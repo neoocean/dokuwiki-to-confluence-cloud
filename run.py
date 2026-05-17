@@ -1605,6 +1605,38 @@ def _dev_clone_source(src: Path, dst: Path) -> int:
     return subprocess.call(["cp", "-R", str(src), str(dst)])
 
 
+def _dev_patch_acl_off(clone_root: Path) -> None:
+    """
+    클론된 DokuWiki conf 의 useacl 을 0 으로 강제해 anonymous 가 모든 페이지를
+    읽을 수 있게 한다. 이렇게 해야 ACL 로 잠긴 네임스페이스 (u:, ride:, blog:
+    등) 가 정상 export 본문을 응답한다. 클론은 호스트 원본과 무관하므로
+    로컬 dev 한정 변경이며 원본에는 손대지 않는다.
+
+    추가로 `useacl` 항목이 conf/local.php 에 아예 없는 경우 (드물지만 발생)
+    해당 라인을 append.
+    """
+    local_php = clone_root / "conf" / "local.php"
+    if not local_php.is_file():
+        log(f"  conf/local.php 없음 — ACL 패치 건너뜀: {local_php}")
+        return
+    text = local_php.read_text(encoding="utf-8", errors="replace")
+    new_text = text
+    if "$conf['useacl']" in new_text:
+        import re as _re
+        new_text = _re.sub(
+            r"\$conf\['useacl'\]\s*=\s*\d+\s*;",
+            "$conf['useacl'] = 0;",
+            new_text,
+        )
+    else:
+        if not new_text.endswith("\n"):
+            new_text += "\n"
+        new_text += "$conf['useacl'] = 0;\n"
+    if new_text != text:
+        local_php.write_text(new_text, encoding="utf-8")
+        log("  ACL 비활성화 (useacl=0) 패치 적용 — 클론 한정")
+
+
 def _dev_wait_healthy(timeout: int = DEV_HEALTH_TIMEOUT) -> bool:
     import urllib.error
     import urllib.request
@@ -1639,6 +1671,7 @@ def cmd_dev(args: argparse.Namespace) -> int:
                 return 1
         else:
             log(f"기존 복제본 재사용: {DEV_CLONE_DST}")
+        _dev_patch_acl_off(DEV_CLONE_DST)
 
         log("docker compose up -d")
         if subprocess.call(["docker", "compose", "-f", str(compose), "up", "-d"]) != 0:
