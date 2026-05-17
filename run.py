@@ -555,9 +555,29 @@ def _convert_html_to_storage(
 
     # 1) Confluence storage 가 받아들이지 않거나 의미 없는 태그 일괄 제거.
     # script/style/link/meta/noscript/iframe/embed/object/form 은 위험 또는 노이즈.
-    # head/html/body 는 보이면 unwrap (children 만 살림).
+    # input/button/select/option/textarea 는 폼 outside 에서도 dokuwiki plugin
+    # (예: todo) 이 인라인으로 박는 인터랙티브 컨트롤 — Confluence storage 는
+    # 거부. todo plugin 은 별도 변환 룰에서 텍스트 마커로 미리 교체된다 (아래
+    # 1.5 단계).
+    #
+    # 1.5) todo plugin: <span class="todo"><input type=checkbox [checked]/>
+    #      <span class="todouser">...</span>
+    #      <span class="todotext clickabletodo todohlght">
+    #        <span class="todoinnertext">텍스트</span>
+    #      </span></span>
+    # 이걸 인라인 텍스트 `[x] 텍스트` 또는 `[ ] 텍스트` 로 교체해 체크 상태를
+    # 보존한다.
+    for todo in soup.find_all("span", class_="todo"):
+        checkbox = todo.find("input", class_="todocheckbox")
+        checked = bool(checkbox and checkbox.has_attr("checked"))
+        inner = todo.find("span", class_="todoinnertext")
+        text = (inner.get_text() if inner else todo.get_text()).strip()
+        prefix = "[x] " if checked else "[ ] "
+        todo.replace_with(prefix + text)
+
     for tag_name in ("script", "style", "link", "meta", "noscript",
-                     "iframe", "embed", "object", "form", "head"):
+                     "iframe", "embed", "object", "form", "head",
+                     "input", "button", "select", "option", "textarea"):
         for t in soup.find_all(tag_name):
             t.decompose()
     for tag_name in ("html", "body"):
