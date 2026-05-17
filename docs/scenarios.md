@@ -103,7 +103,12 @@
 ## 3. 비범위 (Out of Scope, 초기 버전)
 
 - DokuWiki ACL → Confluence permission 매핑.
-- 과거 리비전(`attic/`) 마이그레이션.
+- 과거 리비전(`attic/`) 마이그레이션. **별도 검토 문서**:
+  [`docs/history-migration.md`](history-migration.md) — DokuWiki
+  side 데이터량(955MB / 37,287 리비전), Confluence 의 backdate
+  불가 제약, 6가지 옵션 매트릭스(A 푸터 메타, B 시간순 replay,
+  C 자식 페이지, D content property, E 첨부 raw, F 미디어 버전
+  체인) 와 권장 조합(A+D 가벼움 / B 풀 보존) 정리.
 - 코멘트(`meta/_comments.changes`) 이전.
 - 양방향 동기화. 본 스크립트는 DokuWiki → Confluence 단방향.
 
