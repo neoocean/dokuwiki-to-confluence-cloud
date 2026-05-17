@@ -325,7 +325,15 @@ DokuWiki 가 본문 위에 자동 삽입하는 목차. Confluence 는 별도 `<a
 - 변환기가 모든 플러그인 출력을 Confluence storage 호환 형태로 보존.
 - 부분 손실 1건: **rss** 는 export 시점 스냅샷만 보존 (자동 갱신 안됨). **todo** 는 대부분 (841 pure `<ul>` 그룹 / 1547 task 항목) Confluence task-list 매크로로 변환되어 **클릭 가능한 체크박스**가 되고, mixed/nested 케이스만 `[x]/[ ]` 텍스트 마커로 폴백.
 
-## 9. struct 플러그인 데이터 이전 (별도 트랙)
+## 9. 구성요소 변환 매트릭스
+
+DokuWiki 의 각 마크업 요소가 Confluence 로 옮겨질 때 (A) 그대로 통과,
+(B) Confluence 매크로/구조로 변환, (C) 부분 변환·시각 효과 손실,
+(D) 의도적 누락, (E) 별도 트랙 중 어디에 속하는지 한 곳에 정리한
+reference: [`docs/element-mapping.md`](element-mapping.md). 새 dokuwiki
+요소가 발견되면 §H 절차로 분류.
+
+## 10. struct 플러그인 데이터 이전 (별도 트랙)
 
 `docs/plugin-validation.md §6` 에서 발견된 고아 struct 데이터를 살아있는
 Confluence 데이터베이스로 옮기는 시나리오는
@@ -336,7 +344,7 @@ Properties + Report 폴백, 최후 단순 표 스냅샷. 새 서브커맨드
 `struct_columns` / `struct_rows` / `struct_references` 테이블.
 1,213 활성 row (4 schema) 가 대상.
 
-## 10. 다음 단계
+## 11. 다음 단계
 
 - `upload --dry-run` 으로 트리 / stub / 첨부 예상치 출력 확인.
 - Confluence 공간/루트 페이지 결정 → 실제 업로드 → `rewrite-links` 로 placeholder 해결.
