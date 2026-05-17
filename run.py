@@ -437,16 +437,363 @@ def cmd_render(args: argparse.Namespace) -> int:
     return 0
 
 
-# ---------- S3: Convert (스켈레톤) ----------
+# ---------- S3: Convert ----------
+
+DOKU_LINK_SCHEME = "dwc-link"
+CODE_BODY_SENTINEL_PREFIX = "__DWC_CODE_BODY_"
+
+
+def _categorize_href(href: str) -> dict:
+    """
+    DokuWiki XHTML 의 href/src 를 분류한다.
+
+    반환 형식:
+      {'kind': 'page',     'id': 'wiki:syntax', 'anchor': str | None}
+      {'kind': 'media',    'id': 'wiki:foo.png'}
+      {'kind': 'action'}                          # ?do=edit 류
+      {'kind': 'anchor',   'href': '#headline'}
+      {'kind': 'external', 'href': '...'}
+    """
+    from urllib.parse import parse_qs, urlparse
+
+    if not href:
+        return {"kind": "external", "href": ""}
+    if href.startswith("#"):
+        return {"kind": "anchor", "href": href}
+
+    parsed = urlparse(href)
+    q = parse_qs(parsed.query)
+
+    if "media" in q and q["media"]:
+        return {"kind": "media", "id": q["media"][0]}
+    if "id" in q and q["id"]:
+        return {"kind": "page", "id": q["id"][0], "anchor": parsed.fragment or None}
+    if "do" in q:
+        return {"kind": "action"}
+
+    path = parsed.path or ""
+    if path.startswith("/_media/"):
+        return {"kind": "media", "id": path[len("/_media/"):].replace("/", ":")}
+    if path.startswith("/_detail/"):
+        return {"kind": "media", "id": path[len("/_detail/"):].replace("/", ":")}
+    if path.startswith("/lib/exe/fetch.php"):
+        # query 없는 fetch.php 는 흔치 않지만 방어적으로
+        return {"kind": "external", "href": href}
+    if path.startswith("/doku.php/"):
+        page_id = path[len("/doku.php/"):].strip("/").replace("/", ":")
+        return {"kind": "page", "id": page_id, "anchor": parsed.fragment or None}
+
+    return {"kind": "external", "href": href}
+
+
+def _media_filename(media_id: str) -> str:
+    return media_id.rsplit(":", 1)[-1]
+
+
+def _resolve_media_path(src_root: Path, media_id: str) -> Path | None:
+    rel = Path(*media_id.split(":"))
+    candidate = src_root / "media" / rel
+    return candidate if candidate.is_file() else None
+
+
+def _convert_html_to_storage(
+    raw_html: str,
+    src_root: Path,
+) -> tuple[str, list[dict], list[dict], str | None]:
+    """
+    raw_html (DokuWiki export_xhtmlbody) -> (storage_xml, links, attachments, title).
+
+    links:       [{'target': 'wiki:syntax', 'placeholder': 'dwc-link:wiki:syntax', 'anchor': '...'|None}, ...]
+    attachments: [{'media_id': 'wiki:foo.png', 'filename': 'foo.png', 'src_path': str|None}, ...]
+    title:       첫 h1 의 텍스트(없으면 None)
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(raw_html, "html.parser")
+
+    # 1) DokuWiki 노이즈 제거
+    for a in soup.find_all("a", class_="secedit"):
+        a.decompose()
+    for div in soup.find_all("div", class_="toc"):
+        div.decompose()
+    for div in soup.find_all(id="dw__toc"):
+        div.decompose()
+
+    # 2) 제목 후보 (첫 h1, 없으면 첫 h2)
+    title = None
+    h = soup.find("h1") or soup.find("h2")
+    if h:
+        # 헤딩 내부의 a/span 등을 모두 평탄화한 텍스트
+        title = h.get_text(strip=True) or None
+
+    links: list[dict] = []
+    attachments: dict[str, dict] = {}
+
+    # 3) <img> -> <ac:image>
+    for img in list(soup.find_all("img")):
+        cat = _categorize_href(img.get("src", ""))
+        if cat["kind"] != "media":
+            # 외부 이미지는 그대로 둔다 (storage format 도 <img> 허용)
+            continue
+        media_id = cat["id"]
+        filename = _media_filename(media_id)
+        src_path = _resolve_media_path(src_root, media_id)
+        attachments.setdefault(
+            media_id,
+            {
+                "media_id": media_id,
+                "filename": filename,
+                "src_path": str(src_path) if src_path else None,
+            },
+        )
+        ac_image = soup.new_tag("ac:image")
+        for attr_html, attr_ac in (("width", "ac:width"), ("height", "ac:height"), ("alt", "ac:alt"), ("title", "ac:title")):
+            v = img.get(attr_html)
+            if v:
+                ac_image[attr_ac] = v
+        ri = soup.new_tag("ri:attachment")
+        ri["ri:filename"] = filename
+        ac_image.append(ri)
+
+        # 부모 <a> 가 단일 자식 형태(클릭 가능 이미지) 면 함께 제거하고 ac:image 만 남김
+        parent = img.parent
+        if (
+            parent is not None
+            and parent.name == "a"
+            and sum(1 for _ in parent.children if getattr(_, "name", None) is not None or (isinstance(_, str) and _.strip())) == 1
+        ):
+            parent.replace_with(ac_image)
+        else:
+            img.replace_with(ac_image)
+
+    # 4) <a> 변환
+    for a in list(soup.find_all("a")):
+        href = a.get("href", "")
+        cat = _categorize_href(href)
+        if cat["kind"] == "page":
+            target = cat["id"]
+            anchor = cat.get("anchor")
+            placeholder = f"{DOKU_LINK_SCHEME}:{target}"
+            if anchor:
+                placeholder += f"#{anchor}"
+            a["href"] = placeholder
+            for attr in ("class", "title", "rel", "data-wiki-id"):
+                if attr in a.attrs:
+                    del a.attrs[attr]
+            links.append({"target": target, "placeholder": placeholder, "anchor": anchor})
+        elif cat["kind"] == "media":
+            media_id = cat["id"]
+            filename = _media_filename(media_id)
+            src_path = _resolve_media_path(src_root, media_id)
+            attachments.setdefault(
+                media_id,
+                {
+                    "media_id": media_id,
+                    "filename": filename,
+                    "src_path": str(src_path) if src_path else None,
+                },
+            )
+            ac_link = soup.new_tag("ac:link")
+            ri = soup.new_tag("ri:attachment")
+            ri["ri:filename"] = filename
+            ac_link.append(ri)
+            body = soup.new_tag("ac:link-body")
+            body.string = a.get_text() or filename
+            ac_link.append(body)
+            a.replace_with(ac_link)
+        elif cat["kind"] == "action":
+            # 의미 없는 액션 링크는 텍스트만 남김
+            a.replace_with(a.get_text())
+        # anchor / external 은 그대로
+
+    # 5) <pre class="code..."> -> code 매크로
+    code_bodies: dict[str, str] = {}
+    for idx, pre in enumerate(list(soup.find_all("pre"))):
+        classes = pre.get("class") or []
+        if "code" not in classes and "file" not in classes:
+            continue
+        lang = next((c for c in classes if c not in ("code", "file")), None)
+        text = pre.get_text()
+        sentinel = f"{CODE_BODY_SENTINEL_PREFIX}{idx}__"
+        code_bodies[sentinel] = text
+
+        macro = soup.new_tag("ac:structured-macro")
+        macro["ac:name"] = "code"
+        if lang:
+            param = soup.new_tag("ac:parameter")
+            param["ac:name"] = "language"
+            param.string = lang
+            macro.append(param)
+        body = soup.new_tag("ac:plain-text-body")
+        body.string = sentinel
+        macro.append(body)
+        pre.replace_with(macro)
+
+    # 6) 잡 class/id 정리 (보존이 안전한 것은 남긴다)
+    NOISE_CLASS_PREFIXES = ("sectionedit", "wikilink", "level", "media", "interwiki")
+    NOISE_CLASS_EXACT = {"toc", "page", "dokuwiki", "plugin_include_content"}
+    for tag in soup.find_all(True):
+        cls = tag.get("class")
+        if not cls:
+            continue
+        kept = [
+            c for c in cls
+            if not any(c.startswith(p) for p in NOISE_CLASS_PREFIXES) and c not in NOISE_CLASS_EXACT
+        ]
+        if kept:
+            tag["class"] = kept
+        else:
+            del tag.attrs["class"]
+
+    # 7) 직렬화 + void element XML 자체 닫기 + CDATA 치환
+    import re as _re
+
+    result = "".join(str(c) for c in soup.children)
+    result = _re.sub(r"<(br|hr|img)([^>]*?)(?<!/)\s*>", r"<\1\2/>", result)
+
+    for sentinel, text in code_bodies.items():
+        safe = text.replace("]]>", "]]]]><![CDATA[>")
+        result = result.replace(sentinel, f"<![CDATA[{safe}]]>")
+
+    return result, links, list(attachments.values()), title
+
 
 def cmd_convert(args: argparse.Namespace) -> int:
-    # TODO(S3): BeautifulSoup 으로 raw/*.html 을 파싱해 Confluence storage format
-    # 으로 변환한다. 내부 페이지 링크는 placeholder 토큰으로 남겨 두고
-    # links 테이블에 (src_doku_id, placeholder, target_doku_id) 를 기록한다.
-    # 미디어 참조는 attachments 테이블에 'DISCOVERED' 상태로 upsert.
-    # 결과 storage XML 은 storage/<doku_id>.xml 로 저장하고 content_hash 갱신.
-    log("convert: 미구현 (S3 — docs/scenarios.md 참고)")
-    return 1
+    try:
+        import bs4  # noqa: F401
+    except ImportError:
+        log("beautifulsoup4 가 필요합니다: pip install -r requirements.txt")
+        return 2
+
+    STORAGE_DIR.mkdir(exist_ok=True)
+    conn = db_connect(args.db)
+    db_init(conn)
+
+    src_root_str = db_get_meta(conn, "dokuwiki_src")
+    if not src_root_str:
+        log("dokuwiki_src 메타가 없습니다. 먼저 discover 를 실행하세요.")
+        return 2
+    src_root = Path(src_root_str)
+
+    if args.only:
+        where, params = "doku_id = ?", (args.only,)
+    elif args.force:
+        where, params = "status IN ('RENDERED', 'CONVERTED', 'FAILED')", ()
+    else:
+        where, params = "status = 'RENDERED'", ()
+
+    rows = conn.execute(
+        f"SELECT doku_id, raw_xhtml_path FROM pages WHERE {where} ORDER BY doku_id", params
+    ).fetchall()
+    log(f"convert 대상: {len(rows)} 페이지")
+
+    ok = failed = 0
+    for doku_id, raw_path_str in rows:
+        if not raw_path_str:
+            conn.execute(
+                "UPDATE pages SET status='FAILED', last_error='no raw_xhtml_path', last_checked_at=? WHERE doku_id=?",
+                (now_iso(), doku_id),
+            )
+            conn.commit()
+            failed += 1
+            continue
+
+        raw_path = Path(raw_path_str)
+        if not raw_path.is_file():
+            conn.execute(
+                "UPDATE pages SET status='FAILED', last_error=?, last_checked_at=? WHERE doku_id=?",
+                (f"raw missing: {raw_path}", now_iso(), doku_id),
+            )
+            conn.commit()
+            failed += 1
+            continue
+
+        try:
+            raw_html = raw_path.read_text(encoding="utf-8", errors="replace")
+            storage_xml, links_out, attachments_out, h1_title = _convert_html_to_storage(
+                raw_html, src_root
+            )
+        except Exception as e:  # noqa: BLE001
+            log(f"  [FAIL] {doku_id}: {e}")
+            conn.execute(
+                "UPDATE pages SET status='FAILED', last_error=?, last_checked_at=? WHERE doku_id=?",
+                (f"convert error: {e!r}", now_iso(), doku_id),
+            )
+            conn.commit()
+            failed += 1
+            continue
+
+        rel = Path(*doku_id.split(":")).with_suffix(".xml")
+        out_path = STORAGE_DIR / rel
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(storage_xml, encoding="utf-8")
+        content_hash = sha256_bytes(storage_xml.encode("utf-8"))
+
+        # 멱등성: 이 페이지의 이전 links/attachments 정리 후 재기록
+        conn.execute("DELETE FROM links WHERE src_doku_id=?", (doku_id,))
+        conn.execute(
+            "DELETE FROM attachments WHERE page_doku_id=? AND status='DISCOVERED'",
+            (doku_id,),
+        )
+
+        for link in links_out:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO links(src_doku_id, placeholder, target_doku_id, resolved)
+                VALUES (?, ?, ?, 0)
+                """,
+                (doku_id, link["placeholder"], link["target"]),
+            )
+
+        for att in attachments_out:
+            size = None
+            sha = None
+            if att["src_path"]:
+                try:
+                    p = Path(att["src_path"])
+                    size = p.stat().st_size
+                    sha = sha256_file(p)
+                except OSError:
+                    pass
+            status = "DISCOVERED" if att["src_path"] else "FAILED"
+            err = None if att["src_path"] else "media file not found under src/media/"
+            conn.execute(
+                """
+                INSERT INTO attachments(
+                    page_doku_id, media_id, src_path, size, sha256, status, last_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(page_doku_id, media_id) DO UPDATE SET
+                    src_path = excluded.src_path,
+                    size = excluded.size,
+                    sha256 = excluded.sha256,
+                    status = CASE WHEN attachments.status = 'UPLOADED' THEN attachments.status ELSE excluded.status END,
+                    last_error = excluded.last_error
+                """,
+                (doku_id, att["media_id"], att["src_path"], size, sha, status, err),
+            )
+
+        # 제목은 h1 우선, 그다음 기존 값
+        if h1_title:
+            conn.execute(
+                "UPDATE pages SET title=? WHERE doku_id=?",
+                (h1_title, doku_id),
+            )
+
+        conn.execute(
+            """
+            UPDATE pages
+               SET storage_path=?, content_hash=?, status='CONVERTED',
+                   last_error=NULL, converted_at=?, last_checked_at=?
+             WHERE doku_id=?
+            """,
+            (str(out_path), content_hash, now_iso(), now_iso(), doku_id),
+        )
+        conn.commit()
+        ok += 1
+
+    log(f"convert 완료: ok={ok} failed={failed}")
+    conn.close()
+    return 0
 
 
 # ---------- S4~S6: Upload (스켈레톤) ----------
@@ -546,6 +893,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp_render.set_defaults(func=cmd_render)
 
     sp_convert = sub.add_parser("convert", help="XHTML -> storage format 변환 (S3)")
+    sp_convert.add_argument("--force", action="store_true", help="이미 변환된 페이지도 다시 변환")
+    sp_convert.add_argument("--only", help="특정 doku_id 만 변환")
     sp_convert.set_defaults(func=cmd_convert)
 
     sp_upload = sub.add_parser("upload", help="페이지/첨부 업로드 (S4~S6)")
