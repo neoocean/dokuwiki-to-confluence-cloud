@@ -163,7 +163,58 @@ python run.py dev up && \
   python run.py dev down --purge
 ```
 
-## 6. 새 플러그인을 추가했을 때
+## 6. struct 플러그인 — 고아 데이터 (현 인스턴스 한정)
+
+이 인스턴스에는 struct 플러그인이 *과거에 설치되었으나 현재는 코드가
+부재*하다. 페이지 마이그레이션에는 영향이 없지만, 일반 케이스를 대비해
+조사 결과와 처리 가이드를 함께 둔다.
+
+### 6.1 현 인스턴스 상태 (2026-05-18 측정)
+
+| 항목 | 상태 |
+|------|------|
+| `lib/plugins/struct/` (플러그인 코드) | **부재** |
+| `data/meta/struct.sqlite3` (schema + data) | 존재. 5 schema(`brevet_uri_cppage`, `brevet_course`, `brevet_place`, `test`, `brevet_event`) + 페이지별 row |
+| `data/meta/dumpfile_struct.sql` | 과거 dump (백업) |
+| 메인 페이지 마크업의 struct syntax (`----dataentry`, `----schema`, `{{struct.`, `{{aggregator`, `~~STRUCT`) | **0건** |
+| `u:neoocean:struct` 페이지 | 일반 메모 페이지 (struct *설치 시도 기록*) — struct syntax 사용 안 함 |
+
+→ 활성 struct 페이지가 0건이므로 마이그레이션 파이프라인 출력에 영향
+없음. struct 의 데이터는 `meta/struct.sqlite3` 에 고아 상태로 남아 있고
+호스트 P4 백업에 그대로 보존된다.
+
+### 6.2 일반 케이스 — struct 가 활성일 때 어떻게 이전되는지
+
+DokuWiki 가 렌더한 출력 기준:
+
+| 마크업 | DokuWiki 출력 | 현 변환기 결과 |
+|--------|---------------|----------------|
+| `----dataentry <schema> ---- ... ----` | `<dl class="struct_entry">` 또는 `<table class="inline struct">` (key/value 표) | 그대로 `<table>` 로 통과 → **시각적으로 보존** |
+| `{{struct.aggregator>...}}` | `<table class="inline struct_aggregator">` (다중 row) | 표 그대로 통과 → 시점 스냅샷 |
+| `----schema---- ... ----` | schema 정의 표 | 표 그대로 통과 |
+| schema 메타 (column type, lookup, page binding) | 출력 없음 (sqlite 에만 존재) | **손실** — Confluence 에 schema 개념 없음 |
+
+요약: **표시 결과는 그대로 이전되지만 "데이터베이스로서의 동작 의미"는
+사라진다.** Confluence 페이지의 표는 정적 스냅샷이 됨 — row 추가/aggregator
+재계산 안 됨.
+
+### 6.3 활성 struct 페이지를 *진짜* 옮겨야 할 경우의 옵션
+
+본 인스턴스에는 해당 없으나 다른 환경에서 마이그레이션할 때 검토:
+
+1. **스냅샷 유지** (default) — 현 변환기 동작. 추가 작업 없음.
+2. **데이터 보존을 content property 로** — `meta/struct.sqlite3` 의 row 들을
+   schema 별로 dump → 각 페이지의 Confluence content property
+   `dokuwiki.struct.<schema>` JSON 에 저장. history-migration §D 와 동일
+   패턴. UI 비표시지만 후속 도구가 재구성 가능.
+3. **schema → Confluence DB 매크로 매핑** — Atlassian 의 *Database* 매크로
+   또는 third-party plugin 으로 schema 자체를 재구성. **자동 변환 도구
+   없음 — 수동 작업**. 옮기는 데이터 양이 많지 않다면 표 그대로 두는
+   것이 실용적.
+
+이 옵션들은 현 PR 범위 밖. 필요 시 별도 시나리오 문서로 분리한다.
+
+## 7. 새 플러그인을 추가했을 때
 
 1. `lib/plugins/<name>/` 가 클론에 포함되었는지 확인 (`dev up` 이 새로
    복제할 때 자동 포함).
