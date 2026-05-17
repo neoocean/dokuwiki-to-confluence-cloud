@@ -289,7 +289,7 @@ DokuWiki 가 본문 위에 자동 삽입하는 목차. Confluence 는 별도 `<a
 | 6 | URL-encoded 미디어 경로로 한국어 파일 resolve 실패. e.g. `ride:files:%EB%8F%84%EC%84%A0%EC%82%AC.gpx` | `_categorize_href` 가 `parsed.path` 를 raw 그대로 사용. `parse_qs` 는 자동 디코딩하지만 path 는 안 함                                                       | `urllib.parse.unquote(parsed.path)` 후 prefix 매칭. `_href_to_doku_id_via_path` 도 동일 (CL 52687)                                                       |
 | 7 | `plugin_include__<page-id>` 같은 dynamic class 가 166 파일에 잔존 | include 플러그인이 transcluded section 마다 페이지 ID 를 박은 class 부여                                                                                | 노이즈 class prefix 목록에 `plugin_` 추가 (CL 52687)                                                                                                    |
 | 8 | ACL 로 anonymous deny 된 네임스페이스가 dev 인스턴스에서 풀 로그인 폼 응답 (1208 페이지) | 호스트의 `acl.auth.php` 가 c:, u:, ride:, lam:, blog:, p:, oh:, j:, g:, gd:, reads:, um:, user: 등 광범위하게 `@ALL=0` (no permission). dev 컨테이너도 동일 conf 사용 | `run.py dev up` 이 clone 직후 `conf/local.php` 의 `useacl` 을 0 으로 패치 → 모든 페이지 anonymous 읽기 허용. 원본 호스트 데이터는 손대지 않음 (CL 52688) |
-| 9 | todo 플러그인의 `<input type="checkbox">` 가 191 파일에 잔존. Confluence storage 는 인터랙티브 컨트롤 거부 | dokuwiki todo 플러그인이 인라인 체크박스를 그대로 출력                                                                                                  | `<span class="todo">` 를 발견 시 `[x] <text>` 또는 `[ ] <text>` 텍스트 마커로 교체. 또한 `input/button/select/option/textarea` 도 안전망으로 strip (CL 52689) |
+| 9 | todo 플러그인의 `<input type="checkbox">` 가 191 파일에 잔존. Confluence storage 는 인터랙티브 컨트롤 거부 | dokuwiki todo 플러그인이 인라인 체크박스를 그대로 출력                                                                                                  | 두 모드 변환: `<ul>` 의 모든 직접 `<li>` 가 단일 pure todo 인 경우 `<ul>` 통째를 `<ac:task-list>` 로 치환해 **클릭 가능한 Confluence 체크박스** 로 만든다. 그 외 (mixed/nested) 는 `[x] / [ ]` 텍스트 마커 폴백. 또한 `input/button/select/option/textarea` 도 안전망으로 strip (CL 52689; task-list 변환은 CL 52691) |
 
 ### 7.3 누적 통계
 
@@ -305,7 +305,7 @@ DokuWiki 가 본문 위에 자동 삽입하는 목차. Confluence 는 별도 `<a
 
 - 활성 플러그인 6개(blog / include / pagelist / tag / todo / wrap) 모두 dev 컨테이너에서 정상 렌더링 확인.
 - 변환기가 모든 플러그인 출력을 Confluence storage 호환 형태로 보존.
-- 부분 손실 2건: **rss** 는 export 시점 스냅샷만 보존 (자동 갱신 안됨), **todo** 는 시각적 마커는 보존되나 Confluence UI 에서 클릭 가능한 task 가 아님.
+- 부분 손실 1건: **rss** 는 export 시점 스냅샷만 보존 (자동 갱신 안됨). **todo** 는 대부분 (841 pure `<ul>` 그룹 / 1547 task 항목) Confluence task-list 매크로로 변환되어 **클릭 가능한 체크박스**가 되고, mixed/nested 케이스만 `[x]/[ ]` 텍스트 마커로 폴백.
 
 ## 9. 다음 단계
 

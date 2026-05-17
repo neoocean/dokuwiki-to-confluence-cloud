@@ -525,6 +525,76 @@ def _resolve_media_path(src_root: Path, media_id: str) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
+def _todo_checked_and_text(todo) -> tuple[bool, str]:
+    """todo span 의 (checked, inner-text) 추출."""
+    checkbox = todo.find("input", class_="todocheckbox")
+    checked = bool(checkbox and checkbox.has_attr("checked"))
+    inner = todo.find("span", class_="todoinnertext")
+    text = (inner.get_text() if inner else todo.get_text()).strip()
+    return checked, text
+
+
+def _build_ac_task(soup, task_id: int, checked: bool, text: str):
+    """Confluence <ac:task> 엘리먼트 빌드."""
+    task = soup.new_tag("ac:task")
+    tid = soup.new_tag("ac:task-id")
+    tid.string = str(task_id)
+    task.append(tid)
+    ts = soup.new_tag("ac:task-status")
+    ts.string = "complete" if checked else "incomplete"
+    task.append(ts)
+    body = soup.new_tag("ac:task-body")
+    body.string = text
+    task.append(body)
+    return task
+
+
+def _convert_todos(soup) -> None:
+    """
+    DokuWiki todo plugin 출력을 Confluence task-list / 텍스트 마커로 변환.
+
+    Step 1: <ul> 의 모든 직접 <li> 가 단일 pure todo (li 의 텍스트와 todo
+            span 의 텍스트가 동일) 이면 <ul> 전체를 <ac:task-list> 로 치환.
+            Confluence 의 task-list 는 block-level 이라 안전한 위치에만 둠.
+    Step 2: 남은 모든 todo span → `[x] 텍스트` / `[ ] 텍스트` 인라인 마커.
+    """
+    counter = [0]
+
+    def _next_id() -> int:
+        counter[0] += 1
+        return counter[0]
+
+    for ul in list(soup.find_all("ul")):
+        lis = ul.find_all("li", recursive=False)
+        if not lis:
+            continue
+        todos_in_lis = []
+        all_pure = True
+        for li in lis:
+            spans = li.find_all("span", class_="todo")
+            if len(spans) != 1:
+                all_pure = False
+                break
+            todo = spans[0]
+            if li.get_text(strip=True) != todo.get_text(strip=True):
+                all_pure = False
+                break
+            todos_in_lis.append(todo)
+        if not all_pure or not todos_in_lis:
+            continue
+        task_list = soup.new_tag("ac:task-list")
+        for todo in todos_in_lis:
+            checked, text = _todo_checked_and_text(todo)
+            task_list.append(_build_ac_task(soup, _next_id(), checked, text))
+        ul.replace_with(task_list)
+
+    # 남은 todo 들은 인라인 텍스트 마커로
+    for todo in list(soup.find_all("span", class_="todo")):
+        checked, text = _todo_checked_and_text(todo)
+        prefix = "[x] " if checked else "[ ] "
+        todo.replace_with(prefix + text)
+
+
 def _convert_html_to_storage(
     raw_html: str,
     src_root: Path,
@@ -560,20 +630,26 @@ def _convert_html_to_storage(
     # 거부. todo plugin 은 별도 변환 룰에서 텍스트 마커로 미리 교체된다 (아래
     # 1.5 단계).
     #
-    # 1.5) todo plugin: <span class="todo"><input type=checkbox [checked]/>
-    #      <span class="todouser">...</span>
-    #      <span class="todotext clickabletodo todohlght">
-    #        <span class="todoinnertext">텍스트</span>
-    #      </span></span>
-    # 이걸 인라인 텍스트 `[x] 텍스트` 또는 `[ ] 텍스트` 로 교체해 체크 상태를
-    # 보존한다.
-    for todo in soup.find_all("span", class_="todo"):
-        checkbox = todo.find("input", class_="todocheckbox")
-        checked = bool(checkbox and checkbox.has_attr("checked"))
-        inner = todo.find("span", class_="todoinnertext")
-        text = (inner.get_text() if inner else todo.get_text()).strip()
-        prefix = "[x] " if checked else "[ ] "
-        todo.replace_with(prefix + text)
+    # 1.5) todo plugin -> Confluence task-list / text marker
+    #
+    # dokuwiki todo:
+    #   <span class="todo">
+    #     <input type=checkbox class=todocheckbox [checked]/>
+    #     <span class="todouser">[✓ user, date]</span>
+    #     <span class="todotext clickabletodo todohlght">
+    #       <span class="todoinnertext">텍스트</span>
+    #     </span>
+    #   </span>
+    #
+    # 두 가지 모드:
+    #   (a) <ul> 의 모든 직접 <li> 가 "오직 단일 todo" 인 경우 (li.get_text()
+    #       와 todo.get_text() 가 같음) → 그 <ul> 을 통째로 <ac:task-list>
+    #       로 치환해 클릭 가능한 Confluence 체크박스가 되도록 한다.
+    #       Confluence 의 ac:task-list 는 block-level 이라 li 안에 박으면
+    #       렌더링 깨질 수 있으므로 ul 전체 치환만 안전하다.
+    #   (b) 그 외 (텍스트 섞인 li, nested ul, 인라인 todo) → 기존의
+    #       `[x] 텍스트` / `[ ] 텍스트` 인라인 텍스트 마커 폴백.
+    _convert_todos(soup)
 
     for tag_name in ("script", "style", "link", "meta", "noscript",
                      "iframe", "embed", "object", "form", "head",

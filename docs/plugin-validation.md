@@ -102,7 +102,7 @@ done
 | blog      | `u:note:start`                 | `<div class="inclmeta">` + 페이지 메타/링크/태그                | 그대로 통과 (페이지 링크는 dwc-link placeholder 로 변환)               |
 | topic     | `wiki:start` (`{{topic>til}}`) | `<table class="ul plgn__pglist">` 페이지 리스트 (9개)        | 표 + 링크 모두 보존, plgn__pglist 클래스도 보존                        |
 | rss       | `wiki:syntax`                  | `<ul class="rss"><li>` slashdot 5개 항목, 외부 링크          | 외부 링크 그대로 통과; 캡쳐 시점 스냅샷                                |
-| todo      | `u:lam:2020`                   | `<span class="todo"><input type=checkbox checked/>...텍스트` | `[x] 텍스트` 또는 `[ ] 텍스트` 인라인 마커 (CL 52689 이후)            |
+| todo      | `u:lam:2020`                   | `<span class="todo"><input type=checkbox checked/>...텍스트` | 두 모드: pure-todo `<ul>` 은 `<ac:task-list><ac:task>` 매크로(클릭 가능한 Confluence 체크박스)로, mixed/nested 는 `[x] / [ ]` 텍스트 마커로 폴백 (CL 52691) |
 
 검증 명령(요약):
 
@@ -140,10 +140,19 @@ clone) 에서 정상 렌더링된다.
   시점의 스냅샷이 영구히 남는다. 자동 갱신이 필요하면 Confluence 의
   RSS 매크로로 수동 교체 필요. (현재 변환기는 rss 결과를 일반
   텍스트/링크 리스트로 보존.)
-- **todo checkbox**: Confluence 의 task list 매크로로 변환하지 않고
-  `[x] 텍스트` / `[ ] 텍스트` 단순 텍스트 마커로 격하. 시각적 상태는
-  보존되지만 Confluence UI 에서 체크/언체크할 수 없다. 후속 수동
-  작업이 필요한 경우 매크로 변환 룰을 추가 (현 변환기에는 미구현).
+- **todo checkbox** (CL 52691 부터):
+  - **pure-todo `<ul>`** (모든 직접 `<li>` 가 단일 todo 인 경우, 841
+    그룹 / 1547 task) → `<ac:task-list><ac:task>` 매크로로 변환.
+    Confluence UI 에서 **클릭 가능한 체크박스**가 된다. 페이지별
+    `task-id` 카운터로 고유 id 부여.
+  - **mixed `<li>`** (텍스트 섞임) / **nested ul** / **인라인 todo**
+    → `[x] 텍스트` / `[ ] 텍스트` 텍스트 마커로 폴백. Confluence 의
+    `ac:task-list` 가 block-level 이라 inline 컨텍스트(특히 `<li>`
+    내부)에 박으면 렌더링이 깨지기 때문에 의도적으로 보수적으로
+    처리한다.
+  - 사용자 메타정보 (`<span class="todouser">[✓ user, date]</span>`)
+    는 task-body 에 포함하지 않고 `todoinnertext` 만 보존. 메타가
+    필요한 경우 별도 변환 룰을 추가.
 
 ## 5. 재현 명령 한 줄
 
