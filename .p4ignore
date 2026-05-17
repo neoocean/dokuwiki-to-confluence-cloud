@@ -1,0 +1,36 @@
+# dokuwiki-to-confluence-cloud Perforce ignore rules.
+#
+# DOCUMENTATION-ONLY in the current workspace setup: P4IGNORE points to
+# /Users/neoocean/p4/playground/p4ignore.txt and per-directory .p4ignore
+# files are not consulted. The matching enforced rules — `__pycache__/`,
+# `*.pyc`, `.DS_Store`, `.claude/`, `venv` — already live in that master
+# file. This file mirrors the project-local rules so they remain visible
+# at the module boundary and would activate automatically if the
+# operator ever flips P4IGNORE to a per-directory name.
+
+# Runtime state — host-local, regenerable from `discover` + `render`.
+state.db
+state.db-wal
+state.db-shm
+
+# Cached intermediates produced by render/convert. Re-fetched on demand.
+raw/
+storage/
+
+# Logs.
+logs/
+
+# Python / virtualenv.
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Claude Code per-workspace local state.
+.claude/
+
+# Editor / OS noise.
+.DS_Store
+.vscode/
+.idea/

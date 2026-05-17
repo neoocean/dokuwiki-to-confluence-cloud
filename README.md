@@ -10,4 +10,24 @@ DokuWiki 의 `?do=export_xhtmlbody` 출력을 받아 Confluence storage format �
 
 ## 상태
 
-설계 단계. `docs/scenarios.md` 에 기술된 시나리오를 차례로 구현 예정.
+구현 진행 중. `docs/scenarios.md` 의 S1~S2 가 동작하고, S3~S7 은 스켈레톤.
+
+## 사용
+
+```sh
+pip install -r requirements.txt
+
+# S1: 페이지 트리 발견
+python run.py discover --src ~/p4/playground/docker/dokuwiki/data/data
+
+# S2: DokuWiki 가 렌더링한 XHTML 캐시
+python run.py render --base-url http://dokuwiki.local
+
+# 상태 요약
+python run.py status
+```
+
+자격증명은 환경변수로:
+- `CONFLUENCE_EMAIL`, `CONFLUENCE_API_TOKEN` (업로드용)
+- `DOKUWIKI_BASE_URL`, `DOKUWIKI_USER`, `DOKUWIKI_PASSWORD` (렌더링용)
+- `DOKUWIKI_SRC` (`--src` 기본값)
