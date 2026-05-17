@@ -2,8 +2,13 @@
 
 본 문서는 [`scenarios.md` §3 비범위](scenarios.md) 에서 명시적으로 제외했던
 "DokuWiki 페이지의 과거 리비전 / 변경 이력 / 미디어 히스토리"를 Confluence
-Cloud 로 이전할 때의 옵션과 트레이드오프를 정리한다. 이 문서를 검토한
-뒤 사용자가 어느 옵션을 채택할지 결정하면 구현 PR 을 분리해 진행한다.
+Cloud 로 이전할 때의 옵션과 트레이드오프를 정리한다.
+
+**채택 결정 (2026-05-18): 옵션 B — 시간순 replay 로 Confluence 버전 체인
+보존.** §5 가 채택 결정과 그 근거. §6 의 구현 스케치는 B 에 맞춰
+구체화되어 있다. §4 의 다른 옵션들은 *선택 가능한 보조 모드* 또는
+*미래 대안* 으로 그대로 유지한다 — `--mode` 플래그로 차후 전환 가능
+하도록 구현한다.
 
 ## 1. 문제 정의
 
@@ -97,46 +102,63 @@ type 코드:
 | E    | attic 의 raw 마크업 파일들을 페이지 첨부로 일괄 업로드 | 첨부 섹션에 `<page>.<ts>.txt` N개            | 낮음        | 페이지당 +N (37k 첨부)               | 마크업 그대로라 사용자가 읽기 어렵다. 첨부 개수 폭증. |
 | F    | 미디어 attic 만 Confluence 첨부 버전 체인으로 PUT | 첨부의 "이전 버전" UI                         | 중간        | 미디어 평균 ~3 버전 × 193 ≈ 600     | 미디어 attachment 도 backdate 불가; 텍스트 페이지 미해결 |
 
-## 5. 권장 조합
+## 5. 채택 결정
 
-사용자가 "히스토리 *데이터*만 잃지 않으면 된다" 라면:
+### 5.1 결정 (2026-05-18)
 
-- **Default = A + D** (가벼움, 사용자가 거의 항상 만족하는 균형)
-  - 메인 페이지 본문 끝에 §A 푸터 박스.
-  - 페이지 content property `dokuwiki.history` 에 changes.log 전체와
-    attic 파일 인덱스(파일명 + sha256 + byte size) 를 JSON 으로 저장.
-  - attic 의 raw `.txt.gz` 자체는 *Confluence 에 올리지 않음*. 호스트
-    P4 백업에 이미 존재하므로 단일 source of truth 유지.
+**옵션 B + 본문 헤더 메타** 를 텍스트 페이지 히스토리의 default 모드로
+채택. 미디어 히스토리는 **옵션 F** 채택.
 
-사용자가 "Confluence UI 의 *버전 보기*에서 과거 본문을 직접 비교할 수
-있어야 한다" 라면:
+### 5.2 채택 이유
 
-- **B + 본문 헤더 메타** (실현 가능한 최대 보존)
-  - `history-replay` 서브커맨드로 페이지마다 시간순 PUT.
-  - 각 버전 본문 최상단에 회색 박스:
-    ```
-    > 이 리비전은 DokuWiki 의 2020-01-23 03:18 UTC 시점 본문입니다.
-    > 작성자: neoocean (5.181.235.199), 변경 코멘트: "[2019-01-03] "
-    ```
-  - 페이지의 *Confluence 버전 N* 은 dokuwiki revision N 에 대응. 다만
-    `version.createdAt` / `version.authorId` 는 마이그레이션 시각과
-    API 사용자.
+- 사용자 요구: Confluence UI 의 "이전 버전 보기"에서 과거 본문을
+  직접 비교할 수 있어야 한다.
+- 본문 안에 dokuwiki 의 원본 ts/user/comment 를 헤더 박스로 같이 박으면
+  *Confluence 의 버전 메타가 마이그레이션 시각/계정으로 고정*되는 한계
+  도 본문 텍스트 차원에서는 보완된다.
+- 추가 API 호출 ~37,287 PUT 은 부담이지만 일회성 마이그레이션이라
+  허용 가능. 백오프 + 재시도가 이미 변환기에 있다.
 
-미디어:
+### 5.3 옵션 B 와 다른 옵션의 관계
 
-- **F** 단독 또는 **A 의 푸터에 "원본 미디어 N개" 만 명시**.
-  실측 522MB / 193 파일이라 작은 편이라 F 가 부담 없다.
+§4 의 다른 옵션(A / C / D / E / F) 은 **삭제하지 않고 유지**한다:
 
-## 6. 구현 스케치
+- **A (본문 푸터 메타)** — B 와 함께 사용. 메인 페이지(latest revision)
+  의 본문 끝에 *전체 변경 요약* 박스를 같이 박는다. B 의 헤더 박스가
+  각 버전의 metadata 라면, A 의 푸터는 페이지 라이프타임 합산 metadata.
+- **D (content property JSON)** — 미래 대안 / 보조. B 채택했어도 추후
+  외부 도구가 dokuwiki 원본 changes.log 를 기계적으로 조회해야 할 경우
+  `history-upload --include-property` 플래그로 함께 저장 가능하게
+  남긴다. 디폴트는 비활성.
+- **C (자식 페이지)** — 미래 대안. B 채택 후 사용자가 "버전 비교 UI 보다
+  단일 페이지에 모든 변경이 나열되는 게 좋다" 면 `--mode=child-page` 로
+  전환. 본 PR 범위 밖.
+- **E (attic raw 첨부)** — 보존 가치 낮음 (호스트 P4 백업에 이미 raw 가
+  있음). 폐기보단 *옵션 자체는 유지*. `--mode=raw-attachments` 만
+  남겨둔다. 일반 권장 안 함.
+- **F (미디어 attic 첨부 버전 체인)** — *함께 채택*. 미디어는 522MB /
+  193 파일이라 부담 적고 첨부의 "이전 버전" UI 가 자연스럽다.
+
+### 5.4 채택안 한 줄 요약
+
+> 텍스트는 **B + A** (시간순 replay + latest 페이지 푸터),
+> 미디어는 **F** (Confluence 첨부 버전 체인).
+> D / C / E 는 `--mode` 플래그로 옵션만 유지, 디폴트 비활성.
+
+## 6. 구현 스케치 (B + A + F 채택안 기준)
 
 ### 6.1 새 서브커맨드
 
 ```
-python run.py history-discover   # attic + changes 인덱싱
+python run.py history-discover   # attic + changes + media_attic 인덱싱
 python run.py history-render     # attic 의 각 리비전을 ?rev= 로 캐시
-python run.py history-convert    # 리비전별 storage XML 생성
-python run.py history-upload     # 선택된 옵션(A/B/C/D/E) 에 따라 업로드
+python run.py history-convert    # 리비전별 storage XML 생성 + 헤더 박스 prepend
+python run.py history-upload     # 시간순 PUT replay (B). --include-footer 로 latest 페이지에 A 푸터 추가
+python run.py history-media      # F: media_attic 의 시간순 PUT (Confluence 첨부 버전 체인)
 ```
+
+기본 동작은 채택안 (B + A + F). `--mode {chronological|footer-only|child-page|content-property|raw-attachments}`
+플래그로 다른 옵션을 명시적으로 선택 가능 (default = `chronological`).
 
 ### 6.2 state.db 스키마 확장
 
@@ -166,8 +188,24 @@ CREATE TABLE history_meta (
     total_revs     INTEGER,
     first_ts       INTEGER,
     last_ts        INTEGER,
-    confluence_property_id TEXT,   -- 옵션 D 의 content property
-    history_child_page_id  TEXT    -- 옵션 C 의 자식 페이지
+    replay_started_at      TEXT,    -- B replay 시작 시각
+    replay_completed_at    TEXT,    -- B replay 완료 시각
+    last_replayed_rev_ts   INTEGER, -- 재개용. 다음 PUT 대상의 다음 ts.
+    confluence_property_id TEXT,    -- 옵션 D (보조)
+    history_child_page_id  TEXT     -- 옵션 C (보조)
+);
+
+CREATE TABLE media_revisions (
+    media_id           TEXT NOT NULL,   -- 예: 'wiki:foo.png'
+    rev_ts             INTEGER NOT NULL,
+    src_path           TEXT,            -- media_attic/<...>.<ts>.<ext>
+    size               INTEGER,
+    sha256             TEXT,
+    confluence_attachment_id TEXT,      -- F 업로드 후
+    status             TEXT NOT NULL,   -- DISCOVERED / UPLOADED / FAILED / OVERSIZED
+    last_error         TEXT,
+    uploaded_at        TEXT,
+    PRIMARY KEY (media_id, rev_ts)
 );
 ```
 
@@ -201,7 +239,50 @@ CREATE TABLE history_meta (
 </ac:structured-macro>
 ```
 
-### 6.5 content property (옵션 D) 의 JSON 모양
+### 6.5 B replay 알고리즘 (채택안 핵심)
+
+1. `history-discover` 가 `revisions` 테이블을 채운다 (페이지당 모든
+   `attic/.../*.txt.gz` + `meta/.../*.changes` 행 cross-join).
+2. `history-render` 가 status=DISCOVERED 인 행을 `?rev=<ts>` 로 받아
+   `raw_history/<doku_id>.<ts>.html` 에 캐시. 본문이 변경 없는
+   리비전(같은 sha256) 도 일단 캐시 — dedup 은 convert 단계에서.
+3. `history-convert` 가 `_convert_html_to_storage` 를 재사용해
+   리비전별 storage XML 을 만든 뒤, *§6.4 의 헤더 박스를 본문
+   최상단에 prepend*. revert 로 인한 본문 동일 리비전은
+   `content_hash` 비교로 식별해 status='SKIPPED' (선택; 디폴트는
+   skip — Confluence 의 버전 N 가 N-1 과 본문이 같으면 PUT 거부됨).
+4. `history-upload` 가 페이지별로 작업:
+   - 페이지의 `confluence_page_id` 가 비어있으면, 가장 오래된 revision
+     으로 POST 하여 version 1 생성.
+   - 그 다음 revisions 를 ts 오름차순으로 PUT. 각 PUT 의 `body.value`
+     는 `storage_path` 의 콘텐츠, `version.number = 직전 cur_ver + 1`,
+     `version.message = "DokuWiki rev <ts> by <user>: <comment>"`
+     (Confluence 가 받아들이는 *짧은* 코멘트).
+   - PUT 후 `revisions.status = UPLOADED` + `history_meta.last_replayed_rev_ts`
+     갱신. 중단/재시작 안전.
+   - 429 는 기존 `_request_with_retry` 의 백오프 적용.
+   - 마지막 revision = 현재 dokuwiki latest. 이건 메인 파이프라인의
+     `upload` 가 만든 페이지의 *최종 버전*과 동일해야 한다. 메인
+     `upload` 가 이미 만든 페이지를 재활용해 history-upload 가
+     이어서 N-1 개 PUT 을 추가하는 형태.
+
+### 6.6 메인 파이프라인과의 통합
+
+기존 `upload` 가 페이지를 만들고 latest 본문 + (옵션 A) 푸터 박스를
+함께 박는다. `history-upload` 는 그 페이지에 이어서 *오래된 → 새것*
+순으로 PUT 을 던진다 — 단, 시간 순서를 *지키려면 latest 가 마지막에
+와야 한다*. 그래서 실제 순서는:
+
+  1. 메인 `upload` 가 페이지 *없으면* skeleton 만 생성 (제목 + stub
+     본문 + 푸터). `history-upload` 가 가장 오래된 revision 으로 첫
+     PUT 을 던지면 버전 2 가 됨.
+  2. 또는 `upload --skip-create-when-history` 로 메인 단계를 생략하고
+     `history-upload` 가 첫 POST 부터 책임진다. 이쪽이 깔끔. 채택.
+
+→ 결과: Confluence 페이지의 *version N* = dokuwiki 의 *N번째 revision*.
+   최종 버전이 dokuwiki 의 latest = 메인 파이프라인의 출력과 일치.
+
+### 6.7 content property (옵션 D, 보조) 의 JSON 모양
 
 `PUT /wiki/api/v2/pages/{id}/properties` body:
 
@@ -262,18 +343,39 @@ Confluence 사용자 accountId 로의 매핑은 별도 작업.
 권장: 옵션 무시 + content property `dokuwiki.media_history` 에 인덱스만
 저장 (필요 시 호스트에서 재구성).
 
-## 10. 결정 보류 항목
+## 10. 결정 항목 (채택안에서 어떻게 풀렸는지)
 
-1. **사용자가 어떤 옵션을 채택할지** — A+D (가벼움) / B (UI 비교 가능, 시간 큼) / 둘의 혼합.
-2. **삭제된 페이지 (`D` 타입)** 처리: Confluence 에 없는 페이지에 history 만 박을 수 없다. 별도 "삭제된 페이지 묶음" 페이지에 모두 모을지, 아예 무시할지.
-3. **revert (`R`)** 가 만든 리비전: dokuwiki 가 새 revision 으로 기록하지만 본문은 과거 revision 의 복제. 옵션 B 에선 중복 버전 생성됨. dedup 룰 (content_hash 같으면 skip) 필요.
-4. **dokuwiki 사용자 매핑 JSON** 의 출처와 검증 절차.
-5. **공개 vs 비공개**: 일부 페이지는 ACL 로 막혀있었다. 히스토리에 그런 페이지의 과거 본문이 들어가면 *그 시점의 권한 상태* 가 사라진다. 신뢰선 재검토 필요.
-6. **언어/문자 인코딩**: attic 의 일부 오래된 파일이 깨진 인코딩일 수 있다. 첫 단계에서 디코드 실패 케이스 통계 필요.
+| # | 항목 | 상태 |
+|---|------|------|
+| 1 | 어떤 옵션을 채택할지                          | **결정 (2026-05-18): B + A + F** (§5.1) |
+| 2 | 삭제된 페이지 (`D` 타입) 처리                | **결정**: 별도 페이지 `<root>/_삭제된_페이지/` 자식 트리에 모두 모은다. 본문은 마지막 살아있던 revision 의 변환 결과 + 푸터에 "DokuWiki 에서 <ts> 에 삭제됨" 표시. 시간순 replay 는 적용하지 않음 (Confluence trash 와 별개). |
+| 3 | revert (`R`) 가 만든 리비전 중복 처리          | **결정**: convert 단계에서 직전 revision 과 동일한 `content_hash` 면 status=SKIPPED. Confluence 가 동일 본문 PUT 을 어쨌든 거부하므로 사전 필터링이 안전. |
+| 4 | dokuwiki 사용자 매핑 JSON 의 출처와 검증       | **보류**: 일단 매핑 없이 dokuwiki 사용자명을 본문 헤더에 텍스트로 기록. 사용자가 매핑 JSON 을 제공하면 `--users-map` 플래그로 받아 헤더에서 `@mention` 으로 렌더. 검증 절차는 매핑 도입 시 별도. |
+| 5 | ACL-locked 과거 본문 노출                     | **결정**: 호스트 운영자(=사용자 본인)의 명시적 단독 환경. 마이그레이션 대상 공간은 사용자가 별도로 정한 access boundary 안. 따라서 *과거 ACL 은 보존하지 않는다* — Confluence 측 권한이 통일된 단일 boundary 다. 추후 다인 환경으로 확장하면 재검토. |
+| 6 | 인코딩 깨짐 통계                              | **계획**: `history-discover` 단계에서 attic 의 각 `.txt.gz` 를 `errors='replace'` 로 디코드하고, replacement char (`�`) 가 들어간 리비전을 `revisions.last_error='decode-replaced'` 로 마킹. discover 종료 시 통계 출력. 실제 비율은 첫 실행으로 측정. |
 
-## 11. 다음 단계
+남은 *진짜 결정* 항목은 #4 (사용자 매핑) 뿐. 나머지는 채택안의 동작이
+정의되어 있다.
 
-1. 사용자가 `§4` 매트릭스 중 한 가지(또는 조합)를 채택.
-2. 채택안에 맞춰 `§6` 의 서브커맨드와 schema 구현을 별도 PR 로 진행.
-3. 작은 샘플 페이지 (예: `wiki:syntax`) 에 대해 dry-run 으로 검증.
-4. 전체 corpus 에 대해 비동기 실행, 결과 audit.
+## 11. 다음 단계 (구현 로드맵)
+
+1. **discover 단계**: `attic/` walk + `meta/*.changes` 파싱 → `revisions`
+   + `history_meta` 테이블 채움. 인코딩 깨짐 통계(§10 #6) 함께 출력.
+   `media_attic/` 도 walk → `media_revisions` 채움.
+2. **render 단계**: dev 컨테이너의 `?rev=<ts>` 로 페이지별 모든
+   revision 받기. ~37k 호출. 컨테이너에 부담 안 가게 `--delay` 디폴트
+   상향 (예: 200ms). 1차 estimate: ~2시간.
+3. **convert 단계**: 메인 `_convert_html_to_storage` 재사용. 본문에
+   §6.4 헤더 박스 prepend. content_hash 동일 (revert 결과) revision
+   은 status=SKIPPED. ~5분 (cpu-bound, bs4).
+4. **upload 단계** (`history-upload`): §6.5 알고리즘. 페이지별로
+   ts 오름차순 POST → PUT 반복. ~37k API 호출 → 비동기 백그라운드.
+   재개 가능 (`last_replayed_rev_ts` 기반).
+5. **media 단계** (`history-media`): 미디어별 ts 오름차순 첨부
+   업로드. ~600 호출.
+6. **사후 검증**: 임의의 5개 페이지를 골라 Confluence 의 "이전 버전 보기"
+   에서 dokuwiki revision N 과 Confluence 버전 N 의 본문 일치 + 헤더
+   메타 정확성 점검.
+7. **삭제된 페이지** 처리 (§10 #2): `meta/_dokuwiki.changes` 의 `D` 타입
+   이벤트로부터 deleted page 목록 추출 → `<root>/_삭제된_페이지/` 트리
+   생성 → 마지막 revision 변환 + 푸터 박스로 마무리.

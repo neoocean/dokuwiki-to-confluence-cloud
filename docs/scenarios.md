@@ -103,12 +103,25 @@
 ## 3. 비범위 (Out of Scope, 초기 버전)
 
 - DokuWiki ACL → Confluence permission 매핑.
-- 과거 리비전(`attic/`) 마이그레이션. **별도 검토 문서**:
-  [`docs/history-migration.md`](history-migration.md) — DokuWiki
-  side 데이터량(955MB / 37,287 리비전), Confluence 의 backdate
-  불가 제약, 6가지 옵션 매트릭스(A 푸터 메타, B 시간순 replay,
-  C 자식 페이지, D content property, E 첨부 raw, F 미디어 버전
-  체인) 와 권장 조합(A+D 가벼움 / B 풀 보존) 정리.
+- 과거 리비전(`attic/`) 마이그레이션 — *현재 파이프라인 범위 밖이지만
+  채택안 확정됨*. 별도 시나리오:
+  [`docs/history-migration.md`](history-migration.md). 핵심 사실 +
+  채택안:
+  - DokuWiki side 데이터량: attic 955MB / 37,287 리비전 / 1,630 페이지
+    (평균 23 rev), media_attic 522MB / 193 파일.
+  - Confluence Cloud 의 결정적 제약: `version.createdAt` /
+    `version.authorId` 의 backdate API 없음 — "원본 그대로"는 불가능.
+  - 6가지 옵션 매트릭스 그대로 유지 (A 푸터 메타 / B 시간순 replay /
+    C 자식 페이지 / D content property / E raw 첨부 / F 미디어 버전
+    체인) — `--mode` 플래그로 미래 전환 가능.
+  - **채택 (2026-05-18): 텍스트 = B + A** (시간순 PUT replay 로
+    Confluence 버전 체인 보존 + latest 페이지에 푸터 박스로 변경
+    요약), **미디어 = F** (첨부 버전 체인). D / C / E 는 옵션만 유지,
+    디폴트 비활성.
+  - 구현은 별도 PR 예정. 신규 서브커맨드 `history-discover` /
+    `history-render` / `history-convert` / `history-upload` /
+    `history-media` + `revisions` / `media_revisions` /
+    `history_meta` 스키마 추가.
 - 코멘트(`meta/_comments.changes`) 이전.
 - 양방향 동기화. 본 스크립트는 DokuWiki → Confluence 단방향.
 
