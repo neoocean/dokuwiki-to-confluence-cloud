@@ -325,7 +325,18 @@ DokuWiki 가 본문 위에 자동 삽입하는 목차. Confluence 는 별도 `<a
 - 변환기가 모든 플러그인 출력을 Confluence storage 호환 형태로 보존.
 - 부분 손실 1건: **rss** 는 export 시점 스냅샷만 보존 (자동 갱신 안됨). **todo** 는 대부분 (841 pure `<ul>` 그룹 / 1547 task 항목) Confluence task-list 매크로로 변환되어 **클릭 가능한 체크박스**가 되고, mixed/nested 케이스만 `[x]/[ ]` 텍스트 마커로 폴백.
 
-## 9. 다음 단계
+## 9. struct 플러그인 데이터 이전 (별도 트랙)
+
+`docs/plugin-validation.md §6` 에서 발견된 고아 struct 데이터를 살아있는
+Confluence 데이터베이스로 옮기는 시나리오는
+[`docs/struct-migration.md`](struct-migration.md). 채택안 (2026-05-18):
+schema → Confluence native Database 우선, 미지원 컬럼 시 Page
+Properties + Report 폴백, 최후 단순 표 스냅샷. 새 서브커맨드
+`struct-discover/convert/upload/status` + `struct_schemas` /
+`struct_columns` / `struct_rows` / `struct_references` 테이블.
+1,213 활성 row (4 schema) 가 대상.
+
+## 10. 다음 단계
 
 - `upload --dry-run` 으로 트리 / stub / 첨부 예상치 출력 확인.
 - Confluence 공간/루트 페이지 결정 → 실제 업로드 → `rewrite-links` 로 placeholder 해결.

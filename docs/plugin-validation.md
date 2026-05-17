@@ -198,21 +198,23 @@ DokuWiki 가 렌더한 출력 기준:
 사라진다.** Confluence 페이지의 표는 정적 스냅샷이 됨 — row 추가/aggregator
 재계산 안 됨.
 
-### 6.3 활성 struct 페이지를 *진짜* 옮겨야 할 경우의 옵션
+### 6.3 활성 struct 데이터를 *진짜* 옮겨야 할 경우의 옵션
 
-본 인스턴스에는 해당 없으나 다른 환경에서 마이그레이션할 때 검토:
+현 인스턴스의 메인 페이지 마크업은 struct syntax 가 0건이지만,
+`meta/struct.sqlite3` 에 **1,213 활성 row** (4 schema) 가 남아 있어
+*데이터 자체*는 이전 가치가 있다.
 
-1. **스냅샷 유지** (default) — 현 변환기 동작. 추가 작업 없음.
-2. **데이터 보존을 content property 로** — `meta/struct.sqlite3` 의 row 들을
-   schema 별로 dump → 각 페이지의 Confluence content property
+1. **스냅샷 유지** — 현 변환기 동작. 추가 작업 없음. struct.sqlite3
+   는 호스트 P4 백업에 남고 Confluence 에는 안 들어감.
+2. **데이터 보존을 content property 로** — `meta/struct.sqlite3` 의 row
+   들을 schema 별로 dump → 각 페이지의 Confluence content property
    `dokuwiki.struct.<schema>` JSON 에 저장. history-migration §D 와 동일
    패턴. UI 비표시지만 후속 도구가 재구성 가능.
-3. **schema → Confluence DB 매크로 매핑** — Atlassian 의 *Database* 매크로
-   또는 third-party plugin 으로 schema 자체를 재구성. **자동 변환 도구
-   없음 — 수동 작업**. 옮기는 데이터 양이 많지 않다면 표 그대로 두는
-   것이 실용적.
-
-이 옵션들은 현 PR 범위 밖. 필요 시 별도 시나리오 문서로 분리한다.
+3. **schema → Confluence Database 매크로 매핑** — **채택 (2026-05-18)**.
+   Atlassian native Database 컨텐츠 타입으로 schema 자체를 재구성. 우선
+   순위: A native database (`/wiki/api/v2/databases`) → 미지원 컬럼 시 B
+   Page Properties + Report 매크로 → 최후 C 단순 표 스냅샷. 상세는
+   [`docs/struct-migration.md`](struct-migration.md). 구현은 별도 PR.
 
 ## 7. 새 플러그인을 추가했을 때
 
