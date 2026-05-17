@@ -268,19 +268,47 @@ DokuWiki 가 본문 위에 자동 삽입하는 목차. Confluence 는 별도 `<a
 
 `<strong>`, `<em>`, `<em class="u">` (밑줄), `<code>` (monospace), `<del>`/`<s>`, `<sub>`, `<sup>` — 모두 storage format 그대로 보존.
 
-## 7. 라이브 테스트로 발견된 버그 (CL 52684)
+## 7. 라이브 테스트로 발견된 버그
 
-`dev/dokuwiki-local` 인스턴스에서 `wiki:syntax` 한 페이지만 돌려도 다음
-네 가지가 한꺼번에 드러났다. 각 항목은 변환기에 패치되어 있고, 같은 패턴이
-다른 페이지에서 또 나타나면 같은 길로 디버그한다.
+### 7.1 wiki:syntax 한 페이지에서 발견 (CL 52684)
+
+`dev/dokuwiki-local` 인스턴스에서 한 페이지만 돌려도 다음 네 가지가 드러났다.
 
 1. **path-style 내부 링크 미인식.** `userewrite` 가 켜진 인스턴스는 `?id=` 없는 path 형 URL 을 보내 변환기가 external 로 분류. → `data-wiki-id` 와 `wikilink*` class 를 1순위로.
 2. **`<!-- EDIT{...} -->` 메타가 텍스트로 누수.** bs4 의 코멘트 핸들링이 일부 경로에서 내부 JSON 을 가시 노드로 만든다. → 모든 HTML 코멘트 제거.
 3. **외부 이미지 proxy 가 첨부로 잘못 분류.** `fetch.php?media=https%3A%2F%2F...` 형태가 `media=` 분류에 잡혀 attachments 테이블에 가짜 행을 만들었다. → `media=` 값이 `http(s)://` 로 시작하면 external 로 재분류, `<img src>` 를 실제 URL 로 교체.
 4. **재변환 시 FAILED 첨부 잔존.** 이전 run 의 FAILED 행이 정리되지 않아 디버그 루프 마다 attachments 테이블이 누적. → re-convert 가 `status != 'UPLOADED'` 인 행을 모두 정리. UPLOADED 는 보존해 Confluence 가 이미 받은 첨부를 두 번 올리지 않는다.
 
-## 8. 다음 단계
+### 7.2 전체 1569 페이지 풀 트리에서 발견 (CL 52687, 52688, 52689)
 
-- 1569 페이지 전체에 대한 `render` + `convert` 일괄 실행. 추가 엣지 케이스(플러그인 마크업, 사용자 정의 매크로, 깨진 페이지 등) 발견.
+`dev up → discover → render → convert` 일괄 실행 후 storage XML 을 grep 으로 감사하면서 발견.
+
+| # | 증상 (corpus 통계)                                     | 원인                                                                                                                                                    | 수정 (CL)                                                                                                                                                |
+|---|--------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 5 | `<script>`, `<link>`, `<form>`, `<meta>` 각 1208 파일에 잔존 | DokuWiki 의 export_xhtmlbody 가 ACL-denied 페이지 또는 일부 플러그인 출력 시 풀 HTML 문서(헤더/푸터 포함)를 토함                                          | `_convert_html_to_storage` 가 `<main id="dokuwiki__content">` 발견 시 그 안의 `<div class="page">` 만 추출. 위험 태그(`script/style/link/meta/noscript/iframe/embed/object/form/head`) 일괄 decompose. `<html>/<body>` 는 unwrap. dokuwiki chrome 도 id/class 단위로 제거 (CL 52687)         |
+| 6 | URL-encoded 미디어 경로로 한국어 파일 resolve 실패. e.g. `ride:files:%EB%8F%84%EC%84%A0%EC%82%AC.gpx` | `_categorize_href` 가 `parsed.path` 를 raw 그대로 사용. `parse_qs` 는 자동 디코딩하지만 path 는 안 함                                                       | `urllib.parse.unquote(parsed.path)` 후 prefix 매칭. `_href_to_doku_id_via_path` 도 동일 (CL 52687)                                                       |
+| 7 | `plugin_include__<page-id>` 같은 dynamic class 가 166 파일에 잔존 | include 플러그인이 transcluded section 마다 페이지 ID 를 박은 class 부여                                                                                | 노이즈 class prefix 목록에 `plugin_` 추가 (CL 52687)                                                                                                    |
+| 8 | ACL 로 anonymous deny 된 네임스페이스가 dev 인스턴스에서 풀 로그인 폼 응답 (1208 페이지) | 호스트의 `acl.auth.php` 가 c:, u:, ride:, lam:, blog:, p:, oh:, j:, g:, gd:, reads:, um:, user: 등 광범위하게 `@ALL=0` (no permission). dev 컨테이너도 동일 conf 사용 | `run.py dev up` 이 clone 직후 `conf/local.php` 의 `useacl` 을 0 으로 패치 → 모든 페이지 anonymous 읽기 허용. 원본 호스트 데이터는 손대지 않음 (CL 52688) |
+| 9 | todo 플러그인의 `<input type="checkbox">` 가 191 파일에 잔존. Confluence storage 는 인터랙티브 컨트롤 거부 | dokuwiki todo 플러그인이 인라인 체크박스를 그대로 출력                                                                                                  | `<span class="todo">` 를 발견 시 `[x] <text>` 또는 `[ ] <text>` 텍스트 마커로 교체. 또한 `input/button/select/option/textarea` 도 안전망으로 strip (CL 52689) |
+
+### 7.3 누적 통계
+
+- 1569 페이지 디스커버 → 1567 RENDERED + 2 SKIPPED (`pages/.txt` 와 빈 본문의 root `start`).
+- 1567 CONVERTED, 실패 0.
+- 첨부 10659 DISCOVERED, 140 FAILED (디스크에 미디어 없음 — 정상 데이터 상태).
+- 위험 태그 잔존 0건 (`script/form/head/iframe/input/button/select/textarea`).
+- URL-encoded 잔존은 외부 medium.com URL 의 8 파일 — 그대로 보존 정책.
+
+## 8. 플러그인 검증
+
+별도 문서 [`docs/plugin-validation.md`](plugin-validation.md) 참고. 요약:
+
+- 활성 플러그인 6개(blog / include / pagelist / tag / todo / wrap) 모두 dev 컨테이너에서 정상 렌더링 확인.
+- 변환기가 모든 플러그인 출력을 Confluence storage 호환 형태로 보존.
+- 부분 손실 2건: **rss** 는 export 시점 스냅샷만 보존 (자동 갱신 안됨), **todo** 는 시각적 마커는 보존되나 Confluence UI 에서 클릭 가능한 task 가 아님.
+
+## 9. 다음 단계
+
 - `upload --dry-run` 으로 트리 / stub / 첨부 예상치 출력 확인.
 - Confluence 공간/루트 페이지 결정 → 실제 업로드 → `rewrite-links` 로 placeholder 해결.
+- 새 플러그인이 추가되면 `docs/plugin-validation.md` §6 절차로 재검증.
