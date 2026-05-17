@@ -478,7 +478,8 @@ def _categorize_href(href: str) -> dict:
     if "do" in q:
         return {"kind": "action"}
 
-    path = parsed.path or ""
+    from urllib.parse import unquote
+    path = unquote(parsed.path or "")  # 한국어/유니코드 미디어/페이지 명 URL-decode
     if path.startswith("/_media/"):
         return {"kind": "media", "id": path[len("/_media/"):].replace("/", ":")}
     if path.startswith("/_detail/"):
@@ -502,13 +503,14 @@ def _href_to_doku_id_via_path(href: str) -> str | None:
     URL rewrite (`useslash`) 가 켜진 환경에서 dokuwiki 는 내부 페이지 링크를
     `?id=` 가 없는 path 형태로 출력한다: `/wiki/syntax`, `/playground/playground`.
     이 helper 는 그 path 부분을 doku_id 로 환산한다. 변환 실패 시 None.
+    한국어 등 비-ASCII 페이지명은 URL-인코딩되어 들어오므로 unquote 한다.
     """
-    from urllib.parse import urlparse
+    from urllib.parse import unquote, urlparse
 
     parsed = urlparse(href)
     if parsed.scheme:
         return None
-    path = (parsed.path or "").strip("/")
+    path = unquote(parsed.path or "").strip("/")
     if not path:
         return None
     # `/doku.php/foo:bar` 등 명시적 prefix 는 별도 분류기가 처리한다
@@ -538,7 +540,44 @@ def _convert_html_to_storage(
 
     soup = BeautifulSoup(raw_html, "html.parser")
 
-    # 1) DokuWiki 노이즈 제거
+    # 0) full-HTML 응답 폴백.
+    # `do=export_xhtmlbody` 인데도 일부 페이지는 (ACL denial, 일부 플러그인,
+    # 일부 버전에서) 헤더/풋터까지 포함한 풀 HTML 문서를 토해낸다.
+    # `<main id="dokuwiki__content">` 안의 `<div class="page">` 가 실제
+    # 콘텐츠. 그게 보이면 그 children 만 살리고 나머지는 통째로 버린다.
+    main = soup.find("main", id="dokuwiki__content")
+    if main is not None:
+        page_div = main.find("div", class_="page") or main
+        new_soup = BeautifulSoup("", "html.parser")
+        for child in list(page_div.children):
+            new_soup.append(child.extract())
+        soup = new_soup
+
+    # 1) Confluence storage 가 받아들이지 않거나 의미 없는 태그 일괄 제거.
+    # script/style/link/meta/noscript/iframe/embed/object/form 은 위험 또는 노이즈.
+    # head/html/body 는 보이면 unwrap (children 만 살림).
+    for tag_name in ("script", "style", "link", "meta", "noscript",
+                     "iframe", "embed", "object", "form", "head"):
+        for t in soup.find_all(tag_name):
+            t.decompose()
+    for tag_name in ("html", "body"):
+        for t in soup.find_all(tag_name):
+            t.unwrap()
+
+    # DokuWiki 의 chrome (login 폼이 박힌 mode_denied 응답이나 풀 페이지에
+    # 묻어 들어오는 헤더/푸터/내비) 제거.
+    for sel_id in (
+        "dokuwiki__site", "dokuwiki__top", "dokuwiki__header",
+        "dokuwiki__footer", "dokuwiki__pagetools", "dokuwiki__aside",
+        "dokuwiki__usertools", "dokuwiki__sitetools",
+    ):
+        for t in soup.find_all(id=sel_id):
+            t.decompose()
+    for cls in ("breadcrumbs", "trace", "tools", "docInfo", "no", "headings"):
+        for t in soup.find_all(class_=cls):
+            t.decompose()
+
+    # 2) 기존 노이즈 제거
     for a in soup.find_all("a", class_="secedit"):
         a.decompose()
     for div in soup.find_all("div", class_="toc"):
@@ -680,7 +719,10 @@ def _convert_html_to_storage(
         pre.replace_with(macro)
 
     # 6) 잡 class/id 정리 (보존이 안전한 것은 남긴다)
-    NOISE_CLASS_PREFIXES = ("sectionedit", "wikilink", "level", "media", "interwiki")
+    NOISE_CLASS_PREFIXES = (
+        "sectionedit", "wikilink", "level", "media", "interwiki",
+        "plugin_",  # plugin_include__<page-id> 같이 ID 가 박힌 dynamic class
+    )
     NOISE_CLASS_EXACT = {"toc", "page", "dokuwiki", "plugin_include_content"}
     for tag in soup.find_all(True):
         cls = tag.get("class")
