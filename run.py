@@ -465,7 +465,12 @@ def _categorize_href(href: str) -> dict:
     q = parse_qs(parsed.query)
 
     if "media" in q and q["media"]:
-        return {"kind": "media", "id": q["media"][0]}
+        media_val = q["media"][0]
+        # DokuWiki 는 외부 URL 도 fetch.php 의 media= 에 URL-인코딩해 넘긴다
+        # (썸네일/리사이즈용 프록시). 이건 첨부가 아니라 외부 이미지로 둔다.
+        if media_val.startswith(("http://", "https://")):
+            return {"kind": "external", "href": media_val}
+        return {"kind": "media", "id": media_val}
     if "id" in q and q["id"]:
         return {"kind": "page", "id": q["id"][0], "anchor": parsed.fragment or None}
     if "do" in q:
@@ -490,6 +495,26 @@ def _media_filename(media_id: str) -> str:
     return media_id.rsplit(":", 1)[-1]
 
 
+def _href_to_doku_id_via_path(href: str) -> str | None:
+    """
+    URL rewrite (`useslash`) 가 켜진 환경에서 dokuwiki 는 내부 페이지 링크를
+    `?id=` 가 없는 path 형태로 출력한다: `/wiki/syntax`, `/playground/playground`.
+    이 helper 는 그 path 부분을 doku_id 로 환산한다. 변환 실패 시 None.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(href)
+    if parsed.scheme:
+        return None
+    path = (parsed.path or "").strip("/")
+    if not path:
+        return None
+    # `/doku.php/foo:bar` 등 명시적 prefix 는 별도 분류기가 처리한다
+    if path.startswith(("doku.php", "_media/", "_detail/", "lib/exe/")):
+        return None
+    return path.replace("/", ":")
+
+
 def _resolve_media_path(src_root: Path, media_id: str) -> Path | None:
     rel = Path(*media_id.split(":"))
     candidate = src_root / "media" / rel
@@ -507,7 +532,7 @@ def _convert_html_to_storage(
     attachments: [{'media_id': 'wiki:foo.png', 'filename': 'foo.png', 'src_path': str|None}, ...]
     title:       첫 h1 의 텍스트(없으면 None)
     """
-    from bs4 import BeautifulSoup
+    from bs4 import BeautifulSoup, Comment
 
     soup = BeautifulSoup(raw_html, "html.parser")
 
@@ -518,6 +543,9 @@ def _convert_html_to_storage(
         div.decompose()
     for div in soup.find_all(id="dw__toc"):
         div.decompose()
+    # DokuWiki 의 EDIT{...} section-edit 메타 코멘트 등 모든 HTML 코멘트 제거
+    for c in soup.find_all(string=lambda s: isinstance(s, Comment)):
+        c.extract()
 
     # 2) 제목 후보 (첫 h1, 없으면 첫 h2)
     title = None
@@ -531,9 +559,15 @@ def _convert_html_to_storage(
 
     # 3) <img> -> <ac:image>
     for img in list(soup.find_all("img")):
-        cat = _categorize_href(img.get("src", ""))
+        src_orig = img.get("src", "")
+        cat = _categorize_href(src_orig)
+        if cat["kind"] == "external":
+            # DokuWiki fetch.php proxy 경유로 외부 이미지를 감싼 경우
+            # (?media=http%3A...) src 를 실제 외부 URL 로 교체.
+            if cat.get("href") and cat["href"] != src_orig:
+                img["src"] = cat["href"]
+            continue
         if cat["kind"] != "media":
-            # 외부 이미지는 그대로 둔다 (storage format 도 <img> 허용)
             continue
         media_id = cat["id"]
         filename = _media_filename(media_id)
@@ -569,7 +603,21 @@ def _convert_html_to_storage(
     # 4) <a> 변환
     for a in list(soup.find_all("a")):
         href = a.get("href", "")
-        cat = _categorize_href(href)
+        # DokuWiki 가 부여하는 data-wiki-id / wikilink* 클래스가 있으면
+        # URL rewrite 설정과 무관하게 가장 신뢰할 수 있는 단서다.
+        wiki_id_attr = a.get("data-wiki-id")
+        classes = a.get("class") or []
+        is_wikilink = any(c.startswith("wikilink") for c in classes)
+        if wiki_id_attr or (is_wikilink and not href.startswith(("http://", "https://"))):
+            target_id = wiki_id_attr or _href_to_doku_id_via_path(href)
+            if target_id:
+                from urllib.parse import urlparse as _urlparse
+                anchor = _urlparse(href).fragment or None
+                cat = {"kind": "page", "id": target_id, "anchor": anchor}
+            else:
+                cat = _categorize_href(href)
+        else:
+            cat = _categorize_href(href)
         if cat["kind"] == "page":
             target = cat["id"]
             anchor = cat.get("anchor")
@@ -729,10 +777,11 @@ def cmd_convert(args: argparse.Namespace) -> int:
         out_path.write_text(storage_xml, encoding="utf-8")
         content_hash = sha256_bytes(storage_xml.encode("utf-8"))
 
-        # 멱등성: 이 페이지의 이전 links/attachments 정리 후 재기록
+        # 멱등성: 이 페이지의 이전 links 와 미업로드 attachments 정리 후 재기록.
+        # 이미 UPLOADED 인 첨부는 보존해 다음 run 에서 중복 업로드를 막는다.
         conn.execute("DELETE FROM links WHERE src_doku_id=?", (doku_id,))
         conn.execute(
-            "DELETE FROM attachments WHERE page_doku_id=? AND status='DISCOVERED'",
+            "DELETE FROM attachments WHERE page_doku_id=? AND status != 'UPLOADED'",
             (doku_id,),
         )
 
