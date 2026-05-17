@@ -549,6 +549,69 @@ def _build_ac_task(soup, task_id: int, checked: bool, text: str):
     return task
 
 
+WRAP_SEMANTIC_MAP = {
+    "wrap_info":      "info",
+    "wrap_help":      "info",
+    "wrap_tip":       "tip",
+    "wrap_important": "note",
+    "wrap_note":      "note",
+    "wrap_alert":     "warning",
+    "wrap_warning":   "warning",
+    "wrap_danger":    "warning",
+}
+
+
+def _convert_wrap_callouts(soup) -> None:
+    """
+    dokuwiki wrap 플러그인의 callout/panel/인라인 강조를 Confluence storage
+    매크로(또는 일반 인라인 태그) 로 매핑한다.
+
+    block 컨테이너 (<div class="wrap_..."> ): 의미 클래스가 있으면
+        <ac:structured-macro ac:name=info|tip|note|warning> + ac:rich-text-body 로,
+        없고 wrap_box/wrap_round 면 panel 매크로로.
+    인라인 (<em>/<span class="wrap_em|wrap_hi">):
+        wrap_em -> <strong>, wrap_hi -> <span style="background-color: #fff59d">.
+    """
+    # block-level callouts
+    for div in list(soup.find_all("div")):
+        classes = div.get("class") or []
+        macro_name = None
+        for c in classes:
+            if c in WRAP_SEMANTIC_MAP:
+                macro_name = WRAP_SEMANTIC_MAP[c]
+                break
+        if not macro_name:
+            is_wrap_box = any(c in ("wrap_box", "wrap_round") for c in classes)
+            is_wrap = "plugin_wrap" in classes or any(c.startswith("wrap_") for c in classes)
+            if is_wrap_box and is_wrap:
+                macro_name = "panel"
+        if not macro_name:
+            continue
+
+        macro = soup.new_tag("ac:structured-macro")
+        macro["ac:name"] = macro_name
+        body = soup.new_tag("ac:rich-text-body")
+        for child in list(div.children):
+            body.append(child.extract())
+        macro.append(body)
+        div.replace_with(macro)
+
+    # inline emphasis
+    for tag in list(soup.find_all(["em", "span"])):
+        classes = tag.get("class") or []
+        if "wrap_em" in classes:
+            strong = soup.new_tag("strong")
+            for c in list(tag.children):
+                strong.append(c.extract())
+            tag.replace_with(strong)
+        elif "wrap_hi" in classes:
+            span = soup.new_tag("span")
+            span["style"] = "background-color: #fff59d;"
+            for c in list(tag.children):
+                span.append(c.extract())
+            tag.replace_with(span)
+
+
 def _convert_todos(soup) -> None:
     """
     DokuWiki todo plugin 출력을 Confluence task-list / 텍스트 마커로 변환.
@@ -630,6 +693,23 @@ def _convert_html_to_storage(
     # 거부. todo plugin 은 별도 변환 룰에서 텍스트 마커로 미리 교체된다 (아래
     # 1.5 단계).
     #
+    # 1.4) wrap plugin / callouts -> Confluence info/tip/note/warning/panel
+    #
+    # dokuwiki wrap 의 의미 클래스:
+    #   <WRAP info|help ...>    -> <div class="wrap_info ... plugin_wrap"> -> Confluence info 매크로
+    #   <WRAP tip ...>          -> wrap_tip                                 -> tip 매크로
+    #   <WRAP important|note>   -> wrap_important / wrap_note               -> note 매크로
+    #   <WRAP alert|warning|danger> -> wrap_alert/warning/danger             -> warning 매크로
+    #   <WRAP box|round ...>    -> wrap_box / wrap_round (제목 없는 박스)    -> panel 매크로
+    #
+    # 인라인 강조:
+    #   <wrap em>X</wrap>   -> <em class="wrap_em plugin_wrap">X</em>   -> <strong>X</strong>
+    #   <wrap hi>X</wrap>   -> <em class="wrap_hi plugin_wrap">X</em>   -> 노란 background-color span
+    #
+    # 정렬/레이아웃 클래스(wrap_left/right/center/clear/indent 등) 는 의미가
+    # 없어서 별도 변환 없이 div 그대로 두고, class 정리 단계에서 떨군다.
+    _convert_wrap_callouts(soup)
+
     # 1.5) todo plugin -> Confluence task-list / text marker
     #
     # dokuwiki todo:

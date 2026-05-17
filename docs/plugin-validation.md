@@ -97,7 +97,7 @@ done
 | 플러그인  | 대표 페이지                    | dokuwiki 출력                                                | 변환 결과                                                              |
 |-----------|--------------------------------|--------------------------------------------------------------|------------------------------------------------------------------------|
 | tag       | `u:note:notetaking`            | `<div class="tags"><a href=/tag/... rel="tag">공부법</a></div>` | placeholder `<a href="dwc-link:tag:공부법">공부법</a>` (S7 후 해결됨)  |
-| wrap      | `u:lam:2020`                   | `<em class="wrap_important plugin_wrap">목금 원격!!</em>`    | `<em class="wrap_important plugin_wrap">목금 원격!!</em>` 그대로 통과 |
+| wrap      | `u:lam:2020`, `ride:s200i`     | block: `<div class="wrap_<variant> ... plugin_wrap">`, 인라인: `<em class="wrap_em/wrap_hi ... plugin_wrap">` | **block**: 의미 클래스 → Confluence 매크로 (`info`/`tip`/`note`/`warning`/`panel`). **인라인**: `wrap_em` → `<strong>`, `wrap_hi` → 노란 background-color span. 정렬/레이아웃 변형 (`wrap_left/right/center` 등) 은 의미 없어 그대로 보존. 자세한 매핑 표: §6.4 (CL 52696) |
 | include   | `ride:구리300_cp목록`         | `<div class="plugin_include_content plugin_include__...">콘텐츠</div>` | div 의 plugin_ 클래스 제거, 콘텐츠 보존                                |
 | blog      | `u:note:start`                 | `<div class="inclmeta">` + 페이지 메타/링크/태그                | 그대로 통과 (페이지 링크는 dwc-link placeholder 로 변환)               |
 | topic     | `wiki:start` (`{{topic>til}}`) | `<table class="ul plgn__pglist">` 페이지 리스트 (9개)        | 표 + 링크 모두 보존, plgn__pglist 클래스도 보존                        |
@@ -215,6 +215,38 @@ DokuWiki 가 렌더한 출력 기준:
    순위: A native database (`/wiki/api/v2/databases`) → 미지원 컬럼 시 B
    Page Properties + Report 매크로 → 최후 C 단순 표 스냅샷. 상세는
    [`docs/struct-migration.md`](struct-migration.md). 구현은 별도 PR.
+
+## 6.4 wrap 플러그인 — callout / panel / 인라인 강조 매핑 (참조표)
+
+이 인스턴스의 wrap variant 사용 분포 (2026-05-18 측정):
+
+| variant                 | 페이지 수 | 카테고리        | dokuwiki 렌더링                                                    | 변환 결과                                                        |
+|-------------------------|-----------|-----------------|--------------------------------------------------------------------|------------------------------------------------------------------|
+| `<WRAP info ...>`       | 11        | 정보 박스       | `<div class="wrap_info ... plugin_wrap">`                          | `<ac:structured-macro ac:name="info"><ac:rich-text-body>…</…>` |
+| `<WRAP help ...>`       | (변형)    | 정보 박스       | `wrap_help`                                                        | 동일 (`info` 매크로)                                             |
+| `<WRAP tip ...>`        | 28        | 팁              | `wrap_tip`                                                         | `<ac:structured-macro ac:name="tip">`                            |
+| `<WRAP important ...>`  | 4         | 중요            | `wrap_important`                                                   | `<ac:structured-macro ac:name="note">`                           |
+| `<WRAP note ...>`       | (변형)    | 중요            | `wrap_note`                                                        | 동일 (`note` 매크로)                                             |
+| `<WRAP alert ...>`      | 2         | 경고            | `wrap_alert`                                                       | `<ac:structured-macro ac:name="warning">`                        |
+| `<WRAP warning/danger>` | (변형)    | 경고            | `wrap_warning` / `wrap_danger`                                     | 동일 (`warning` 매크로)                                          |
+| `<WRAP box ...>`        | 14        | 일반 박스       | `wrap_box`                                                         | `<ac:structured-macro ac:name="panel">` (제목 없음)              |
+| `<WRAP round ...>`      | 8         | 둥근 박스       | `wrap_round` (의미 클래스 없이만 있으면)                          | `panel` 매크로                                                   |
+| `<wrap em>X</wrap>`     | 21        | 인라인 강조     | `<em class="wrap_em ... plugin_wrap">X</em>`                       | `<strong>X</strong>`                                             |
+| `<wrap hi>X</wrap>`     | 44        | 인라인 형광펜   | `<em class="wrap_hi ... plugin_wrap">X</em>`                       | `<span style="background-color: #fff59d;">X</span>`              |
+| `<WRAP left/right/center>` | 28+31  | 정렬            | `wrap_left` / `wrap_right` / `wrap_center`                         | div 그대로 (Confluence 가 class 무시; 시각적 효과 없음)         |
+| `<WRAP clear/indent>`   | (적음)    | 레이아웃        | `wrap_clear` 등                                                   | 동일 (div 보존, 무시됨)                                          |
+
+복합 variant (예: `<WRAP left round info 100%>`) 는 *의미 클래스 우선*
+규칙으로 처리: `wrap_info` 가 매치되면 그 div 전체가 `info` 매크로로
+승격되고 정렬/스타일 정보는 매크로 안에서 손실. 정렬이 정말 중요한
+사례는 적어 절충 OK.
+
+변환기 코드 위치: `_convert_wrap_callouts(soup)` in `run.py`. 보강 시
+`WRAP_SEMANTIC_MAP` 딕셔너리에 한 줄 추가.
+
+코어 `> 인용문` (blockquote, 192 페이지) 은 dokuwiki 가 `<blockquote>`
+로 렌더하고 Confluence storage 가 그대로 받아들이므로 변환기 통과만
+필요. 본 매핑 범위 밖.
 
 ## 7. 새 플러그인을 추가했을 때
 
