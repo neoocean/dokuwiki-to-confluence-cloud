@@ -116,3 +116,171 @@
 5. 동일 명령 `--dry-run` 제거 후 실제 업로드.
 6. `python run.py rewrite-links` 로 2차 통과.
 7. 결과 요약 확인 → 실패 항목 `--only` 로 재시도.
+
+## 5. 로컬 DokuWiki 테스트 환경
+
+라이브 테스트는 호스트의 `~/p4/playground/docker/dokuwiki/data` 를 절대
+수정하지 않으면서 `?do=export_xhtmlbody` 가 응답하는 인스턴스를 띄워야 한다.
+실제로 시도해 본 결과를 정리한다.
+
+### 5.1 시도해본 옵션과 결론
+
+| 시도 | 결과 |
+|------|------|
+| `bitnami/dokuwiki:latest` (기존 운영 컴포즈 재사용) | Docker Hub 접근 거부 — Bitnami 가 공개 카탈로그를 정리해 더 이상 풀할 수 없음. |
+| 원본 데이터를 `:ro` 로 그대로 마운트 | DokuWiki 부팅 시 `data/pages`, `data/attic`, `data/meta`, `data/media` 각각에 대해 writable 검증을 수행해 거의 모든 서브디렉터리가 writable 이어야 통과한다. `:ro` 마운트로는 부팅 자체가 안 됨. |
+| 원본 `:ro` + writable 디렉터리만 부분 overlay | tmpfs overlay 가 root 소유로 마운트돼 apache (`www-data`) 가 쓰지 못함. 시작 스크립트에서 chown 해도 mediadir 검증을 끝내 통과하지 못함. |
+| **APFS clonefile (`cp -cR`) 로 트리 전체 복제 후 writable 마운트** | 채택. 14GB 가 9.5초·디스크 사용 0 으로 복제되고 원본은 손대지 않음. |
+
+### 5.2 채택한 셋업
+
+`dev/dokuwiki-local/docker-compose.yml` 에 보존. 핵심:
+
+- 이미지: `php:8.2-apache` (DokuWiki 트리에 `doku.php` 와 `vendor/` 가 모두 포함돼 있어 별도 dokuwiki 이미지 불필요).
+- 데이터 마운트: `/tmp/dwc_test_dokuwiki/dwdata:/var/www/html:rw` — `cp -cR /Users/neoocean/p4/playground/docker/dokuwiki/data /tmp/dwc_test_dokuwiki/dwdata` 로 만든 APFS clonefile 복제본.
+- 포트: `127.0.0.1:18080:80` (로컬 한정).
+- PHP 8.2 deprecation/warning 억제: 컨테이너 시작 시 `display_errors=Off`, `error_reporting=E_ERROR` 를 `/usr/local/etc/php/conf.d/zz-quiet.ini` 에 주입. 그러지 않으면 export 응답 본문 앞에 `<br /><b>Warning</b>: Trying to access array offset on value of type bool ...` 가 섞여 들어와 bs4 가 잘못 파싱한다.
+- mod_rewrite 활성화 (`a2enmod rewrite`) — DokuWiki 의 path 스타일 URL 처리에 필요.
+
+### 5.3 실행/정리
+
+위 절차(데이터 복제 + docker compose + 헬스체크 + 정리)는 `run.py dev` 서브커맨드로 패키징되어 있다.
+
+```sh
+# 컨테이너 기동 — 처음이면 호스트 데이터를 APFS clonefile 로 복제하고
+# (cp -cR; 실패 시 cp -R 폴백), docker compose 로 띄운 뒤 export 엔드포인트가
+# 200 을 반환할 때까지 최대 30초 대기.
+python run.py dev up
+# (필요하면 다른 원본 디렉터리로: `python run.py dev up --src /other/path`)
+
+# 한 페이지로 end-to-end 검증
+python run.py discover --src /Users/neoocean/p4/playground/docker/dokuwiki/data/data
+python run.py render   --base-url http://127.0.0.1:18080 --only wiki:syntax
+python run.py convert  --only wiki:syntax
+python run.py status
+
+# 컨테이너만 종료 (복제본은 다음 `dev up` 에서 즉시 재사용)
+python run.py dev down
+
+# 복제본까지 정리해 디스크/inode 도 회수
+python run.py dev down --purge
+```
+
+내부 동작은 다음과 같다.
+
+- `dev up`
+  1. `/tmp/dwc_test_dokuwiki/dwdata` 가 없으면 `cp -cR <src> <dst>` 실행. macOS APFS 면 clonefile 로 0-byte. 다른 파일시스템이면 자동으로 `cp -R` 로 폴백한다(이 경우 디스크가 원본만큼 늘어남).
+  2. `dev/dokuwiki-local/docker-compose.yml` 를 사용해 `docker compose up -d`.
+  3. `http://127.0.0.1:18080/doku.php?id=wiki:syntax&do=export_xhtmlbody` 가 HTTP 200 을 반환할 때까지 1초 간격으로 폴링(최대 30초). 타임아웃 시 종료 코드 1.
+- `dev down`
+  1. `docker compose down` 실행.
+  2. `--purge` 옵션 시 `/tmp/dwc_test_dokuwiki/dwdata` 와 빈 부모를 정리.
+
+이미 컨테이너가 떠 있을 때 `dev up` 을 다시 호출해도 안전하다 — 복제본이 있으면 그대로 쓰고 compose 가 idempotent 하게 동작한다.
+
+## 6. DokuWiki 렌더링 출력에서 확인된 사실
+
+`?do=export_xhtmlbody` 출력을 실제로 읽어보고 변환기가 알아야 할 패턴들.
+모든 인스턴스에 일반화되는 것은 아니므로 새 인스턴스에서 변환기를 돌릴 때는
+다시 한 페이지부터 검증해야 한다.
+
+### 6.1 내부 페이지 링크
+
+URL rewrite (`useslash`/`userewrite`) 설정에 따라 모양이 갈린다.
+
+- `userewrite=0` (기본): `<a href="/doku.php?id=wiki:syntax">…</a>`
+- `userewrite=1` (path-rewrite, 본 인스턴스): `<a href="/wiki/syntax">…</a>` — `?id=` 가 사라짐.
+
+다행히 두 모드 모두 `<a>` 에 다음 두 단서를 같이 박는다:
+
+- `class="wikilink1"` — 페이지가 존재
+- `class="wikilink2"` — 페이지 없음 (broken link)
+- `data-wiki-id="<doku_id>"` — 항상 절대 doku id
+
+따라서 변환기는 **href 보다 `data-wiki-id` 와 `wikilink*` class 를 먼저** 보고 그 값을 doku_id 로 채택한다. URL 분석은 fallback.
+
+### 6.2 미디어 / 첨부 URL
+
+- 내부 미디어: `/_media/<ns>/<file>` 혹은 `/lib/exe/fetch.php?media=<ns>:<file>`
+- 이미지 디테일 페이지: `/_detail/<ns>/<file>`
+- **외부 이미지 proxy**: `/lib/exe/fetch.php?w=200&h=50&tok=...&media=https%3A%2F%2Fwww.php.net%2Fimages%2Fphp.gif` — DokuWiki 의 리사이즈/캐시 프록시 기능. `media=` 가 URL-인코딩된 외부 URL 을 담는다.
+
+변환기 규칙: `media=` 값이 `http://` 또는 `https://` 로 시작하면 첨부가 아니라 **외부 이미지** 로 분류하고 `<img src>` 를 디코딩된 실제 URL 로 교체한다. 첨부 테이블에는 넣지 않는다.
+
+### 6.3 인터위키 / 외부 링크
+
+- `<a class="interwiki iw_<shortname>" href="https://...">` — 외부지만 dokuwiki 가 prefixed 단축 표기로 만들어 준 링크 (e.g. `interwiki iw_doku` → `dokuwiki>foo` 표기).
+- `<a class="urlextern" href="https://...">` — 일반 외부 URL.
+
+둘 다 storage format 그대로 통과 (Confluence 가 보통의 `<a>` 를 수용한다). class 는 정리 단계에서 떨군다.
+
+### 6.4 section-edit 메타 코멘트
+
+각 섹션 끝에 다음 마커가 박힌다:
+
+```html
+<!-- EDIT{"target":"section","name":"Formatting Syntax","hid":"formatting_syntax",
+         "codeblockOffset":0,"secid":1,"range":"1-472"} -->
+```
+
+DokuWiki 의 "이 섹션만 편집" 기능을 위한 메타. Confluence 에는 의미 없고
+bs4 의 일부 시리얼라이즈 경로에서 코멘트 내부 JSON 이 가시 텍스트로 새는
+사례가 있어 변환기는 **모든 HTML 코멘트를 일괄 제거**한다.
+
+### 6.5 헤딩과 secedit 앵커
+
+```html
+<h1 class="sectionedit1" id="formatting_syntax">
+  Formatting Syntax
+  <a class="secedit" href="?do=edit&id=wiki:syntax&rev=&sectid=1" title="Edit">
+    <span>Edit</span>
+  </a>
+</h1>
+```
+
+`<a class="secedit">` 는 제거. `class="sectionedit<N>"` 도 노이즈로 떨어뜨림. `id` 는 보존 (페이지 내 앵커 링크가 가리킴).
+
+### 6.6 자동 생성된 TOC
+
+```html
+<div class="toc">…</div>
+<div id="dw__toc">…</div>
+```
+
+DokuWiki 가 본문 위에 자동 삽입하는 목차. Confluence 는 별도 `<ac:structured-macro ac:name="toc"/>` 를 갖고 있으므로 변환기는 이 div 를 통째로 제거한다.
+
+### 6.7 코드 블록
+
+```html
+<pre class="code python">
+<span class="kw1">def</span> hello(): …
+</pre>
+```
+
+- `class="code"` 또는 `class="code <lang>"`
+- 내부에 GeSHi 신택스 하이라이트용 `<span>` 들이 들어있으면 그것까지 합쳐 `get_text()` 로 평탄화한다 — Confluence 의 `code` 매크로는 plain text + 별도 language 파라미터를 받으므로 안전.
+
+### 6.8 파일 인용
+
+`<pre class="file">` 는 dokuwiki 의 `<file ...>` 매크로 출력. 변환기는 `code` 와 동일하게 처리.
+
+### 6.9 인라인 포맷팅
+
+`<strong>`, `<em>`, `<em class="u">` (밑줄), `<code>` (monospace), `<del>`/`<s>`, `<sub>`, `<sup>` — 모두 storage format 그대로 보존.
+
+## 7. 라이브 테스트로 발견된 버그 (CL 52684)
+
+`dev/dokuwiki-local` 인스턴스에서 `wiki:syntax` 한 페이지만 돌려도 다음
+네 가지가 한꺼번에 드러났다. 각 항목은 변환기에 패치되어 있고, 같은 패턴이
+다른 페이지에서 또 나타나면 같은 길로 디버그한다.
+
+1. **path-style 내부 링크 미인식.** `userewrite` 가 켜진 인스턴스는 `?id=` 없는 path 형 URL 을 보내 변환기가 external 로 분류. → `data-wiki-id` 와 `wikilink*` class 를 1순위로.
+2. **`<!-- EDIT{...} -->` 메타가 텍스트로 누수.** bs4 의 코멘트 핸들링이 일부 경로에서 내부 JSON 을 가시 노드로 만든다. → 모든 HTML 코멘트 제거.
+3. **외부 이미지 proxy 가 첨부로 잘못 분류.** `fetch.php?media=https%3A%2F%2F...` 형태가 `media=` 분류에 잡혀 attachments 테이블에 가짜 행을 만들었다. → `media=` 값이 `http(s)://` 로 시작하면 external 로 재분류, `<img src>` 를 실제 URL 로 교체.
+4. **재변환 시 FAILED 첨부 잔존.** 이전 run 의 FAILED 행이 정리되지 않아 디버그 루프 마다 attachments 테이블이 누적. → re-convert 가 `status != 'UPLOADED'` 인 행을 모두 정리. UPLOADED 는 보존해 Confluence 가 이미 받은 첨부를 두 번 올리지 않는다.
+
+## 8. 다음 단계
+
+- 1569 페이지 전체에 대한 `render` + `convert` 일괄 실행. 추가 엣지 케이스(플러그인 마크업, 사용자 정의 매크로, 깨진 페이지 등) 발견.
+- `upload --dry-run` 으로 트리 / stub / 첨부 예상치 출력 확인.
+- Confluence 공간/루트 페이지 결정 → 실제 업로드 → `rewrite-links` 로 placeholder 해결.

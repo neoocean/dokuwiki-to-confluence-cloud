@@ -20,7 +20,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -1536,6 +1538,94 @@ def cmd_rewrite_links(args: argparse.Namespace) -> int:
     return 0 if failed == 0 else 1
 
 
+# ---------- 보조: dev up/down (로컬 DokuWiki 테스트 컨테이너) ----------
+
+DEV_COMPOSE_REL = Path("dev/dokuwiki-local/docker-compose.yml")
+DEV_CLONE_DST = Path("/tmp/dwc_test_dokuwiki/dwdata")
+DEV_DEFAULT_SRC = Path("/Users/neoocean/p4/playground/docker/dokuwiki/data")
+DEV_BASE_URL = "http://127.0.0.1:18080"
+DEV_HEALTH_PROBE = "/doku.php?id=wiki:syntax&do=export_xhtmlbody"
+DEV_HEALTH_TIMEOUT = 30
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _dev_clone_source(src: Path, dst: Path) -> int:
+    """APFS clonefile (`cp -cR`) 를 우선 시도, 실패 시 평범한 `cp -R` 로 폴백."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    log(f"호스트 데이터 복제: {src} -> {dst}")
+    rc = subprocess.call(["cp", "-cR", str(src), str(dst)])
+    if rc == 0:
+        return 0
+    log("cp -cR 실패 (APFS 외 파일시스템 가능성). cp -R 로 재시도 — 디스크 사용량이 원본 크기만큼 증가합니다.")
+    return subprocess.call(["cp", "-R", str(src), str(dst)])
+
+
+def _dev_wait_healthy(timeout: int = DEV_HEALTH_TIMEOUT) -> bool:
+    import urllib.error
+    import urllib.request
+
+    url = DEV_BASE_URL + DEV_HEALTH_PROBE
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            resp = urllib.request.urlopen(url, timeout=2)
+            if resp.status == 200:
+                return True
+        except (urllib.error.URLError, OSError):
+            pass
+        time.sleep(1)
+    return False
+
+
+def cmd_dev(args: argparse.Namespace) -> int:
+    compose = _project_root() / DEV_COMPOSE_REL
+    if not compose.is_file():
+        log(f"compose 파일이 없습니다: {compose}")
+        return 2
+
+    if args.action == "up":
+        src = Path(args.src).expanduser().resolve() if args.src else DEV_DEFAULT_SRC
+        if not src.is_dir():
+            log(f"호스트 DokuWiki 데이터 디렉터리가 없습니다: {src}")
+            return 2
+        if not DEV_CLONE_DST.exists():
+            if _dev_clone_source(src, DEV_CLONE_DST) != 0:
+                log("데이터 복제 실패")
+                return 1
+        else:
+            log(f"기존 복제본 재사용: {DEV_CLONE_DST}")
+
+        log("docker compose up -d")
+        if subprocess.call(["docker", "compose", "-f", str(compose), "up", "-d"]) != 0:
+            return 1
+
+        log(f"헬스 체크 — 최대 {DEV_HEALTH_TIMEOUT}s 대기")
+        if not _dev_wait_healthy():
+            log("타임아웃: 컨테이너가 응답하지 않음. `docker logs dokuwiki-mig` 로 진단.")
+            return 1
+        log(f"준비 완료: {DEV_BASE_URL}")
+        log("  예) python run.py render --base-url " + DEV_BASE_URL + " --only wiki:syntax")
+        return 0
+
+    if args.action == "down":
+        log("docker compose down")
+        rc = subprocess.call(["docker", "compose", "-f", str(compose), "down"])
+        if args.purge:
+            if DEV_CLONE_DST.exists():
+                log(f"복제본 삭제: {DEV_CLONE_DST}")
+                shutil.rmtree(DEV_CLONE_DST, ignore_errors=True)
+            parent = DEV_CLONE_DST.parent
+            if parent.exists() and not any(parent.iterdir()):
+                parent.rmdir()
+        return rc
+
+    log(f"알 수 없는 action: {args.action}")
+    return 2
+
+
 # ---------- 보조: status ----------
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -1643,6 +1733,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp_status = sub.add_parser("status", help="상태 요약")
     sp_status.set_defaults(func=cmd_status)
+
+    sp_dev = sub.add_parser(
+        "dev",
+        help="로컬 DokuWiki 테스트 컨테이너 (dev/dokuwiki-local) up/down",
+    )
+    dev_sub = sp_dev.add_subparsers(dest="action", required=True)
+
+    sp_dev_up = dev_sub.add_parser("up", help="컨테이너 기동 (필요시 APFS clonefile 복제)")
+    sp_dev_up.add_argument(
+        "--src",
+        default=env_default("DOKUWIKI_SRC"),
+        help=f"복제할 원본 DokuWiki 데이터 디렉터리 (기본: {DEV_DEFAULT_SRC})",
+    )
+    sp_dev_up.set_defaults(func=cmd_dev)
+
+    sp_dev_down = dev_sub.add_parser("down", help="컨테이너 종료")
+    sp_dev_down.add_argument(
+        "--purge",
+        action="store_true",
+        help=f"종료 후 복제본 {DEV_CLONE_DST} 도 삭제",
+    )
+    sp_dev_down.set_defaults(func=cmd_dev)
 
     return p
 
