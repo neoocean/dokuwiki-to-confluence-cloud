@@ -1273,14 +1273,218 @@ def cmd_upload(args: argparse.Namespace) -> int:
     return 0 if failed == 0 else 1
 
 
-# ---------- S7: Rewrite links (스켈레톤) ----------
+# ---------- S7: Rewrite links ----------
+
+LINK_BODY_SENTINEL_PREFIX = "__DWC_LINK_BODY_"
+
+
+def _rewrite_links_in_xml(
+    conn: sqlite3.Connection,
+    src_doku_id: str,
+    xml: str,
+) -> tuple[str, list[str], list[str]]:
+    """
+    storage XML 안의 dwc-link:<target>[#anchor] placeholder 를 실제
+    <ac:link><ri:page ri:content-title=...> 로 치환한다.
+
+    반환: (new_xml, resolved_placeholders, unresolved_placeholders).
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(xml, "html.parser")
+    resolved: list[str] = []
+    unresolved: list[str] = []
+    link_body_texts: dict[str, str] = {}
+
+    for idx, a in enumerate(list(soup.find_all("a"))):
+        href = a.get("href", "")
+        if not href.startswith(f"{DOKU_LINK_SCHEME}:"):
+            continue
+
+        rest = href[len(DOKU_LINK_SCHEME) + 1 :]
+        if "#" in rest:
+            target_id, anchor = rest.split("#", 1)
+        else:
+            target_id, anchor = rest, None
+
+        target_row = conn.execute(
+            "SELECT title, confluence_page_id, status FROM pages WHERE doku_id=?",
+            (target_id,),
+        ).fetchone()
+
+        link_text = a.get_text() or target_id
+
+        if not target_row or (target_row[2] not in ("UPLOADED", "CONVERTED")):
+            # 미해결: 일반 텍스트로 격하
+            unresolved.append(href)
+            replacement_text = link_text
+            a.replace_with(replacement_text)
+            continue
+
+        target_title = target_row[0] or target_id
+
+        ac_link = soup.new_tag("ac:link")
+        if anchor:
+            ac_link["ac:anchor"] = anchor
+        ri_page = soup.new_tag("ri:page")
+        ri_page["ri:content-title"] = target_title
+        ac_link.append(ri_page)
+        body = soup.new_tag("ac:plain-text-link-body")
+        sentinel = f"{LINK_BODY_SENTINEL_PREFIX}{idx}__"
+        body.string = sentinel
+        link_body_texts[sentinel] = link_text
+        ac_link.append(body)
+        a.replace_with(ac_link)
+        resolved.append(href)
+
+    result = "".join(str(c) for c in soup.children)
+
+    import re as _re
+
+    result = _re.sub(r"<(br|hr|img)([^>]*?)(?<!/)\s*>", r"<\1\2/>", result)
+
+    for sentinel, text in link_body_texts.items():
+        safe = text.replace("]]>", "]]]]><![CDATA[>")
+        result = result.replace(sentinel, f"<![CDATA[{safe}]]>")
+
+    return result, resolved, unresolved
+
 
 def cmd_rewrite_links(args: argparse.Namespace) -> int:
-    # TODO(S7): links 테이블의 placeholder 를 confluence_page_id 로 치환한
-    # storage format 을 재업로드한다. resolved=1 로 표시. 미해결 링크
-    # (target_doku_id 가 미존재 또는 SKIPPED) 는 일반 텍스트로 격하.
-    log("rewrite-links: 미구현 (S7 — docs/scenarios.md 참고)")
-    return 1
+    try:
+        import bs4  # noqa: F401
+    except ImportError:
+        log("beautifulsoup4 가 필요합니다: pip install -r requirements.txt")
+        return 2
+
+    conn = db_connect(args.db)
+    db_init(conn)
+
+    where = (
+        "p.status IN ('UPLOADED','CONVERTED') "
+        "AND p.storage_path IS NOT NULL "
+        "AND EXISTS (SELECT 1 FROM links l WHERE l.src_doku_id=p.doku_id AND l.resolved=0)"
+    )
+    params: tuple = ()
+    if args.only:
+        where = "p.doku_id=? AND p.storage_path IS NOT NULL"
+        params = (args.only,)
+
+    rows = conn.execute(
+        f"SELECT p.doku_id, p.storage_path, p.content_hash, p.confluence_page_id, p.title "
+        f"FROM pages p WHERE {where} ORDER BY p.doku_id",
+        params,
+    ).fetchall()
+
+    log(f"rewrite-links 대상: {len(rows)} 페이지")
+
+    session = None
+    base_url = args.base_url.rstrip("/") if getattr(args, "base_url", None) else ""
+    if not args.dry_run and rows:
+        # 재업로드가 필요한 경우에만 인증 세션 구성
+        needs_upload = any(r[3] for r in rows)
+        if needs_upload:
+            session = _confluence_session(args)
+            if session is None:
+                return 2
+
+    rewritten = updated_on_confluence = no_change = not_uploaded = failed = 0
+    total_resolved = total_unresolved = 0
+
+    for doku_id, storage_path, old_hash, confluence_page_id, title in rows:
+        sp = Path(storage_path)
+        if not sp.is_file():
+            log(f"  [FAIL] {doku_id}: storage 파일 없음 ({storage_path})")
+            failed += 1
+            continue
+
+        xml = sp.read_text(encoding="utf-8")
+        new_xml, resolved_phs, unresolved_phs = _rewrite_links_in_xml(conn, doku_id, xml)
+        total_resolved += len(resolved_phs)
+        total_unresolved += len(unresolved_phs)
+
+        new_hash = sha256_bytes(new_xml.encode("utf-8"))
+        if new_hash == old_hash:
+            no_change += 1
+            # 그래도 links 테이블의 resolved 플래그는 갱신
+            for ph in resolved_phs:
+                conn.execute(
+                    "UPDATE links SET resolved=1 WHERE src_doku_id=? AND placeholder=?",
+                    (doku_id, ph),
+                )
+            conn.commit()
+            continue
+
+        # 디스크에 새 storage 쓰고 hash 갱신
+        sp.write_text(new_xml, encoding="utf-8")
+        conn.execute(
+            "UPDATE pages SET content_hash=?, last_checked_at=? WHERE doku_id=?",
+            (new_hash, now_iso(), doku_id),
+        )
+        for ph in resolved_phs:
+            conn.execute(
+                "UPDATE links SET resolved=1 WHERE src_doku_id=? AND placeholder=?",
+                (doku_id, ph),
+            )
+        conn.commit()
+        rewritten += 1
+
+        if unresolved_phs:
+            log(f"  [{doku_id}] 미해결 링크 {len(unresolved_phs)} 개 → 일반 텍스트로 격하")
+
+        if not confluence_page_id:
+            log(f"  [LOCAL] {doku_id}: 아직 업로드되지 않음 — storage 만 갱신 (다음 upload 호출이 반영)")
+            not_uploaded += 1
+            continue
+
+        if args.dry_run:
+            log(f"  [DRY UPDATE] {doku_id} confluence_id={confluence_page_id} 해결={len(resolved_phs)}")
+            continue
+
+        cur_ver = _get_page_version(session, base_url, confluence_page_id)
+        if cur_ver is None:
+            log(f"  [FAIL] {doku_id}: 현재 버전 조회 실패")
+            failed += 1
+            continue
+        next_ver = cur_ver + 1
+        payload = {
+            "id": confluence_page_id,
+            "status": "current",
+            "title": title or doku_id,
+            "body": {"representation": "storage", "value": new_xml},
+            "version": {"number": next_ver},
+        }
+        resp = _request_with_retry(
+            session, "PUT", f"{base_url}/api/v2/pages/{confluence_page_id}", json=payload
+        )
+        if resp is None or resp.status_code >= 400:
+            err = f"update {resp.status_code if resp else 'no resp'}: {(resp.text if resp else '')[:300]}"
+            log(f"  [FAIL] {doku_id}: {err}")
+            conn.execute(
+                "UPDATE pages SET status='FAILED', last_error=?, last_checked_at=? WHERE doku_id=?",
+                (err, now_iso(), doku_id),
+            )
+            conn.commit()
+            failed += 1
+            continue
+        conn.execute(
+            "UPDATE pages SET confluence_version=?, status='UPLOADED', last_error=NULL, "
+            "uploaded_at=?, last_checked_at=? WHERE doku_id=?",
+            (next_ver, now_iso(), now_iso(), doku_id),
+        )
+        db_set_meta(conn, f"uploaded_hash:{doku_id}", new_hash)
+        conn.commit()
+        updated_on_confluence += 1
+        log(f"  [REWRITTEN] {doku_id} -> v{next_ver}")
+
+    log(
+        f"rewrite-links 완료: rewritten={rewritten} "
+        f"pushed={updated_on_confluence} no-change={no_change} "
+        f"local-only={not_uploaded} failed={failed}"
+    )
+    log(f"  링크 해결={total_resolved} 미해결={total_unresolved}")
+    conn.close()
+    return 0 if failed == 0 else 1
 
 
 # ---------- 보조: status ----------
@@ -1378,7 +1582,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp_upload.set_defaults(func=cmd_upload)
 
     sp_rewrite = sub.add_parser("rewrite-links", help="내부 링크 2-pass 치환 (S7)")
+    sp_rewrite.add_argument(
+        "--base-url",
+        default=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+    )
+    sp_rewrite.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
+    sp_rewrite.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
     sp_rewrite.add_argument("--dry-run", action="store_true")
+    sp_rewrite.add_argument("--only", help="특정 doku_id 만 처리")
     sp_rewrite.set_defaults(func=cmd_rewrite_links)
 
     sp_status = sub.add_parser("status", help="상태 요약")
