@@ -344,7 +344,15 @@ Properties + Report 폴백, 최후 단순 표 스냅샷. 새 서브커맨드
 `struct_columns` / `struct_rows` / `struct_references` 테이블.
 1,213 활성 row (4 schema) 가 대상.
 
-## 11. 다음 단계
+## 11. 실제 마이그레이션 런북
+
+Confluence 키 도착 후 라이브 업로드를 안전하게 수행하는 단계별 절차와
+롤백 대응은 [`docs/runbook.md`](runbook.md) 에 별도 정리. 준비물
+체크리스트(이메일/API 토큰/공간 키/루트 페이지 ID), 사전 점검 명령
+(`status`/`report`/`lint`), 소규모 검증(`upload --only`) → 전체 →
+`rewrite-links` 순서, FAILED 대응, 롤백 SQL.
+
+## 12. 다음 단계
 
 - `upload --dry-run` 으로 트리 / stub / 첨부 예상치 출력 확인.
 - Confluence 공간/루트 페이지 결정 → 실제 업로드 → `rewrite-links` 로 placeholder 해결.
