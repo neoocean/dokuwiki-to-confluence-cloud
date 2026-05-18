@@ -1142,6 +1142,124 @@ def _stub_body(ns: str) -> str:
     )
 
 
+def _skipped_promote_body(doku_id: str, reason: str | None) -> str:
+    return (
+        f'<p>DokuWiki 의 <code>{doku_id}</code> 페이지가 비어있거나 응답이 '
+        f'없어{f" ({reason})" if reason else ""} 마이그레이션 시 자동으로 '
+        f'placeholder 페이지로 생성됨. 트리 구조 보존을 위해 만들어진 것이며 '
+        f'필요 시 내용을 채우거나 자식 페이지들을 다른 부모로 옮길 수 있다.</p>'
+    )
+
+
+def _promote_skipped_pages_in_chain(conn: sqlite3.Connection) -> int:
+    """
+    SKIPPED 페이지가 *다른 페이지의 parent* 로 쓰이고 있으면 BFS 가
+    그 chain 을 통과 못 한다 (root start 가 SKIPPED 이면 namespace
+    start 전체가 reach 안 됨). 그런 SKIPPED 페이지를 stub placeholder
+    로 자동 promote 해 트리 구조를 살린다.
+
+    parent 로 쓰이지 않는 고립 SKIPPED 페이지는 그대로 둔다 (의도된
+    skip 일 수도 있으므로).
+    """
+    # 어떤 이유로든 storage 가 없는 chain parent (SKIPPED, DISCOVERED,
+    # RENDERED, FAILED) 를 모두 promote 한다. 자식이 있는 노드만 대상.
+    rows = conn.execute(
+        """
+        SELECT DISTINCT p.doku_id, p.last_error
+          FROM pages p
+         WHERE p.status NOT IN ('CONVERTED', 'UPLOADED')
+           AND p.doku_id IN (
+                SELECT DISTINCT parent_doku_id
+                  FROM pages
+                 WHERE parent_doku_id IS NOT NULL
+           )
+        """
+    ).fetchall()
+
+    promoted = 0
+    for doku_id, reason in rows:
+        body = _skipped_promote_body(doku_id, reason)
+        storage_path = STORAGE_DIR / Path(*doku_id.split(":")).with_suffix(".xml")
+        storage_path.parent.mkdir(parents=True, exist_ok=True)
+        storage_path.write_text(body, encoding="utf-8")
+        conn.execute(
+            """
+            UPDATE pages
+               SET status='CONVERTED', storage_path=?, content_hash=?,
+                   last_error=NULL, converted_at=?, last_checked_at=?
+             WHERE doku_id=?
+            """,
+            (
+                str(storage_path),
+                sha256_bytes(body.encode("utf-8")),
+                now_iso(),
+                now_iso(),
+                doku_id,
+            ),
+        )
+        promoted += 1
+    conn.commit()
+    return promoted
+
+
+def _disambiguate_duplicate_titles(conn: sqlite3.Connection) -> int:
+    """
+    Confluence Cloud 는 공간 단위로 페이지 제목이 유일해야 한다 (400 에러).
+    DokuWiki 의 일지/매일 페이지 트리(`u:lam:workhours:2019:12:05` 등) 는
+    같은 title (`05`) 을 가진 형제가 많아 충돌 폭이 크다.
+
+    Reactive disambiguation (`upload` 가 400 보면 한 번 재시도) 만으로는
+    같은 title 그룹마다 PUT 두 배 + 첫 페이지가 plain title 을 차지하는
+    BFS-순서 의존성이 생긴다. 여기서는 사전에 충돌이 예상되는 모든
+    페이지에 일관된 형식의 suffix 를 부여한다:
+
+        '<original_title> (<doku_id 의 마지막 segment 를 뺀 나머지>)'
+
+    예) doku_id 'u:lam:workhours:2019:12:05' title '05'
+        -> '05 (u:lam:workhours:2019:12)'
+
+    return: 갱신된 페이지 수.
+    """
+    # 같은 disambiguator 로 또 겹치는 케이스(예: 'wiki:start' 와 'wiki:til'
+    # 이 둘 다 title='#til' + ns_prefix='wiki') 가 있을 수 있으므로 충돌이
+    # 사라질 때까지 반복.
+    updated_total = 0
+    for _iter in range(5):
+        rows = conn.execute(
+            """
+            SELECT title FROM pages
+             WHERE status='CONVERTED' AND title IS NOT NULL AND title != ''
+             GROUP BY title HAVING COUNT(*) > 1
+            """
+        ).fetchall()
+        if not rows:
+            break
+        for (title,) in rows:
+            page_rows = conn.execute(
+                "SELECT doku_id FROM pages WHERE title=? AND status='CONVERTED'",
+                (title,),
+            ).fetchall()
+            for idx, (doku_id,) in enumerate(page_rows):
+                parts = doku_id.split(":")
+                if len(parts) >= 2:
+                    # 첫 회: doku_id 의 namespace prefix 사용
+                    # 후속 회 (또 충돌): doku_id 자체 append 로 강제 unique
+                    base_suffix = ":".join(parts[:-1])
+                    if base_suffix and f"({base_suffix})" not in title:
+                        new_title = f"{title} ({base_suffix})"
+                    else:
+                        new_title = f"{title} [{doku_id}]"
+                else:
+                    new_title = f"{title} [{doku_id}]"
+                conn.execute(
+                    "UPDATE pages SET title=? WHERE doku_id=?",
+                    (new_title, doku_id),
+                )
+                updated_total += 1
+    conn.commit()
+    return updated_total
+
+
 def _ensure_namespace_stubs(conn: sqlite3.Connection) -> int:
     """모든 namespace 를 따라 누락된 <ns>:start 행을 STUB 으로 생성."""
     needed: set[str] = set()
@@ -1354,9 +1472,15 @@ def cmd_upload(args: argparse.Namespace) -> int:
     db_set_meta(conn, "confluence_space_key", args.space_key)
     db_set_meta(conn, "confluence_root_page_id", args.root_page_id)
 
+    promoted = _promote_skipped_pages_in_chain(conn)
+    if promoted:
+        log(f"SKIPPED → placeholder 자동 promote: {promoted}개 (chain 부모로 쓰이던 페이지)")
     stub_count = _ensure_namespace_stubs(conn)
     if stub_count:
         log(f"네임스페이스 stub {stub_count}개 자동 생성")
+    dup_count = _disambiguate_duplicate_titles(conn)
+    if dup_count:
+        log(f"중복 title 사전 disambiguation: {dup_count}개 (Confluence per-space unique 제약)")
 
     base_url = args.base_url.rstrip("/")
     session = None
@@ -1756,6 +1880,58 @@ def cmd_rewrite_links(args: argparse.Namespace) -> int:
     return 0 if failed == 0 else 1
 
 
+# ---------- 보조: lint (storage XML 유효성 검사) ----------
+
+def cmd_lint(args: argparse.Namespace) -> int:
+    """
+    storage/*.xml 파일들이 valid XML 인지 일괄 검증. Confluence storage
+    format 은 strict XML 이므로 invalid 가 있으면 업로드 단계의 400 으로
+    이어진다. 사전에 잡아 변환기 결함을 잡는다.
+
+    namespace prefix (ac:, ri:) 가 storage XML 본문에는 선언 없이 등장
+    하므로 임시 wrapper 로 감싸 검증한다.
+    """
+    try:
+        from lxml import etree
+    except ImportError:
+        log("lxml 이 필요합니다: pip install lxml")
+        return 2
+
+    target = Path(args.path) if args.path else STORAGE_DIR
+    if not target.exists():
+        log(f"경로 없음: {target}")
+        return 2
+
+    if target.is_dir():
+        files = sorted(target.rglob("*.xml"))
+    else:
+        files = [target]
+    if not files:
+        log(f"storage XML 파일이 없습니다: {target}")
+        return 1
+
+    wrap_open = (b'<root xmlns:ac="http://atlassian.com/content" '
+                 b'xmlns:ri="http://atlassian.com/resource/identifier">')
+    wrap_close = b'</root>'
+
+    failed: list[tuple[Path, str]] = []
+    for f in files:
+        try:
+            body = f.read_bytes()
+            etree.fromstring(wrap_open + body + wrap_close)
+        except etree.XMLSyntaxError as e:
+            failed.append((f, str(e).splitlines()[0]))
+        except OSError as e:
+            failed.append((f, f"OSError: {e}"))
+
+    log(f"lint: {len(files)} 파일 검사, 실패 {len(failed)}")
+    for path, err in failed[: args.limit]:
+        print(f"  [INVALID] {path}: {err}")
+    if len(failed) > args.limit:
+        print(f"  ... (+{len(failed) - args.limit} more)")
+    return 0 if not failed else 1
+
+
 # ---------- 보조: dev up/down (로컬 DokuWiki 테스트 컨테이너) ----------
 
 DEV_COMPOSE_REL = Path("dev/dokuwiki-local/docker-compose.yml")
@@ -1984,6 +2160,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp_status = sub.add_parser("status", help="상태 요약")
     sp_status.set_defaults(func=cmd_status)
+
+    sp_lint = sub.add_parser("lint", help="storage XML 유효성 검사")
+    sp_lint.add_argument(
+        "--path", help=f"검사 대상 파일/디렉터리 (기본: {STORAGE_DIR})"
+    )
+    sp_lint.add_argument("--limit", type=int, default=20, help="실패 항목 출력 최대 개수")
+    sp_lint.set_defaults(func=cmd_lint)
 
     sp_dev = sub.add_parser(
         "dev",
