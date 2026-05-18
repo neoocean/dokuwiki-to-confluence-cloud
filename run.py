@@ -70,7 +70,107 @@ def db_connect(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     return conn
 
 
+HISTORY_SCHEMA_DDL = """
+CREATE TABLE IF NOT EXISTS revisions (
+    doku_id TEXT NOT NULL,
+    rev_ts INTEGER NOT NULL,
+    type TEXT,
+    user TEXT,
+    ip TEXT,
+    comment TEXT,
+    extra TEXT,
+    attic_path TEXT,
+    raw_xhtml_path TEXT,
+    storage_path TEXT,
+    content_hash TEXT,
+    status TEXT NOT NULL,
+    last_error TEXT,
+    last_checked_at TEXT,
+    PRIMARY KEY (doku_id, rev_ts)
+);
+CREATE INDEX IF NOT EXISTS revisions_doku_idx ON revisions(doku_id);
+CREATE INDEX IF NOT EXISTS revisions_status_idx ON revisions(status);
+
+CREATE TABLE IF NOT EXISTS history_meta (
+    doku_id TEXT PRIMARY KEY,
+    total_revs INTEGER,
+    first_ts INTEGER,
+    last_ts INTEGER,
+    replay_started_at TEXT,
+    replay_completed_at TEXT,
+    last_replayed_rev_ts INTEGER,
+    confluence_property_id TEXT,
+    history_child_page_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS media_revisions (
+    media_id TEXT NOT NULL,
+    rev_ts INTEGER NOT NULL,
+    src_path TEXT,
+    size INTEGER,
+    sha256 TEXT,
+    confluence_attachment_id TEXT,
+    status TEXT NOT NULL,
+    last_error TEXT,
+    uploaded_at TEXT,
+    PRIMARY KEY (media_id, rev_ts)
+);
+"""
+
+
+STRUCT_SCHEMA_DDL = """
+CREATE TABLE IF NOT EXISTS struct_schemas (
+    sid INTEGER PRIMARY KEY,
+    tbl TEXT NOT NULL UNIQUE,
+    row_count INTEGER NOT NULL DEFAULT 0,
+    column_count INTEGER NOT NULL DEFAULT 0,
+    chosen_mode TEXT,
+    confluence_db_id TEXT,
+    properties_index_page_id TEXT,
+    snapshot_page_id TEXT,
+    status TEXT NOT NULL,
+    last_error TEXT,
+    last_checked_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS struct_columns (
+    sid INTEGER NOT NULL,
+    colref INTEGER NOT NULL,
+    sort INTEGER NOT NULL,
+    name TEXT,
+    dokuwiki_class TEXT NOT NULL,
+    config_json TEXT,
+    confluence_column_id TEXT,
+    PRIMARY KEY (sid, colref)
+);
+
+CREATE TABLE IF NOT EXISTS struct_rows (
+    sid INTEGER NOT NULL,
+    pid INTEGER NOT NULL,
+    bound_doku_id TEXT,
+    payload_json TEXT NOT NULL,
+    confluence_row_id TEXT,
+    confluence_page_id TEXT,
+    status TEXT NOT NULL,
+    last_error TEXT,
+    PRIMARY KEY (sid, pid)
+);
+
+CREATE TABLE IF NOT EXISTS struct_references (
+    src_sid INTEGER NOT NULL,
+    src_pid INTEGER NOT NULL,
+    src_colref INTEGER NOT NULL,
+    target_kind TEXT NOT NULL,
+    target_locator TEXT NOT NULL,
+    resolved INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (src_sid, src_pid, src_colref)
+);
+"""
+
+
 def db_init(conn: sqlite3.Connection) -> None:
+    conn.executescript(HISTORY_SCHEMA_DDL)
+    conn.executescript(STRUCT_SCHEMA_DDL)
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS pages (
@@ -2052,6 +2152,444 @@ def cmd_rewrite_links(args: argparse.Namespace) -> int:
     return 0 if failed == 0 else 1
 
 
+# ---------- history: discover ----------
+
+def cmd_history_discover(args: argparse.Namespace) -> int:
+    """attic/ + meta/*.changes + media_attic/ 인덱싱. 라이브 호출 없음.
+
+    attic 의 .txt.gz 한 파일이 한 리비전. meta/.../<page>.changes 는 TSV
+    (ts, ip, type, page, user, comment, extra). 두 소스를 교차해
+    revisions 테이블 채움. media_attic 은 별도 media_revisions.
+    """
+    conn = db_connect(args.db)
+    db_init(conn)
+    src = db_get_meta(conn, "dokuwiki_src")
+    if not src:
+        log("dokuwiki_src 메타 없음 — 먼저 discover 실행.")
+        return 2
+
+    src_root = Path(src)
+    attic = src_root / "attic"
+    meta = src_root / "meta"
+    media_attic = src_root / "media_attic"
+
+    if not attic.is_dir():
+        log(f"attic 디렉터리 없음: {attic}")
+        return 1
+
+    # 1) attic 파일 인덱싱 -> revisions
+    log("attic 인덱싱 중…")
+    n_files = 0
+    decode_replaced = 0
+    import gzip
+    import re as _re
+
+    rev_pattern = _re.compile(r"\.(\d{8,12})\.txt\.gz$")
+    page_meta: dict[str, list[int]] = {}  # doku_id -> [ts, ts, ...]
+
+    for f in attic.rglob("*.txt.gz"):
+        m = rev_pattern.search(f.name)
+        if not m:
+            continue
+        try:
+            ts = int(m.group(1))
+        except ValueError:
+            continue
+        # doku_id: relative path 에서 (basename - .<ts>.txt.gz) + 디렉터리는 :
+        rel = f.relative_to(attic)
+        parts = list(rel.parts)
+        last = parts[-1]
+        base = last[: -len(m.group(0))]  # strip '.<ts>.txt.gz'
+        parts[-1] = base
+        doku_id = ":".join(parts)
+
+        # 디코딩 깨짐 확인. gzip 손상도 일부 attic 에서 발견됨.
+        try:
+            with gzip.open(f, "rb") as g:
+                raw_bytes = g.read()
+        except (OSError, EOFError, Exception) as e:
+            # zlib.error / EOFError / 기타 gzip 손상
+            if "zlib" in type(e).__module__ or isinstance(e, (OSError, EOFError)):
+                conn.execute(
+                    "INSERT OR REPLACE INTO revisions(doku_id, rev_ts, attic_path, status, last_error, last_checked_at) "
+                    "VALUES (?, ?, ?, 'FAILED', ?, ?)",
+                    (None or "", ts, str(f), f"gzip read: {e!r}", now_iso()),
+                )
+                continue
+            raise
+        try:
+            raw_bytes.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            if "�" in raw_bytes.decode("utf-8", errors="replace"):
+                decode_replaced += 1
+
+        conn.execute(
+            "INSERT OR REPLACE INTO revisions(doku_id, rev_ts, attic_path, status, last_checked_at) "
+            "VALUES (?, ?, ?, 'DISCOVERED', ?)",
+            (doku_id, ts, str(f), now_iso()),
+        )
+        page_meta.setdefault(doku_id, []).append(ts)
+        n_files += 1
+
+    conn.commit()
+    log(f"attic: {n_files} revisions ({decode_replaced} 디코딩 깨짐 후보)")
+
+    # 2) meta/*.changes 파싱 -> revisions 의 type/user/ip/comment 채움
+    log("changes 로그 파싱 중…")
+    n_changes = 0
+    for f in meta.rglob("*.changes"):
+        if f.name.startswith("_"):  # _dokuwiki.changes, _media.changes 같은 글로벌 로그
+            continue
+        rel = f.relative_to(meta)
+        parts = list(rel.parts)
+        last = parts[-1]
+        if not last.endswith(".changes"):
+            continue
+        parts[-1] = last[:-len(".changes")]
+        doku_id = ":".join(parts)
+        try:
+            for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+                cols = line.split("\t")
+                if len(cols) < 5:
+                    continue
+                ts_s, ip, ctype, page_id, user = cols[:5]
+                comment = cols[5] if len(cols) > 5 else ""
+                extra = cols[6] if len(cols) > 6 else ""
+                try:
+                    ts = int(ts_s)
+                except ValueError:
+                    continue
+                # 기존 revisions 행에 메타 보강 (없으면 INSERT)
+                conn.execute(
+                    """
+                    INSERT INTO revisions(doku_id, rev_ts, type, user, ip, comment, extra, status, last_checked_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, 'DISCOVERED', ?)
+                    ON CONFLICT(doku_id, rev_ts) DO UPDATE SET
+                         type=excluded.type, user=excluded.user, ip=excluded.ip,
+                         comment=excluded.comment, extra=excluded.extra
+                    """,
+                    (doku_id, ts, ctype, user, ip, comment, extra, now_iso()),
+                )
+                n_changes += 1
+        except OSError:
+            continue
+    conn.commit()
+    log(f"changes 로그: {n_changes} entry 적용")
+
+    # 3) history_meta 집계
+    for doku_id, ts_list in page_meta.items():
+        ts_sorted = sorted(ts_list)
+        conn.execute(
+            "INSERT OR REPLACE INTO history_meta(doku_id, total_revs, first_ts, last_ts) "
+            "VALUES (?, ?, ?, ?)",
+            (doku_id, len(ts_list), ts_sorted[0], ts_sorted[-1]),
+        )
+    conn.commit()
+
+    # 4) media_attic 인덱싱
+    log("media_attic 인덱싱 중…")
+    n_media = 0
+    if media_attic.is_dir():
+        media_rev_pattern = _re.compile(r"\.(\d{8,12})(\..+)?$")
+        for f in media_attic.rglob("*"):
+            if not f.is_file():
+                continue
+            m = media_rev_pattern.search(f.name)
+            if not m:
+                continue
+            try:
+                ts = int(m.group(1))
+            except ValueError:
+                continue
+            ext = m.group(2) or ""
+            # media_id: rel path 에서 .<ts><.ext> 제거
+            rel = f.relative_to(media_attic)
+            parts = list(rel.parts)
+            last = parts[-1]
+            base = last[: -len(m.group(0))] + ext
+            parts[-1] = base
+            media_id = ":".join(parts)
+            try:
+                size = f.stat().st_size
+                sha = sha256_file(f)
+            except OSError:
+                size, sha = None, None
+            conn.execute(
+                "INSERT OR REPLACE INTO media_revisions(media_id, rev_ts, src_path, size, sha256, status) "
+                "VALUES (?, ?, ?, ?, ?, 'DISCOVERED')",
+                (media_id, ts, str(f), size, sha),
+            )
+            n_media += 1
+    conn.commit()
+
+    log(f"history-discover 완료: revisions={n_files}, changes={n_changes}, media={n_media}, decode_replaced={decode_replaced}")
+    # 요약
+    n_pages = conn.execute("SELECT COUNT(*) FROM history_meta").fetchone()[0]
+    log(f"  unique pages: {n_pages}, avg revs/page: {n_files / max(n_pages,1):.1f}")
+    conn.close()
+    return 0
+
+
+def cmd_history_status(args: argparse.Namespace) -> int:
+    conn = db_connect(args.db)
+    print("==== history_meta 요약 ====")
+    n_pages, total_revs, max_revs = conn.execute(
+        "SELECT COUNT(*), SUM(total_revs), MAX(total_revs) FROM history_meta"
+    ).fetchone()
+    print(f"  unique pages: {n_pages}")
+    print(f"  total revisions: {total_revs}")
+    print(f"  max revs per page: {max_revs}")
+    print()
+    print("==== revisions status 분포 ====")
+    for status, n in conn.execute(
+        "SELECT status, COUNT(*) FROM revisions GROUP BY status"
+    ).fetchall():
+        print(f"  {status:12} {n}")
+    print()
+    print("==== type 분포 (changes 로그) ====")
+    for t, n in conn.execute(
+        "SELECT type, COUNT(*) FROM revisions WHERE type IS NOT NULL GROUP BY type ORDER BY n DESC"
+        if False else "SELECT type, COUNT(*) FROM revisions WHERE type IS NOT NULL GROUP BY type"
+    ).fetchall():
+        print(f"  {t}: {n}")
+    print()
+    print("==== media_revisions ====")
+    n_media, total_media, max_media = conn.execute(
+        "SELECT COUNT(DISTINCT media_id), COUNT(*), MAX(rev_ts) FROM media_revisions"
+    ).fetchone()
+    print(f"  unique media: {n_media}")
+    print(f"  total versions: {total_media}")
+    print()
+    print("==== 상위 5 revision-heavy 페이지 ====")
+    for d, n in conn.execute(
+        "SELECT doku_id, total_revs FROM history_meta ORDER BY total_revs DESC LIMIT 5"
+    ).fetchall():
+        print(f"  {d}: {n}")
+    conn.close()
+    return 0
+
+
+# ---------- struct: discover / convert ----------
+
+def _struct_db_path_from_meta(conn: sqlite3.Connection) -> Path | None:
+    src = db_get_meta(conn, "dokuwiki_src")
+    if not src:
+        return None
+    p = Path(src) / "meta" / "struct.sqlite3"
+    return p if p.is_file() else None
+
+
+def cmd_struct_discover(args: argparse.Namespace) -> int:
+    """meta/struct.sqlite3 에서 활성 schema(=latest ts) + 컬럼 + row 를
+    state.db 의 struct_* 테이블로 옮긴다. 라이브 Confluence 호출 없음."""
+    conn = db_connect(args.db)
+    db_init(conn)
+
+    sd_path = _struct_db_path_from_meta(conn)
+    if not sd_path:
+        log("dokuwiki_src 또는 struct.sqlite3 를 찾을 수 없습니다 — 먼저 discover 실행 또는 --struct-db 직접 지정.")
+        if args.struct_db:
+            sd_path = Path(args.struct_db)
+            if not sd_path.is_file():
+                log(f"--struct-db 경로 없음: {sd_path}")
+                return 2
+        else:
+            return 2
+
+    sd = sqlite3.connect(str(sd_path))
+    # 활성 schema = 각 tbl 의 최신 sid (MAX ts)
+    rows = sd.execute(
+        "SELECT id, tbl FROM schemas WHERE id IN ("
+        "  SELECT id FROM schemas WHERE (tbl, ts) IN ("
+        "    SELECT tbl, MAX(ts) FROM schemas GROUP BY tbl"
+        "  )"
+        ")"
+    ).fetchall()
+
+    n_schemas = 0
+    n_cols = 0
+    n_rows = 0
+    n_refs = 0
+
+    for sid, tbl in rows:
+        data_tbl = f"data_{tbl}"
+        try:
+            row_count = sd.execute(f"SELECT COUNT(*) FROM {data_tbl} WHERE latest=1").fetchone()[0]
+        except sqlite3.OperationalError:
+            row_count = 0
+
+        # 빈 schema (test 등) 도 일단 등록만, status=SKIPPED
+        status = "DISCOVERED" if row_count > 0 else "SKIPPED"
+
+        # 컬럼 정의
+        col_rows = sd.execute(
+            "SELECT sc.colref, sc.sort, sc.tid, t.class, t.config "
+            "FROM schema_cols sc JOIN types t ON sc.tid=t.id "
+            "WHERE sid=? AND sc.enabled=1 ORDER BY sc.sort",
+            (sid,),
+        ).fetchall()
+
+        conn.execute(
+            "INSERT OR REPLACE INTO struct_schemas(sid, tbl, row_count, column_count, status, last_checked_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (sid, tbl, row_count, len(col_rows), status, now_iso()),
+        )
+        n_schemas += 1
+
+        # types.config 에서 label.<lang> 추출
+        import json
+        col_name_map: dict[int, str] = {}
+        for colref, sort, tid, cls, cfg_json in col_rows:
+            name = None
+            try:
+                cfg = json.loads(cfg_json) if cfg_json else {}
+                label = cfg.get("label", {})
+                if isinstance(label, dict):
+                    for lang in ("ko", "en", "*"):
+                        if lang in label and label[lang]:
+                            name = label[lang]
+                            break
+                    if name is None and label:
+                        name = next(iter(label.values()), None)
+            except (ValueError, TypeError):
+                pass
+            if not name:
+                name = f"col{colref}"
+            col_name_map[colref] = name
+            conn.execute(
+                "INSERT OR REPLACE INTO struct_columns(sid, colref, sort, name, dokuwiki_class, config_json) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (sid, colref, sort, name, cls, cfg_json),
+            )
+            n_cols += 1
+
+        if row_count == 0:
+            conn.commit()
+            continue
+
+        # 데이터 row 들
+        try:
+            col_names = sd.execute(f"PRAGMA table_info({data_tbl})").fetchall()
+        except sqlite3.OperationalError:
+            conn.commit()
+            continue
+        col_list = [c[1] for c in col_names if c[1].startswith("col")]
+
+        data_rows = sd.execute(
+            f"SELECT pid, rev, latest, {', '.join(col_list)} FROM {data_tbl} WHERE latest=1"
+        ).fetchall()
+
+        # multi 컬럼: multi_<tbl> (pid, colref, row, value)
+        multi_tbl = f"multi_{tbl}"
+        multi_data: dict[tuple[int, int], list[str]] = {}
+        try:
+            for pid, colref, _row, value in sd.execute(
+                f"SELECT pid, colref, row, value FROM {multi_tbl} WHERE latest=1 ORDER BY pid, colref, row"
+            ).fetchall():
+                multi_data.setdefault((pid, colref), []).append(value)
+        except sqlite3.OperationalError:
+            pass
+
+        # 컬럼 class 룩업
+        cls_map = {colref: cls for colref, _sort, _tid, cls, _cfg in col_rows}
+
+        for row in data_rows:
+            pid = row[0]
+            payload: dict[str, object] = {}
+            bound = None
+            for i, colref in enumerate([int(c[3:]) for c in col_list]):
+                v = row[3 + i]
+                # multi 데이터 우선
+                if (pid, colref) in multi_data:
+                    v = multi_data[(pid, colref)]
+                if v is None or v == "":
+                    continue
+                payload[str(colref)] = v
+                cls = cls_map.get(colref)
+                if cls == "Wiki":
+                    # value 가 dokuwiki page id 또는 [[id|text]] 형식
+                    target = v if isinstance(v, str) else None
+                    if target and "[[" not in target:
+                        if bound is None:
+                            bound = target.lstrip(":")
+                        conn.execute(
+                            "INSERT OR REPLACE INTO struct_references(src_sid, src_pid, src_colref, target_kind, target_locator) "
+                            "VALUES (?, ?, ?, 'page', ?)",
+                            (sid, pid, colref, target.lstrip(":")),
+                        )
+                        n_refs += 1
+                elif cls == "Media":
+                    target = v if isinstance(v, str) else None
+                    if target:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO struct_references(src_sid, src_pid, src_colref, target_kind, target_locator) "
+                            "VALUES (?, ?, ?, 'attachment', ?)",
+                            (sid, pid, colref, target.lstrip(":")),
+                        )
+                        n_refs += 1
+                elif cls == "Lookup":
+                    # cross-schema reference — value 는 보통 "<tbl>:<pid>" 또는 정수
+                    if isinstance(v, str):
+                        conn.execute(
+                            "INSERT OR REPLACE INTO struct_references(src_sid, src_pid, src_colref, target_kind, target_locator) "
+                            "VALUES (?, ?, ?, 'schema_row', ?)",
+                            (sid, pid, colref, v),
+                        )
+                        n_refs += 1
+
+            import json
+            conn.execute(
+                "INSERT OR REPLACE INTO struct_rows(sid, pid, bound_doku_id, payload_json, status) "
+                "VALUES (?, ?, ?, ?, 'DISCOVERED')",
+                (sid, pid, bound, json.dumps(payload, ensure_ascii=False)),
+            )
+            n_rows += 1
+
+        conn.commit()
+
+    sd.close()
+
+    log(f"struct-discover 완료: schemas={n_schemas}, columns={n_cols}, rows={n_rows}, refs={n_refs}")
+    # 활성 schema 요약
+    print("--- schemas ---")
+    for sid, tbl, rc, cc, status in conn.execute(
+        "SELECT sid, tbl, row_count, column_count, status FROM struct_schemas ORDER BY tbl"
+    ).fetchall():
+        print(f"  sid={sid:3} tbl={tbl:25} cols={cc} rows={rc} status={status}")
+    conn.close()
+    return 0
+
+
+def cmd_struct_status(args: argparse.Namespace) -> int:
+    conn = db_connect(args.db)
+    print("==== struct_schemas ====")
+    for sid, tbl, rc, cc, mode, status in conn.execute(
+        "SELECT sid, tbl, row_count, column_count, COALESCE(chosen_mode,'-'), status FROM struct_schemas ORDER BY tbl"
+    ).fetchall():
+        print(f"  sid={sid:3} tbl={tbl:25} cols={cc:2} rows={rc:5} mode={mode:8} status={status}")
+    print()
+    print("==== struct_rows status 분포 ====")
+    rows = conn.execute(
+        "SELECT status, COUNT(*) FROM struct_rows GROUP BY status"
+    ).fetchall()
+    for status, n in rows:
+        print(f"  {status:14} {n}")
+    print()
+    print("==== references ====")
+    for kind, n in conn.execute(
+        "SELECT target_kind, COUNT(*) FROM struct_references GROUP BY target_kind"
+    ).fetchall():
+        print(f"  {kind:14} {n}")
+    print()
+    print("==== references resolved 분포 ====")
+    for resolved, n in conn.execute(
+        "SELECT resolved, COUNT(*) FROM struct_references GROUP BY resolved"
+    ).fetchall():
+        print(f"  resolved={resolved}: {n}")
+    conn.close()
+    return 0
+
+
 # ---------- 보조: report (corpus 통계 + 분포) ----------
 
 def cmd_report(args: argparse.Namespace) -> int:
@@ -2511,6 +3049,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp_status = sub.add_parser("status", help="상태 요약")
     sp_status.set_defaults(func=cmd_status)
+
+    sp_hd = sub.add_parser(
+        "history-discover", help="attic/ + meta/*.changes + media_attic/ 인덱싱"
+    )
+    sp_hd.set_defaults(func=cmd_history_discover)
+
+    sp_hs = sub.add_parser("history-status", help="history 진행 상황 요약")
+    sp_hs.set_defaults(func=cmd_history_status)
+
+    sp_sd = sub.add_parser(
+        "struct-discover", help="meta/struct.sqlite3 → state.db 의 struct_* 인덱싱"
+    )
+    sp_sd.add_argument("--struct-db", help="명시적 struct.sqlite3 경로 (기본: <dokuwiki_src>/meta/struct.sqlite3)")
+    sp_sd.set_defaults(func=cmd_struct_discover)
+
+    sp_ss = sub.add_parser("struct-status", help="struct 진행 상황 요약")
+    sp_ss.set_defaults(func=cmd_struct_status)
 
     sp_report = sub.add_parser(
         "report", help="corpus 통계 (pages/attachments/매크로/크기/title 충돌)"
