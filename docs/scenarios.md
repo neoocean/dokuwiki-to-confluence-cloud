@@ -344,6 +344,15 @@ Properties + Report 폴백, 최후 단순 표 스냅샷. 새 서브커맨드
 `struct_columns` / `struct_rows` / `struct_references` 테이블.
 1,213 활성 row (4 schema) 가 대상.
 
+## 10b. 100MB 초과 첨부 이전 (별도 트랙)
+
+Confluence Cloud 단일 첨부 한도(100MB)를 넘는 미디어를 옮기는 방안
+검토는 [`docs/oversized-attachments.md`](oversized-attachments.md).
+6개 모드 (broken reference 유지 / 본문 메타 푸터 / 외부 호스팅 +
+URL / 분할 압축 N파트 / 손실 압축 / 무시) 의 트레이드오프와 권장 조합
+(본문 푸터 + 호스트 백업 안내, 후속으로 외부 호스팅). 본 인스턴스 영향
+9건. 라이브 진행 후 별도 패스로 적용 가능 — 현 진행 영향 없음.
+
 ## 11. 실제 마이그레이션 런북
 
 Confluence 키 도착 후 라이브 업로드를 안전하게 수행하는 단계별 절차와
