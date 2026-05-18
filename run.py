@@ -612,6 +612,136 @@ def _convert_wrap_callouts(soup) -> None:
             tag.replace_with(span)
 
 
+WRAP_ALIGN_STYLE_MAP = {
+    "wrap_left":   "text-align: left;",
+    "wrap_right":  "text-align: right;",
+    "wrap_center": "text-align: center;",
+    # 정렬 외 layout 클래스는 의도된 의미가 약해 매핑 안 함
+}
+
+
+TABLE_ALIGN_CLASS_MAP = {
+    "leftalign":   "text-align: left;",
+    "centeralign": "text-align: center;",
+    "rightalign":  "text-align: right;",
+}
+
+
+def _convert_footnotes(soup) -> None:
+    """
+    DokuWiki 의 ((풋노트)) 출력은 두 부분이다:
+      본문: <sup><a class="fn_top" href="#fn__N" id="fnt__N">N)</a></sup>
+      페이지 끝: <div class="footnotes">
+                  <div class="fn">
+                    <sup><a class="fn_bot" href="#fnt__N" id="fn__N">N)</a></sup>
+                    <div class="content">풋노트 내용</div>
+                  </div>
+                  ...
+                </div>
+
+    Confluence 에는 footnote 코어 매크로가 없어 표준 HTML 로 옮긴다.
+    본문 sup 의 anchor 링크는 그대로 둔다 (Confluence 가 in-page anchor
+    지원). 페이지 끝 footnotes div 를:
+
+        <hr/><p><strong>각주</strong></p>
+        <ol>
+          <li id="fn__N">내용 <a href="#fnt__N">↑</a></li>
+          ...
+        </ol>
+
+    로 변환해 클릭 가능한 양방향 anchor 가 동작하도록 한다.
+    """
+    for outer in list(soup.find_all("div", class_="footnotes")):
+        items: list[tuple[str | None, str | None, list]] = []
+        for fn in outer.find_all("div", class_="fn", recursive=False):
+            sup = fn.find("sup")
+            content = fn.find("div", class_="content")
+            anchor_id = None
+            return_href = None
+            if sup:
+                a = sup.find("a")
+                if a:
+                    anchor_id = a.get("id")
+                    return_href = a.get("href")
+            content_children = list(content.children) if content else []
+            items.append((anchor_id, return_href, content_children))
+
+        if not items:
+            outer.decompose()
+            continue
+
+        hr = soup.new_tag("hr")
+        heading = soup.new_tag("p")
+        strong = soup.new_tag("strong")
+        strong.string = "각주"
+        heading.append(strong)
+        ol = soup.new_tag("ol")
+        for anchor_id, return_href, children in items:
+            li = soup.new_tag("li")
+            if anchor_id:
+                li["id"] = anchor_id
+            for c in children:
+                li.append(c.extract() if hasattr(c, "extract") else c)
+            if return_href:
+                back = soup.new_tag("a")
+                back["href"] = return_href
+                back.string = " ↑"
+                li.append(back)
+            ol.append(li)
+
+        outer.replace_with(hr)
+        hr.insert_after(heading)
+        heading.insert_after(ol)
+
+
+def _convert_visual_residue(soup) -> None:
+    """
+    element-mapping §C 의 '시각 효과 손실' 항목을 Confluence 가 인지할 수
+    있는 inline style 또는 표준 태그로 격상.
+
+    - <div class="wrap_left|wrap_right|wrap_center"> -> style="text-align: …;"
+      Confluence storage 가 인라인 style 은 허용한다. 외관 보존됨.
+    - <td|th class="leftalign|centeralign|rightalign"> -> 같은 인라인 style
+    - <em class="u"> -> <u> (밑줄. DokuWiki 코어가 __underline__ 을 em.u 로
+      낸다; Confluence 도 <u> 받음).
+
+    `_convert_wrap_callouts` 가 의미 클래스 매크로 변환을 먼저 수행하므로
+    여기 도착하는 wrap_left/right/center 는 *순수 정렬 div* 인 경우.
+    """
+    # 1) 정렬 div
+    for div in list(soup.find_all("div")):
+        classes = div.get("class") or []
+        styles: list[str] = []
+        for c in classes:
+            if c in WRAP_ALIGN_STYLE_MAP:
+                styles.append(WRAP_ALIGN_STYLE_MAP[c])
+        if styles:
+            existing = div.get("style", "")
+            joined = " ".join(styles)
+            div["style"] = (existing.rstrip(";") + "; " + joined).strip("; ").strip() if existing else joined
+
+    # 2) 표 셀 정렬
+    for cell in list(soup.find_all(["td", "th"])):
+        classes = cell.get("class") or []
+        styles: list[str] = []
+        for c in classes:
+            if c in TABLE_ALIGN_CLASS_MAP:
+                styles.append(TABLE_ALIGN_CLASS_MAP[c])
+        if styles:
+            existing = cell.get("style", "")
+            joined = " ".join(styles)
+            cell["style"] = (existing.rstrip(";") + "; " + joined).strip("; ").strip() if existing else joined
+
+    # 3) em.u -> <u>
+    for em in list(soup.find_all("em")):
+        classes = em.get("class") or []
+        if "u" in classes:
+            u = soup.new_tag("u")
+            for c in list(em.children):
+                u.append(c.extract())
+            em.replace_with(u)
+
+
 def _convert_todos(soup) -> None:
     """
     DokuWiki todo plugin 출력을 Confluence task-list / 텍스트 마커로 변환.
@@ -709,6 +839,12 @@ def _convert_html_to_storage(
     # 정렬/레이아웃 클래스(wrap_left/right/center/clear/indent 등) 는 의미가
     # 없어서 별도 변환 없이 div 그대로 두고, class 정리 단계에서 떨군다.
     _convert_wrap_callouts(soup)
+
+    # 1.45) 정렬 / 밑줄 / 표 셀 정렬 -> inline style 또는 표준 태그
+    _convert_visual_residue(soup)
+
+    # 1.47) 풋노트 ((text)) -> <hr/><strong>각주</strong><ol>
+    _convert_footnotes(soup)
 
     # 1.5) todo plugin -> Confluence task-list / text marker
     #
@@ -899,7 +1035,13 @@ def _convert_html_to_storage(
         "sectionedit", "wikilink", "level", "media", "interwiki",
         "plugin_",  # plugin_include__<page-id> 같이 ID 가 박힌 dynamic class
     )
-    NOISE_CLASS_EXACT = {"toc", "page", "dokuwiki", "plugin_include_content"}
+    NOISE_CLASS_EXACT = {
+        "toc", "page", "dokuwiki", "plugin_include_content",
+        # 표 셀 정렬 클래스: _convert_visual_residue 가 inline style 로 옮긴 후 잔여 class 제거
+        "leftalign", "centeralign", "rightalign",
+        # em.u 의 'u' 도 _convert_visual_residue 에서 <u> 로 격상 후 잔여 — 이미 element 통째 교체되어 보통 안 남지만 방어적
+        "u",
+    }
     for tag in soup.find_all(True):
         cls = tag.get("class")
         if not cls:
@@ -958,12 +1100,9 @@ def cmd_convert(args: argparse.Namespace) -> int:
     ok = failed = 0
     for doku_id, raw_path_str in rows:
         if not raw_path_str:
-            conn.execute(
-                "UPDATE pages SET status='FAILED', last_error='no raw_xhtml_path', last_checked_at=? WHERE doku_id=?",
-                (now_iso(), doku_id),
-            )
-            conn.commit()
-            failed += 1
+            # raw 가 없는 페이지(예: _ensure_namespace_stubs / _promote_skipped
+            # 가 만든 placeholder)는 이미 storage_path 가 채워져 있고 다시
+            # 변환할 입력 자체가 없으므로 silently skip 한다 — fail 아님.
             continue
 
         raw_path = Path(raw_path_str)
@@ -1070,12 +1209,21 @@ def cmd_convert(args: argparse.Namespace) -> int:
 MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024  # 100MB
 
 
+CREDENTIAL_HELP = """
+필요 환경변수:
+  CONFLUENCE_EMAIL       Atlassian 계정 이메일
+  CONFLUENCE_API_TOKEN   API 토큰 (https://id.atlassian.com/manage-profile/security/api-tokens 에서 생성)
+또는 --email / --api-token 인자로 직접 전달.""".strip()
+
+
 def _confluence_session(args: argparse.Namespace):
     """인증된 requests.Session 반환. 자격증명 누락 시 None."""
     import requests
 
     if not args.email or not args.api_token:
-        log("CONFLUENCE_EMAIL / CONFLUENCE_API_TOKEN 환경변수 또는 인자가 필요합니다.")
+        log("자격증명 누락 — Confluence API 호출 불가.")
+        for line in CREDENTIAL_HELP.splitlines():
+            log("  " + line)
         return None
     s = requests.Session()
     s.auth = (args.email, args.api_token)
@@ -1458,11 +1606,21 @@ def _upload_attachments_for_page(
 
 
 def cmd_upload(args: argparse.Namespace) -> int:
+    missing = []
     if not args.space_key:
-        log("--space-key (또는 CONFLUENCE_SPACE_KEY) 가 필요합니다.")
-        return 2
+        missing.append("--space-key (또는 환경변수 CONFLUENCE_SPACE_KEY) — 대상 Confluence 공간의 키")
     if not args.root_page_id:
-        log("--root-page-id (또는 CONFLUENCE_ROOT_PAGE_ID) 가 필요합니다.")
+        missing.append("--root-page-id (또는 환경변수 CONFLUENCE_ROOT_PAGE_ID) — 마이그레이션 트리의 루트가 될 부모 페이지 ID")
+    if not args.dry_run:
+        if not args.email:
+            missing.append("--email / 환경변수 CONFLUENCE_EMAIL")
+        if not args.api_token:
+            missing.append("--api-token / 환경변수 CONFLUENCE_API_TOKEN (https://id.atlassian.com/manage-profile/security/api-tokens 에서 생성)")
+    if missing:
+        log("upload 호출에 필요한 항목이 누락되었습니다:")
+        for m in missing:
+            log(f"  - {m}")
+        log("dry-run 만으로 점검하려면 `--dry-run` 추가 시 인증은 생략 가능.")
         return 2
 
     STORAGE_DIR.mkdir(exist_ok=True)
@@ -1748,6 +1906,13 @@ def cmd_rewrite_links(args: argparse.Namespace) -> int:
         import bs4  # noqa: F401
     except ImportError:
         log("beautifulsoup4 가 필요합니다: pip install -r requirements.txt")
+        return 2
+
+    if not args.dry_run and (not args.email or not args.api_token):
+        log("rewrite-links (라이브 모드) 자격증명 누락:")
+        for line in CREDENTIAL_HELP.splitlines():
+            log("  " + line)
+        log("storage XML 만 재작성 (Confluence 갱신 없이) 하려면 `--dry-run` 사용.")
         return 2
 
     conn = db_connect(args.db)
