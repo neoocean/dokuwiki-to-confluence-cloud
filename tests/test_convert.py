@@ -23,7 +23,7 @@ SRC_ROOT = ROOT  # 미디어 lookup 은 본 테스트에서 무관
 
 
 def _convert(html: str) -> str:
-    storage, _links, _atts, _title = run._convert_html_to_storage(html, SRC_ROOT)
+    storage, _links, _atts, _title, _tags = run._convert_html_to_storage(html, SRC_ROOT)
     return storage
 
 
@@ -149,7 +149,9 @@ def test_footnote_section_rewritten() -> None:
     )
     out = _convert(html)
     assert "<strong>각주</strong>" in out
-    assert '<li id="fn__1">' in out
+    # Confluence 가 <li id=> 의 id 를 제거하므로 anchor 매크로로 표시
+    assert 'ac:name="anchor"' in out
+    assert "fn__1" in out  # anchor target
     assert "<div class=\"footnotes\">" not in out
     # 본문의 sup 은 유지 (anchor link 동작)
     assert 'href="#fn__1"' in out
@@ -231,7 +233,7 @@ def test_void_elements_self_closed() -> None:
 def test_h1_title_extracted() -> None:
     """첫 h1 텍스트가 title 후보."""
     html = '<h1 class="sectionedit1" id="t">Hello</h1><p>x</p>'
-    _xml, _links, _atts, title = run._convert_html_to_storage(html, SRC_ROOT)
+    _xml, _links, _atts, title, _tags = run._convert_html_to_storage(html, SRC_ROOT)
     assert title == "Hello"
 
 

@@ -788,6 +788,27 @@ def _convert_footnotes(soup) -> None:
 
     로 변환해 클릭 가능한 양방향 anchor 가 동작하도록 한다.
     """
+    from bs4 import BeautifulSoup
+    # 본문의 풋노트 reference (sup > a class=fn_top id=fnt__N) 의 id 도
+    # Confluence 가 제거하므로 anchor 매크로 직전 삽입.
+    for sup in list(soup.find_all("sup")):
+        a = sup.find("a", class_="fn_top")
+        if not a:
+            continue
+        anchor_id = a.get("id")
+        if not anchor_id:
+            continue
+        anchor_macro = BeautifulSoup(
+            f'<ac:structured-macro ac:name="anchor">'
+            f'<ac:parameter ac:name="">{anchor_id}</ac:parameter>'
+            f'</ac:structured-macro>',
+            "html.parser",
+        )
+        sup.insert_before(anchor_macro)
+        # id 는 어차피 사라지므로 정리만
+        if a.has_attr("id"):
+            del a.attrs["id"]
+
     for outer in list(soup.find_all("div", class_="footnotes")):
         items: list[tuple[str | None, str | None, list]] = []
         for fn in outer.find_all("div", class_="fn", recursive=False):
@@ -815,8 +836,16 @@ def _convert_footnotes(soup) -> None:
         ol = soup.new_tag("ol")
         for anchor_id, return_href, children in items:
             li = soup.new_tag("li")
+            # Confluence 는 <li id=...> 의 id attribute 를 parsing 시 제거하므로
+            # 공식 anchor 매크로를 첫 자식으로 삽입해 jump target 보존.
             if anchor_id:
-                li["id"] = anchor_id
+                anchor_macro = BeautifulSoup(
+                    f'<ac:structured-macro ac:name="anchor">'
+                    f'<ac:parameter ac:name="">{anchor_id}</ac:parameter>'
+                    f'</ac:structured-macro>',
+                    "html.parser",
+                )
+                li.append(anchor_macro)
             for c in children:
                 li.append(c.extract() if hasattr(c, "extract") else c)
             if return_href:
@@ -928,13 +957,14 @@ def _convert_todos(soup) -> None:
 def _convert_html_to_storage(
     raw_html: str,
     src_root: Path,
-) -> tuple[str, list[dict], list[dict], str | None]:
+) -> tuple[str, list[dict], list[dict], str | None, list[str]]:
     """
-    raw_html (DokuWiki export_xhtmlbody) -> (storage_xml, links, attachments, title).
+    raw_html (DokuWiki export_xhtmlbody) -> (storage_xml, links, attachments, title, tags).
 
     links:       [{'target': 'wiki:syntax', 'placeholder': 'dwc-link:wiki:syntax', 'anchor': '...'|None}, ...]
     attachments: [{'media_id': 'wiki:foo.png', 'filename': 'foo.png', 'src_path': str|None}, ...]
     title:       첫 h1 의 텍스트(없으면 None)
+    tags:        dokuwiki tag 플러그인의 page tag 값 리스트 (Confluence 페이지 label 로 매핑 후보)
     """
     from bs4 import BeautifulSoup, Comment
 
@@ -1096,6 +1126,31 @@ def _convert_html_to_storage(
         else:
             img.replace_with(ac_image)
 
+    # 4-pre) dokuwiki 의 tag 페이지 링크 (/tag/<value>?do=showtag&tag=<value>) 는
+    # 일급 페이지가 아니라 동적 view 라 placeholder 가 미해결로 평문 격하된다.
+    # 대신 *Confluence 페이지 label* 로 매핑하기 위해 tag 값을 별도 set 으로
+    # 수집하고 a 자체는 <ac:label> 같이 의미 있는 inline marker 로.
+    # storage XML 에는 직접 label 을 박을 수 없으므로 dwc-tag:<value> 라는
+    # 토큰 placeholder 로 남기고 cmd_upload 단계에서 PUT 후 label API 로
+    # 별도 적용.
+    page_tags: list[str] = []
+    for tag_a in list(soup.find_all("a", rel="tag")):
+        href = tag_a.get("href", "")
+        # /tag/<encoded>?do=showtag&tag=<encoded> 형태에서 tag 값 추출
+        from urllib.parse import urlparse, parse_qs, unquote
+        q = parse_qs(urlparse(href).query)
+        tag_val = (q.get("tag") or [""])[0]
+        if not tag_val:
+            # path 에서 추출
+            path = unquote(urlparse(href).path or "").strip("/")
+            if path.startswith("tag/"):
+                tag_val = path[4:]
+        tag_val = (tag_val or "").rstrip(",").strip()
+        if tag_val:
+            page_tags.append(tag_val)
+        # a 는 텍스트만 남기고 unwrap
+        tag_a.replace_with(tag_a.get_text() or "")
+
     # 4) <a> 변환
     for a in list(soup.find_all("a")):
         href = a.get("href", "")
@@ -1177,6 +1232,10 @@ def _convert_html_to_storage(
     NOISE_CLASS_PREFIXES = (
         "sectionedit", "wikilink", "level", "media", "interwiki",
         "plugin_",  # plugin_include__<page-id> 같이 ID 가 박힌 dynamic class
+        # 의미 클래스(wrap_info/tip/note/warning/box/round/em/hi) 는 별도
+        # 변환 룰이 *이미 처리한 뒤*이므로, 여기 도착하는 wrap_* 잔여는
+        # 의미 없는 layout 변형 (wrap_clear/indent/outdent/lo/pre 등). 정리.
+        "wrap_",
     )
     NOISE_CLASS_EXACT = {
         "toc", "page", "dokuwiki", "plugin_include_content",
@@ -1208,7 +1267,7 @@ def _convert_html_to_storage(
         safe = text.replace("]]>", "]]]]><![CDATA[>")
         result = result.replace(sentinel, f"<![CDATA[{safe}]]>")
 
-    return result, links, list(attachments.values()), title
+    return result, links, list(attachments.values()), title, page_tags
 
 
 def cmd_convert(args: argparse.Namespace) -> int:
@@ -1260,7 +1319,7 @@ def cmd_convert(args: argparse.Namespace) -> int:
 
         try:
             raw_html = raw_path.read_text(encoding="utf-8", errors="replace")
-            storage_xml, links_out, attachments_out, h1_title = _convert_html_to_storage(
+            storage_xml, links_out, attachments_out, h1_title, page_tags = _convert_html_to_storage(
                 raw_html, src_root
             )
         except Exception as e:  # noqa: BLE001
@@ -1278,6 +1337,13 @@ def cmd_convert(args: argparse.Namespace) -> int:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(storage_xml, encoding="utf-8")
         content_hash = sha256_bytes(storage_xml.encode("utf-8"))
+
+        # tags: pages.title 등과 함께 별도 meta key 로 저장 (label API 단계에서 사용)
+        if page_tags:
+            db_set_meta(conn, f"page_tags:{doku_id}", "\n".join(page_tags))
+        else:
+            # 이전에 있던 tag 정리
+            conn.execute("DELETE FROM meta WHERE key=?", (f"page_tags:{doku_id}",))
 
         # 멱등성: 이 페이지의 이전 links 와 미업로드 attachments 정리 후 재기록.
         # 이미 UPLOADED 인 첨부는 보존해 다음 run 에서 중복 업로드를 막는다.
@@ -1379,6 +1445,34 @@ CREDENTIAL_HELP = """
   CONFLUENCE_EMAIL       Atlassian 계정 이메일
   CONFLUENCE_API_TOKEN   API 토큰 (https://id.atlassian.com/manage-profile/security/api-tokens 에서 생성)
 또는 --email / --api-token 인자로 직접 전달.""".strip()
+
+
+def _apply_page_labels(session, base_url: str, page_id: str, labels: list[str]) -> None:
+    """페이지에 Confluence label 들을 적용. v1 API (POST /rest/api/content/{id}/label)
+    사용 — v2 의 label API 는 read-only 라 추가는 v1 endpoint 만 가능.
+    Confluence label 은 lowercase + alphanumeric/-/_ 만 허용 — 자동 sanitize.
+    """
+    import re as _re
+
+    sanitized: list[dict] = []
+    seen: set[str] = set()
+    for raw in labels:
+        # 공백/특수문자 → hyphen, lowercase
+        clean = _re.sub(r"\s+", "-", raw.strip().lower())
+        clean = _re.sub(r"[^a-z0-9가-힣_\-]", "", clean)
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        sanitized.append({"prefix": "global", "name": clean})
+    if not sanitized:
+        return
+    resp = _request_with_retry(
+        session, "POST",
+        f"{base_url}/rest/api/content/{page_id}/label",
+        json=sanitized,
+    )
+    if resp is None or resp.status_code >= 400:
+        log(f"    label 적용 실패 (page {page_id}): {resp.status_code if resp else 'no resp'}")
 
 
 def _confluence_session(args: argparse.Namespace):
@@ -1981,6 +2075,14 @@ def cmd_upload(args: argparse.Namespace) -> int:
                     updated += 1
                     log(f"  [UPDATED] {doku_id} -> v{next_ver}")
 
+        # tag → Confluence page label 적용 (dry-run 도 건너뜀)
+        if not args.dry_run and confluence_page_id:
+            tags_meta = db_get_meta(conn, f"page_tags:{doku_id}")
+            if tags_meta:
+                tags = [t for t in tags_meta.splitlines() if t.strip()]
+                if tags:
+                    _apply_page_labels(session, base_url, str(confluence_page_id), tags)
+
         # 첨부 업로드 (CREATED 또는 기존 UPLOADED 페이지 모두 대상)
         if not args.dry_run and confluence_page_id:
             o, f = _upload_attachments_for_page(
@@ -2076,6 +2178,10 @@ def _rewrite_links_in_xml(
         result = result.replace(sentinel, f"<![CDATA[{safe}]]>")
 
     return result, resolved, unresolved
+
+
+# return statement above belongs to _rewrite_links_in_xml — _convert_html_to_storage
+# 의 마지막 return 도 tags 포함하도록 별도 갱신.
 
 
 def cmd_rewrite_links(args: argparse.Namespace) -> int:
@@ -2660,6 +2766,158 @@ def cmd_struct_status(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------- rewrite-oversized: OVERSIZED 첨부 reference 를 메타 박스로 ----------
+
+def cmd_rewrite_oversized(args: argparse.Namespace) -> int:
+    """
+    100MB 초과 첨부 (status='OVERSIZED') 의 reference 를 본문에서
+    'note' 매크로 메타 박스로 치환한다. 첨부 파일 자체는 Confluence
+    에 안 들어가고 (사이즈 한도) 호스트 P4 백업에 보존. 본문에선
+    어떤 파일이 어디에 있었는지 시각적으로 표시되어 깨진 reference
+    가 아닌 *대용량 첨부 미이전* 안내로 보인다.
+
+    상세 옵션 매트릭스: docs/oversized-attachments.md §3.
+    이 함수는 그 중 옵션 B (note macro footer) 를 구현.
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        log("beautifulsoup4 가 필요합니다: pip install -r requirements.txt")
+        return 2
+
+    conn = db_connect(args.db)
+    db_init(conn)
+
+    rows = conn.execute(
+        "SELECT page_doku_id, media_id, size, last_error "
+        "FROM attachments WHERE status='OVERSIZED' ORDER BY page_doku_id, media_id"
+    ).fetchall()
+    if not rows:
+        log("OVERSIZED 첨부 없음.")
+        return 0
+    log(f"OVERSIZED 첨부: {len(rows)}건 (영향 페이지 식별 중)")
+
+    # 페이지별로 묶기
+    by_page: dict[str, list[tuple[str, int | None, str | None]]] = {}
+    for page_id, media_id, size, err in rows:
+        by_page.setdefault(page_id, []).append((media_id, size, err))
+
+    changed_pages: list[str] = []
+    for page_id, items in by_page.items():
+        row = conn.execute(
+            "SELECT storage_path FROM pages WHERE doku_id=?", (page_id,)
+        ).fetchone()
+        if not row or not row[0]:
+            log(f"  [SKIP] {page_id}: storage 없음")
+            continue
+        sp = Path(row[0])
+        if not sp.is_file():
+            continue
+        xml = sp.read_text(encoding="utf-8")
+        soup = BeautifulSoup(xml, "html.parser")
+
+        # 각 OVERSIZED 첨부의 filename 으로 ri:attachment 찾기
+        applied = 0
+        for media_id, size, _err in items:
+            filename = _media_filename(media_id)
+            for ri in list(soup.find_all("ri:attachment")):
+                if ri.get("ri:filename") != filename:
+                    continue
+                # ri:attachment 의 부모가 <ac:image> 또는 <ac:link>. 그 부모를 통째 매크로로 교체.
+                parent = ri.find_parent(["ac:image", "ac:link"])
+                if parent is None:
+                    continue
+                size_mb = f"{size / (1024*1024):.1f}" if size else "?"
+                note = BeautifulSoup(
+                    "<ac:structured-macro ac:name='note'>"
+                    "<ac:parameter ac:name='title'>대용량 첨부 미이전</ac:parameter>"
+                    "<ac:rich-text-body>"
+                    f"<p>이 자리에는 원래 <code>{filename}</code> 이 있었습니다.</p>"
+                    "<ul>"
+                    f"<li>크기: 약 {size_mb} MB</li>"
+                    "<li>원본 위치: 호스트의 DokuWiki 백업 (P4 depot)</li>"
+                    "<li>이전되지 않은 이유: Confluence Cloud 단일 첨부 100MB 한도</li>"
+                    "</ul>"
+                    "</ac:rich-text-body>"
+                    "</ac:structured-macro>",
+                    "html.parser",
+                )
+                parent.replace_with(note)
+                applied += 1
+
+        if applied:
+            new_xml = "".join(str(c) for c in soup.children)
+            import re as _re
+            new_xml = _re.sub(r"<(br|hr|img)([^>]*?)(?<!/)\s*>", r"<\1\2/>", new_xml)
+            new_hash = sha256_bytes(new_xml.encode("utf-8"))
+            sp.write_text(new_xml, encoding="utf-8")
+            conn.execute(
+                "UPDATE pages SET content_hash=?, last_checked_at=? WHERE doku_id=?",
+                (new_hash, now_iso(), page_id),
+            )
+            changed_pages.append(page_id)
+            log(f"  [{page_id}] {applied}건의 OVERSIZED 참조 → note 박스")
+
+    conn.commit()
+    log(f"본문 갱신된 페이지: {len(changed_pages)}")
+
+    if args.no_upload:
+        log("--no-upload — storage 만 갱신, Confluence PUT 건너뜀")
+        return 0
+
+    if not changed_pages:
+        return 0
+
+    if not args.email or not args.api_token:
+        log("자격증명 누락 — Confluence PUT 건너뜀. 다음 upload 호출이 자동 PUT 처리.")
+        return 2
+
+    session = _confluence_session(args)
+    if session is None:
+        return 2
+    base = args.base_url.rstrip("/")
+    failed = pushed = 0
+    for doku_id in changed_pages:
+        row = conn.execute(
+            "SELECT confluence_page_id, title, content_hash, storage_path "
+            "FROM pages WHERE doku_id=?",
+            (doku_id,),
+        ).fetchone()
+        if not row or not row[0]:
+            continue
+        cid, title, ch, sp = row
+        cur_ver = _get_page_version(session, base, cid)
+        if cur_ver is None:
+            log(f"  [FAIL] {doku_id}: 버전 조회 실패")
+            failed += 1
+            continue
+        body = Path(sp).read_text(encoding="utf-8")
+        payload = {
+            "id": cid, "status": "current", "title": title,
+            "body": {"representation": "storage", "value": body},
+            "version": {"number": cur_ver + 1},
+        }
+        resp = _request_with_retry(
+            session, "PUT", f"{base}/api/v2/pages/{cid}", json=payload
+        )
+        if resp is None or resp.status_code >= 400:
+            failed += 1
+            log(f"  [FAIL] {doku_id}: {resp.status_code if resp else 'no resp'}")
+            continue
+        conn.execute(
+            "UPDATE pages SET confluence_version=?, uploaded_at=?, last_checked_at=? WHERE doku_id=?",
+            (cur_ver + 1, now_iso(), now_iso(), doku_id),
+        )
+        db_set_meta(conn, f"uploaded_hash:{doku_id}", ch or "")
+        conn.commit()
+        pushed += 1
+        log(f"  [REWRITTEN] {doku_id} -> v{cur_ver + 1}")
+
+    log(f"rewrite-oversized 완료: pushed={pushed} failed={failed}")
+    conn.close()
+    return 0 if failed == 0 else 1
+
+
 # ---------- 보조: audit (dokuwiki vs Confluence 비교) ----------
 
 def _extract_visible_text(html_or_xml: str) -> str:
@@ -2904,25 +3162,36 @@ def _structural_features(html_or_xml: str, is_storage: bool) -> dict[str, int]:
 
 
 def _compare_features(d_feats: dict, c_feats: dict) -> tuple[list[dict], bool]:
-    """카테고리별 카운트 차이 → mismatch list + has_critical_diff 반환."""
-    # 비교 카테고리. is_critical 은 사용자가 보기에 명확한 누락
+    """카테고리별 카운트 차이 → mismatch list + has_critical_diff 반환.
+
+    정밀화 (v2):
+    - 변환기가 의도적으로 다른 카테고리로 옮기는 카운트는 *합산해서 비교*:
+        * link_total = page_link + attachment_link + external_link
+          (dokuwiki 의 fetch.php?media=https:// 같은 proxy 는 변환기가
+          external 로 재분류 — 개별 카테고리 비교는 spurious mismatch)
+        * todo: dokuwiki 측 task 와 Confluence 측 task + task_text_marker
+          (mixed todo fallback 도 합산)
+    - footnote 재구성으로 dokuwiki 측 sup 일부가 storage 의 macro_anchor
+      로 옮겨가는 영향 보정: sup 차이만 따로 보지 않고 footnote 처리한
+      페이지는 sup mismatch 를 ignore.
+    - del 은 todo strikethrough 가 ac:task-status=complete 로 가서 사라짐
+      → del 만 critical 아님. (이미 critical=False)
+    - li 카운트 +차이 (Confluence 측 많음) 는 ac:task-list 의 task 가
+      별도 li 자식으로 셈됨. critical=False.
+    """
     rules = [
         ("h1", True), ("h2", True), ("h3", True), ("h4", False), ("h5", False),
         ("strong", False), ("em", False), ("code", False),
-        ("sub", False), ("sup", False), ("del", False), ("u", False),
+        ("sub", False), ("del", False), ("u", False),
         ("table", True), ("tr", False), ("th", False), ("td", False),
         ("ul", False), ("ol", False), ("li", False),
         ("blockquote", False),
         ("image_total", True),
-        ("page_link", True),
-        ("attachment_link", True),
-        ("external_link", False),
         ("macro_info", True), ("macro_tip", True),
         ("macro_note", True), ("macro_warning", True),
         ("macro_panel", False),
         ("macro_code", True),
-        ("task", False),
-        ("smiley", True),  # dokuwiki 측은 N, storage 측은 0 (모두 emoji 로 변환) 이어야
+        ("smiley", True),
     ]
     mismatches = []
     has_crit = False
@@ -2931,8 +3200,6 @@ def _compare_features(d_feats: dict, c_feats: dict) -> tuple[list[dict], bool]:
         cv = c_feats.get(key, 0)
         if dv == cv:
             continue
-        # 외부 링크 등 일부는 변환 시 다른 카테고리로 옮겨갈 수 있음 — 허용 오차
-        # absolute diff > 0 이면 일단 기록, critical 만 fail 로
         diff = cv - dv
         mismatches.append({
             "category": key,
@@ -2943,6 +3210,40 @@ def _compare_features(d_feats: dict, c_feats: dict) -> tuple[list[dict], bool]:
         })
         if critical and abs(diff) > 0:
             has_crit = True
+
+    # 합산 비교 — 변환기가 카테고리 옮긴 영향 흡수
+    d_link_total = d_feats.get("page_link", 0) + d_feats.get("attachment_link", 0) + d_feats.get("external_link", 0)
+    c_link_total = c_feats.get("page_link", 0) + c_feats.get("attachment_link", 0) + c_feats.get("external_link", 0)
+    if d_link_total != c_link_total:
+        # 큰 차이 (>20%) 면 진짜 손실
+        ratio = abs(c_link_total - d_link_total) / max(d_link_total, 1)
+        crit = ratio > 0.2 and d_link_total > 0
+        mismatches.append({
+            "category": "link_total",
+            "dokuwiki": d_link_total,
+            "confluence": c_link_total,
+            "diff": c_link_total - d_link_total,
+            "critical": crit,
+        })
+        if crit:
+            has_crit = True
+
+    # todo 합산
+    d_task = d_feats.get("task", 0)
+    c_task = c_feats.get("task", 0) + c_feats.get("task_text_marker", 0)
+    if d_task != c_task:
+        ratio = abs(c_task - d_task) / max(d_task, 1)
+        crit = ratio > 0.2 and d_task > 0
+        mismatches.append({
+            "category": "task_total",
+            "dokuwiki": d_task,
+            "confluence": c_task,
+            "diff": c_task - d_task,
+            "critical": crit,
+        })
+        if crit:
+            has_crit = True
+
     return mismatches, has_crit
 
 
@@ -3626,6 +3927,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp_ss = sub.add_parser("struct-status", help="struct 진행 상황 요약")
     sp_ss.set_defaults(func=cmd_struct_status)
+
+    sp_ro = sub.add_parser(
+        "rewrite-oversized",
+        help="OVERSIZED 첨부 reference 를 note 매크로 메타 박스로 (docs/oversized-attachments.md §4.1 B 모드)",
+    )
+    sp_ro.add_argument(
+        "--base-url",
+        default=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+    )
+    sp_ro.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
+    sp_ro.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
+    sp_ro.add_argument("--no-upload", action="store_true", help="storage 만 갱신, Confluence PUT 안 함")
+    sp_ro.set_defaults(func=cmd_rewrite_oversized)
 
     sp_audit = sub.add_parser(
         "audit", help="Confluence 의 실제 페이지를 받아 dokuwiki raw 와 비교"
