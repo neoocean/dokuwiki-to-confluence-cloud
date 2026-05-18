@@ -8,8 +8,11 @@
 # at the module boundary and would activate automatically if the
 # operator ever flips P4IGNORE to a per-directory name.
 
-# Runtime state — host-local, regenerable from `discover` + `render`.
-state.db
+# Runtime state — sqlite. state.db 자체는 의도적으로 depot 에 추적해
+# 마이그레이션 결과(confluence_page_id / uploaded_hash 매핑 등)를
+# 보존한다. GitHub 미러에는 .gitignore 가 별도로 차단해 안 올라간다.
+# WAL/SHM 은 일시 파일이라 계속 차단.
+#state.db                  ← 의도적으로 비활성. depot 에 추적.
 state.db-wal
 state.db-shm
 

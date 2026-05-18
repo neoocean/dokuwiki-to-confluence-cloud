@@ -649,6 +649,43 @@ def _build_ac_task(soup, task_id: int, checked: bool, text: str):
     return task
 
 
+SMILEY_EMOJI_MAP = {
+    # DokuWiki 코어가 제공하는 smiley 이미지를 unicode emoji 로.
+    # `<img class="icon smiley" alt=":-)">` 같은 픽셀 이미지가 Confluence 에서
+    # 깨진 링크가 되지 않도록.
+    ":-)": "🙂", ":)": "🙂", "=)": "🙂",
+    ":-(": "🙁", ":(": "🙁",
+    ":-D": "😀", ":D": "😀",
+    ";-)": "😉", ";)": "😉",
+    ":-P": "😛", ":P": "😛",
+    ":-O": "😮", ":O": "😮",
+    "8-)": "😎", "8-O": "😲",
+    ":-/": "🤔",
+    ":-\\": "🤔",
+    ":-?": "🤔",
+    ":-X": "🤐",
+    ":-|": "😐",
+    "^_^": "😊",
+    "m(": "🤦",
+    ":?:": "❓",
+    ":!:": "❗",
+    "LOL": "😆",
+    "FIXME": "⚠️ FIXME",
+    "DELETEME": "⚠️ DELETEME",
+}
+
+
+def _convert_smileys(soup) -> None:
+    """DokuWiki 코어 smiley 이미지 → unicode emoji 텍스트."""
+    for img in list(soup.find_all("img")):
+        classes = img.get("class") or []
+        if "smiley" not in classes:
+            continue
+        alt = img.get("alt", "") or ""
+        emoji = SMILEY_EMOJI_MAP.get(alt, alt or "")
+        img.replace_with(emoji)
+
+
 WRAP_SEMANTIC_MAP = {
     "wrap_info":      "info",
     "wrap_help":      "info",
@@ -940,6 +977,9 @@ def _convert_html_to_storage(
     # 없어서 별도 변환 없이 div 그대로 두고, class 정리 단계에서 떨군다.
     _convert_wrap_callouts(soup)
 
+    # 1.42) DokuWiki 코어 smiley 이미지 -> emoji 텍스트
+    _convert_smileys(soup)
+
     # 1.45) 정렬 / 밑줄 / 표 셀 정렬 -> inline style 또는 표준 태그
     _convert_visual_residue(soup)
 
@@ -985,7 +1025,10 @@ def _convert_html_to_storage(
     ):
         for t in soup.find_all(id=sel_id):
             t.decompose()
-    for cls in ("breadcrumbs", "trace", "tools", "docInfo", "no", "headings"):
+    # 주의: 'no' 클래스는 DokuWiki 가 blockquote 안 내용을 감싸는 *정상
+    # content wrapper* 로도 쓴다 (e.g. <blockquote><div class='no'>URL 리스트</div>
+    # </blockquote>). chrome 제거 목록에서 제외.
+    for cls in ("breadcrumbs", "trace", "tools", "docInfo", "headings"):
         for t in soup.find_all(class_=cls):
             t.decompose()
 
@@ -1280,12 +1323,27 @@ def cmd_convert(args: argparse.Namespace) -> int:
                 (doku_id, att["media_id"], att["src_path"], size, sha, status, err),
             )
 
-        # 제목은 h1 우선, 그다음 기존 값
+        # 제목은 h1 우선, 그다음 기존 값.
+        # 단 기존 title 이 이미 *disambiguated* 형식 (e.g. 'DokuWiki (wiki:dokuwiki)'
+        # 또는 'X [doku_id]') 이면 보존 — cmd_upload 의 reactive dis 결과나
+        # _disambiguate_duplicate_titles 결과를 h1 으로 덮어쓰면 Confluence
+        # 측 페이지 title 과 어긋나 다음 update 가 400 으로 거부된다.
         if h1_title:
-            conn.execute(
-                "UPDATE pages SET title=? WHERE doku_id=?",
-                (h1_title, doku_id),
+            existing_row = conn.execute(
+                "SELECT title FROM pages WHERE doku_id=?", (doku_id,)
+            ).fetchone()
+            existing = existing_row[0] if existing_row else None
+            is_disambiguated = bool(
+                existing
+                and existing.startswith(h1_title)
+                and len(existing) > len(h1_title)
+                and existing[len(h1_title):].lstrip().startswith(("(", "["))
             )
+            if not is_disambiguated:
+                conn.execute(
+                    "UPDATE pages SET title=? WHERE doku_id=?",
+                    (h1_title, doku_id),
+                )
 
         conn.execute(
             """
@@ -1760,7 +1818,19 @@ def cmd_upload(args: argparse.Namespace) -> int:
 
     order = _bfs_upload_order(conn)
     if args.only:
-        order = [d for d in order if d == args.only]
+        # only 지정 시 부모 chain 도 함께 포함하지 않으면 SKIP 되므로,
+        # --include-parents 또는 단일 페이지 의도 분기.
+        selected = {args.only}
+        if args.include_parents:
+            cur = args.only
+            while cur:
+                row = conn.execute(
+                    "SELECT parent_doku_id FROM pages WHERE doku_id=?", (cur,)
+                ).fetchone()
+                cur = row[0] if row else None
+                if cur:
+                    selected.add(cur)
+        order = [d for d in order if d in selected]
     if args.limit:
         order = order[: args.limit]
 
@@ -2590,6 +2660,492 @@ def cmd_struct_status(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------- 보조: audit (dokuwiki vs Confluence 비교) ----------
+
+def _extract_visible_text(html_or_xml: str) -> str:
+    """텍스트만 추출 + 정규화. dokuwiki HTML 와 Confluence storage/view
+    양쪽에 동일하게 적용해 비교 가능한 형태로."""
+    from bs4 import BeautifulSoup
+
+    s = BeautifulSoup(html_or_xml, "html.parser")
+    # 위험/노이즈 태그 제거 (dokuwiki 쪽 chrome 등)
+    for tag in ("script", "style", "link", "meta", "noscript", "iframe",
+                "head", "form", "input", "button", "select", "option"):
+        for t in s.find_all(tag):
+            t.decompose()
+    # dokuwiki chrome / EDIT 코멘트 제거
+    from bs4 import Comment
+    for c in s.find_all(string=lambda x: isinstance(x, Comment)):
+        c.extract()
+    for sel_id in ("dokuwiki__site", "dokuwiki__top", "dokuwiki__header",
+                   "dokuwiki__footer", "dokuwiki__pagetools",
+                   "dokuwiki__usertools", "dokuwiki__sitetools"):
+        for t in s.find_all(id=sel_id):
+            t.decompose()
+    for a in s.find_all("a", class_="secedit"):
+        a.decompose()
+    for div in s.find_all("div", class_="toc"):
+        div.decompose()
+    text = s.get_text(separator=" ", strip=True)
+    # 공백 정규화
+    import re as _re
+    return _re.sub(r"\s+", " ", text).strip()
+
+
+def _confluence_get_page_body(session, base_url, page_id, body_format="storage"):
+    """Confluence v2 페이지의 body 를 받음.
+
+    body_format: storage / view / atlas_doc_format / export_view ...
+    """
+    resp = _request_with_retry(
+        session, "GET",
+        f"{base_url}/api/v2/pages/{page_id}",
+        params={"body-format": body_format, "include-version": "true"},
+    )
+    if resp is None or resp.status_code >= 400:
+        return None
+    data = resp.json()
+    body = data.get("body", {})
+    if body_format in body and isinstance(body[body_format], dict):
+        return body[body_format].get("value", "")
+    if "storage" in body and isinstance(body["storage"], dict):
+        return body["storage"].get("value", "")
+    return ""
+
+
+def _structural_features(html_or_xml: str, is_storage: bool) -> dict[str, int]:
+    """페이지 본문에서 구조적 특징 카운트 (텍스트 + 형식 + 이미지 + 링크 +
+    첨부 + 코드 블록 + 표 + 리스트 + callout/task 매크로).
+
+    dokuwiki HTML 과 Confluence storage 양쪽에 같은 함수를 호출해
+    is_storage 플래그로 분기. 비교에 쓸 *대표성 있는* 카운트만 추출.
+    """
+    from bs4 import BeautifulSoup, Comment
+
+    soup = BeautifulSoup(html_or_xml, "html.parser")
+    # 노이즈/chrome 제거 (dokuwiki 측만 의미)
+    if not is_storage:
+        for tag in ("script", "style", "link", "meta", "noscript", "iframe",
+                    "form", "input", "head"):
+            for t in soup.find_all(tag):
+                t.decompose()
+        for c in soup.find_all(string=lambda x: isinstance(x, Comment)):
+            c.extract()
+        for sel in ("dokuwiki__site", "dokuwiki__top", "dokuwiki__header",
+                    "dokuwiki__footer", "dokuwiki__pagetools",
+                    "dokuwiki__usertools", "dokuwiki__sitetools"):
+            for t in soup.find_all(id=sel):
+                t.decompose()
+        for a in soup.find_all("a", class_="secedit"):
+            a.decompose()
+        for div in soup.find_all("div", class_="toc"):
+            div.decompose()
+        for div in soup.find_all(id="dw__toc"):
+            div.decompose()
+
+    f: dict[str, int] = {}
+    # 헤딩
+    for lv in range(1, 7):
+        f[f"h{lv}"] = len(soup.find_all(f"h{lv}"))
+    # 인라인 포맷팅
+    for tag in ("strong", "em", "code", "sub", "sup", "del", "u"):
+        f[tag] = len(soup.find_all(tag))
+    # 표 / 리스트
+    f["table"] = len(soup.find_all("table"))
+    f["tr"] = len(soup.find_all("tr"))
+    f["th"] = len(soup.find_all("th"))
+    f["td"] = len(soup.find_all("td"))
+    f["ul"] = len(soup.find_all("ul"))
+    f["ol"] = len(soup.find_all("ol"))
+    f["li"] = len(soup.find_all("li"))
+    f["blockquote"] = len(soup.find_all("blockquote"))
+    f["br"] = len(soup.find_all("br"))
+    f["hr"] = len(soup.find_all("hr"))
+
+    if is_storage:
+        # Confluence: <ac:image>, <ac:link><ri:page>, <ac:link><ri:attachment>
+        f["image_internal"] = len(soup.find_all("ac:image"))
+        # <img> (외부 이미지 그대로 통과한 케이스)
+        f["image_external"] = sum(
+            1 for img in soup.find_all("img")
+            if str(img.get("src", "")).startswith(("http://", "https://"))
+        )
+        f["image_total"] = f["image_internal"] + f["image_external"]
+
+        page_links = 0
+        attach_links = 0
+        for a in soup.find_all("ac:link"):
+            if a.find("ri:page"):
+                page_links += 1
+            if a.find("ri:attachment"):
+                attach_links += 1
+        # placeholder (S7 미수행 잔존) 도 page_link 로 합산
+        placeholder = sum(
+            1 for a in soup.find_all("a")
+            if str(a.get("href", "")).startswith("dwc-link:")
+        )
+        f["page_link_placeholder"] = placeholder
+        f["page_link"] = page_links + placeholder
+        f["attachment_link"] = attach_links
+
+        f["external_link"] = sum(
+            1 for a in soup.find_all("a")
+            if str(a.get("href", "")).startswith(("http://", "https://"))
+        )
+        # storage 안 smiley 잔여 (변환 누락 검증용)
+        f["smiley"] = sum(
+            1 for img in soup.find_all("img")
+            if "smiley" in (img.get("class") or [])
+        )
+
+        # 매크로
+        for name in ("info", "tip", "note", "warning", "panel", "code"):
+            f[f"macro_{name}"] = sum(
+                1 for m in soup.find_all("ac:structured-macro")
+                if m.get("ac:name") == name
+            )
+        f["task_list"] = len(soup.find_all("ac:task-list"))
+        f["task"] = len(soup.find_all("ac:task"))
+        # 텍스트 마커 폴백 (mixed todo)
+        text_all = soup.get_text()
+        import re as _re
+        f["task_text_marker"] = len(_re.findall(r"\[(?:x| )\] ", text_all))
+    else:
+        # DokuWiki: smiley 와 일반 미디어 분리, 외부 proxy 와 내부 분리
+        internal_img = 0
+        external_img = 0
+        smiley_count = 0
+        for img in soup.find_all("img"):
+            classes = img.get("class") or []
+            if "smiley" in classes:
+                smiley_count += 1
+                continue
+            src = str(img.get("src", ""))
+            from urllib.parse import urlparse, parse_qs
+            p = urlparse(src)
+            q = parse_qs(p.query)
+            m = q.get("media", [""])[0] if "media" in q else ""
+            if m.startswith(("http://", "https://")):
+                external_img += 1
+            elif src.startswith(("/_media/", "/_detail/")):
+                internal_img += 1
+            elif "fetch.php" in p.path:
+                internal_img += 1
+            elif src.startswith(("http://", "https://")):
+                external_img += 1
+            else:
+                external_img += 1
+        f["image_internal"] = internal_img
+        f["image_external"] = external_img
+        f["smiley"] = smiley_count
+        # 비교용 image_total: smiley 는 emoji 로 변환되어 text 가 되므로 제외
+        f["image_total"] = internal_img + external_img
+
+        page_links = 0
+        attach_links = 0
+        external_links = 0
+        from urllib.parse import urlparse, parse_qs
+        for a in soup.find_all("a"):
+            classes = a.get("class") or []
+            href = str(a.get("href", ""))
+            p = urlparse(href)
+            q = parse_qs(p.query)
+            media_val = q.get("media", [""])[0] if "media" in q else ""
+            # 외부 미디어 proxy 또는 외부 URL 은 external 로 (Confluence 측에서도 외부 a)
+            is_external_url = href.startswith(("http://", "https://"))
+            is_external_media_proxy = media_val.startswith(("http://", "https://"))
+            if a.get("data-wiki-id") or any(c.startswith("wikilink") for c in classes):
+                page_links += 1
+            elif is_external_media_proxy or is_external_url:
+                external_links += 1
+            elif any(c in ("media", "mediafile") or c.startswith("mf_") for c in classes):
+                attach_links += 1
+            elif "media=" in href or href.startswith(("/_media/", "/_detail/", "/lib/exe/fetch.php")):
+                attach_links += 1
+        f["page_link"] = page_links
+        f["page_link_placeholder"] = 0
+        f["attachment_link"] = attach_links
+        f["external_link"] = external_links
+
+        # 코드 블록
+        f["macro_code"] = len(
+            [pre for pre in soup.find_all("pre")
+             if pre.get("class") and ("code" in pre.get("class") or "file" in pre.get("class"))]
+        )
+        # callout 매크로 — dokuwiki 의 의미 클래스 갯수
+        wrap_info_help = sum(
+            1 for d in soup.find_all("div")
+            if d.get("class") and any(c in ("wrap_info", "wrap_help") for c in d.get("class"))
+        )
+        f["macro_info"] = wrap_info_help
+        f["macro_tip"] = sum(
+            1 for d in soup.find_all("div")
+            if d.get("class") and any(c == "wrap_tip" for c in d.get("class"))
+        )
+        f["macro_note"] = sum(
+            1 for d in soup.find_all("div")
+            if d.get("class") and any(c in ("wrap_important", "wrap_note") for c in d.get("class"))
+        )
+        f["macro_warning"] = sum(
+            1 for d in soup.find_all("div")
+            if d.get("class") and any(c in ("wrap_alert", "wrap_warning", "wrap_danger") for c in d.get("class"))
+        )
+        f["macro_panel"] = sum(
+            1 for d in soup.find_all("div")
+            if d.get("class") and any(c in ("wrap_box", "wrap_round") for c in d.get("class"))
+        )
+        # todo
+        todos = soup.find_all("span", class_="todo")
+        f["task"] = len(todos)
+        f["task_list"] = 0  # dokuwiki 측에는 명시적 task-list 컨테이너 개념 없음
+        f["task_text_marker"] = 0
+
+    return f
+
+
+def _compare_features(d_feats: dict, c_feats: dict) -> tuple[list[dict], bool]:
+    """카테고리별 카운트 차이 → mismatch list + has_critical_diff 반환."""
+    # 비교 카테고리. is_critical 은 사용자가 보기에 명확한 누락
+    rules = [
+        ("h1", True), ("h2", True), ("h3", True), ("h4", False), ("h5", False),
+        ("strong", False), ("em", False), ("code", False),
+        ("sub", False), ("sup", False), ("del", False), ("u", False),
+        ("table", True), ("tr", False), ("th", False), ("td", False),
+        ("ul", False), ("ol", False), ("li", False),
+        ("blockquote", False),
+        ("image_total", True),
+        ("page_link", True),
+        ("attachment_link", True),
+        ("external_link", False),
+        ("macro_info", True), ("macro_tip", True),
+        ("macro_note", True), ("macro_warning", True),
+        ("macro_panel", False),
+        ("macro_code", True),
+        ("task", False),
+        ("smiley", True),  # dokuwiki 측은 N, storage 측은 0 (모두 emoji 로 변환) 이어야
+    ]
+    mismatches = []
+    has_crit = False
+    for key, critical in rules:
+        dv = d_feats.get(key, 0)
+        cv = c_feats.get(key, 0)
+        if dv == cv:
+            continue
+        # 외부 링크 등 일부는 변환 시 다른 카테고리로 옮겨갈 수 있음 — 허용 오차
+        # absolute diff > 0 이면 일단 기록, critical 만 fail 로
+        diff = cv - dv
+        mismatches.append({
+            "category": key,
+            "dokuwiki": dv,
+            "confluence": cv,
+            "diff": diff,
+            "critical": critical,
+        })
+        if critical and abs(diff) > 0:
+            has_crit = True
+    return mismatches, has_crit
+
+
+def _diff_page(conn, session, base_url, doku_id, body_format="storage"):
+    """단일 페이지 비교. (status, dokuwiki_chars, confluence_chars,
+    text_match, summary) 반환."""
+    row = conn.execute(
+        "SELECT raw_xhtml_path, storage_path, confluence_page_id, title "
+        "FROM pages WHERE doku_id=?",
+        (doku_id,),
+    ).fetchone()
+    if not row:
+        return {"status": "NOT_IN_DB", "doku_id": doku_id}
+    raw_path, storage_path, confluence_id, title = row
+    if not confluence_id:
+        return {"status": "NOT_UPLOADED", "doku_id": doku_id, "title": title}
+
+    dokuwiki_text = ""
+    if raw_path and Path(raw_path).is_file():
+        dokuwiki_text = _extract_visible_text(Path(raw_path).read_text(encoding="utf-8"))
+
+    confluence_body = _confluence_get_page_body(session, base_url, confluence_id, body_format)
+    if confluence_body is None:
+        return {"status": "GET_FAILED", "doku_id": doku_id, "title": title,
+                "confluence_id": confluence_id}
+    confluence_text = _extract_visible_text(confluence_body)
+
+    # 텍스트 통계
+    len_ratio = (
+        min(len(dokuwiki_text), len(confluence_text))
+        / max(len(dokuwiki_text), len(confluence_text), 1)
+    )
+    d_tokens = set(dokuwiki_text.split())
+    c_tokens = set(confluence_text.split())
+    overlap = len(d_tokens & c_tokens) / max(len(d_tokens | c_tokens), 1)
+
+    # 구조적 카운트 비교 — dokuwiki raw vs Confluence storage (view 형식이면
+    # 일부 ac:* 가 사라져 비교 부정확하므로 storage 우선)
+    d_raw = ""
+    if raw_path and Path(raw_path).is_file():
+        d_raw = Path(raw_path).read_text(encoding="utf-8")
+    d_feats = _structural_features(d_raw, is_storage=False) if d_raw else {}
+    c_feats = _structural_features(confluence_body, is_storage=(body_format == "storage"))
+    mismatches, has_crit = _compare_features(d_feats, c_feats)
+
+    judgement = "OK"
+    notes = []
+    if len_ratio < 0.5:
+        judgement = "TEXT_DIVERGED"
+        notes.append(f"len ratio {len_ratio:.2f}")
+    if overlap < 0.6:
+        judgement = "TEXT_DIVERGED"
+        notes.append(f"token overlap {overlap:.2f}")
+    if has_crit:
+        judgement = "STRUCT_DIVERGED" if judgement == "OK" else "TEXT_AND_STRUCT_DIVERGED"
+        crit_summary = ", ".join(
+            f"{m['category']}({m['dokuwiki']}→{m['confluence']})"
+            for m in mismatches if m["critical"]
+        )
+        notes.append(crit_summary)
+    if dokuwiki_text and not confluence_text:
+        judgement = "EMPTY_CONFLUENCE"
+    if not dokuwiki_text:
+        judgement = "EMPTY_DOKU"
+
+    return {
+        "status": judgement,
+        "doku_id": doku_id,
+        "title": title,
+        "confluence_id": confluence_id,
+        "dokuwiki_chars": len(dokuwiki_text),
+        "confluence_chars": len(confluence_text),
+        "len_ratio": round(len_ratio, 3),
+        "token_overlap": round(overlap, 3),
+        "mismatches": mismatches,
+        "notes": "; ".join(notes),
+    }
+
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    """업로드된 페이지를 Confluence 에서 다시 받아 dokuwiki raw 와 비교."""
+    if not args.email or not args.api_token:
+        log("audit 은 자격증명 필요.")
+        for line in CREDENTIAL_HELP.splitlines():
+            log("  " + line)
+        return 2
+
+    conn = db_connect(args.db)
+    session = _confluence_session(args)
+    if session is None:
+        return 2
+    base = args.base_url.rstrip("/")
+
+    if args.only:
+        targets = [args.only]
+    elif args.failed_only:
+        targets = [
+            d for (d,) in conn.execute(
+                "SELECT doku_id FROM pages WHERE status='FAILED' ORDER BY doku_id"
+            ).fetchall()
+        ]
+    else:
+        # UPLOADED 페이지에서 무작위 또는 첫 N개
+        if args.sample:
+            targets = [
+                d for (d,) in conn.execute(
+                    "SELECT doku_id FROM pages WHERE status='UPLOADED' "
+                    "AND confluence_page_id IS NOT NULL ORDER BY RANDOM() LIMIT ?",
+                    (args.sample,),
+                ).fetchall()
+            ]
+        else:
+            targets = [
+                d for (d,) in conn.execute(
+                    "SELECT doku_id FROM pages WHERE status='UPLOADED' "
+                    "AND confluence_page_id IS NOT NULL ORDER BY doku_id"
+                ).fetchall()
+            ]
+
+    if not targets:
+        log("audit 대상 페이지 없음.")
+        return 1
+
+    log(f"audit 대상: {len(targets)} 페이지")
+    results: list[dict] = []
+    judgement_counts: dict[str, int] = {}
+    for i, doku_id in enumerate(targets, 1):
+        r = _diff_page(conn, session, base, doku_id, body_format=args.body_format)
+        results.append(r)
+        judgement_counts[r["status"]] = judgement_counts.get(r["status"], 0) + 1
+        if args.verbose or r["status"] not in ("OK",):
+            notes = r.get("notes", "")
+            log(
+                f"  [{r['status']:18}] {doku_id} doku={r.get('dokuwiki_chars','?')} "
+                f"conf={r.get('confluence_chars','?')} ratio={r.get('len_ratio','?')} "
+                f"overlap={r.get('token_overlap','?')} {notes}"
+            )
+
+    log("=== audit 요약 ===")
+    for k, v in sorted(judgement_counts.items(), key=lambda x: -x[1]):
+        log(f"  {k:25} {v}")
+
+    # 카테고리별 mismatch 빈도 집계
+    cat_counts: dict[str, int] = {}
+    cat_total_delta: dict[str, int] = {}
+    for r in results:
+        for m in r.get("mismatches", []) or []:
+            cat = m["category"]
+            cat_counts[cat] = cat_counts.get(cat, 0) + 1
+            cat_total_delta[cat] = cat_total_delta.get(cat, 0) + m["diff"]
+    if cat_counts:
+        log("=== mismatch 카테고리 별 영향 페이지 수 + 누적 delta (c - d) ===")
+        for cat, n in sorted(cat_counts.items(), key=lambda x: -x[1]):
+            log(f"  {cat:25} pages={n:4}  total_delta={cat_total_delta[cat]:+d}")
+
+    if args.output_json:
+        import json as _json
+        Path(args.output_json).write_text(
+            _json.dumps(results, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        log(f"JSON 결과 저장 → {args.output_json}")
+
+    if args.output_html:
+        import html as _h
+        lines = [
+            "<!doctype html><html lang='ko'><head><meta charset='utf-8'>",
+            "<title>audit report</title>",
+            "<style>body{font-family:-apple-system,sans-serif;font-size:13px;padding:1em;}",
+            "table{border-collapse:collapse;width:100%}",
+            "th,td{border:1px solid #ddd;padding:.3em .5em;text-align:left}",
+            "tr.bad td{background:#fde8e6}",
+            "tr.warn td{background:#fff5e6}",
+            "tr.ok td{background:#ecf8ec}",
+            "</style></head><body>",
+            f"<h1>audit report ({len(results)} pages)</h1>",
+            "<table><thead><tr>",
+            "<th>status</th><th>doku_id</th><th>title</th><th>doku_chars</th>",
+            "<th>conf_chars</th><th>ratio</th><th>overlap</th><th>notes</th>",
+            "</tr></thead><tbody>",
+        ]
+        for r in results:
+            cls = (
+                "ok" if r["status"] == "OK"
+                else ("bad" if r["status"] in ("DIVERGED", "EMPTY_CONFLUENCE",
+                                                "GET_FAILED") else "warn")
+            )
+            lines.append(f"<tr class='{cls}'>")
+            for k in ("status", "doku_id", "title", "dokuwiki_chars",
+                      "confluence_chars", "len_ratio", "token_overlap", "notes"):
+                v = r.get(k, "")
+                lines.append(f"<td>{_h.escape(str(v))}</td>")
+            lines.append("</tr>")
+        lines.append("</tbody></table></body></html>")
+        Path(args.output_html).write_text("\n".join(lines), encoding="utf-8")
+        log(f"HTML 리포트 저장 → {args.output_html}")
+
+    conn.close()
+    # exit code: DIVERGED 또는 GET_FAILED 가 있으면 1
+    bad = sum(judgement_counts.get(k, 0) for k in ("DIVERGED", "GET_FAILED", "EMPTY_CONFLUENCE"))
+    return 0 if bad == 0 else 1
+
+
 # ---------- 보조: report (corpus 통계 + 분포) ----------
 
 def cmd_report(args: argparse.Namespace) -> int:
@@ -3033,6 +3589,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp_upload.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
     sp_upload.add_argument("--dry-run", action="store_true")
     sp_upload.add_argument("--only", help="특정 doku_id 만 업로드")
+    sp_upload.add_argument(
+        "--include-parents", action="store_true",
+        help="--only 사용 시 그 페이지의 부모 chain 도 함께 업로드"
+    )
     sp_upload.add_argument("--limit", type=int, help="처음 N 개만 업로드")
     sp_upload.set_defaults(func=cmd_upload)
 
@@ -3066,6 +3626,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp_ss = sub.add_parser("struct-status", help="struct 진행 상황 요약")
     sp_ss.set_defaults(func=cmd_struct_status)
+
+    sp_audit = sub.add_parser(
+        "audit", help="Confluence 의 실제 페이지를 받아 dokuwiki raw 와 비교"
+    )
+    sp_audit.add_argument(
+        "--base-url",
+        default=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+    )
+    sp_audit.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
+    sp_audit.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
+    sp_audit.add_argument("--only", help="특정 doku_id 만 비교")
+    sp_audit.add_argument("--sample", type=int, help="UPLOADED 중 무작위 N개")
+    sp_audit.add_argument("--full", action="store_true", help="전체 UPLOADED 페이지 비교")
+    sp_audit.add_argument("--failed-only", action="store_true", help="FAILED 페이지만 비교")
+    sp_audit.add_argument(
+        "--body-format", default="storage",
+        choices=("storage", "view", "atlas_doc_format", "export_view"),
+        help="Confluence body 받을 형식 (기본 storage)"
+    )
+    sp_audit.add_argument("--verbose", "-v", action="store_true")
+    sp_audit.add_argument("--output-json", help="결과 JSON 저장 경로")
+    sp_audit.add_argument("--output-html", help="HTML 리포트 경로")
+    sp_audit.set_defaults(func=cmd_audit)
 
     sp_report = sub.add_parser(
         "report", help="corpus 통계 (pages/attachments/매크로/크기/title 충돌)"
