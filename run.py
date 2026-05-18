@@ -1199,6 +1199,13 @@ def cmd_convert(args: argparse.Namespace) -> int:
         conn.commit()
         ok += 1
 
+    # convert 가 h1 추출로 title 을 덮어쓴 직후 dis 한 번 호출. upload 단계의
+    # dis 호출과 멱등하므로 중복 호출이 안전하다. 이걸 빼면 convert 직후 잠시
+    # 중복 title 이 노출되어 report 출력 등에서 혼란을 준다.
+    dup = _disambiguate_duplicate_titles(conn)
+    if dup:
+        log(f"convert 후 중복 title disambiguation: {dup}개")
+
     log(f"convert 완료: ok={ok} failed={failed}")
     conn.close()
     return 0
@@ -2045,6 +2052,185 @@ def cmd_rewrite_links(args: argparse.Namespace) -> int:
     return 0 if failed == 0 else 1
 
 
+# ---------- 보조: report (corpus 통계 + 분포) ----------
+
+def cmd_report(args: argparse.Namespace) -> int:
+    """pages / attachments / 매크로 분포 / 큰 페이지 / 충돌 후보 등 corpus
+    레벨 통계 출력. 라이브 업로드 직전 점검 + element-mapping §G 자동 산출."""
+    if not Path(args.db).exists():
+        log(f"DB 없음: {args.db}")
+        return 1
+    conn = db_connect(args.db)
+
+    def header(title: str) -> None:
+        print()
+        print(f"==== {title} ====")
+
+    header("pages 상태 분포")
+    for status, n in conn.execute(
+        "SELECT status, COUNT(*) FROM pages GROUP BY status ORDER BY status"
+    ):
+        print(f"  {status:12s}  {n}")
+
+    header("attachments 상태 분포")
+    rows = conn.execute(
+        "SELECT status, COUNT(*) FROM attachments GROUP BY status ORDER BY status"
+    ).fetchall()
+    if rows:
+        for status, n in rows:
+            print(f"  {status:12s}  {n}")
+    else:
+        print("  (none)")
+
+    header("links (S7 placeholder)")
+    for resolved, n in conn.execute(
+        "SELECT resolved, COUNT(*) FROM links GROUP BY resolved"
+    ):
+        label = "resolved" if resolved else "unresolved"
+        print(f"  {label:12s}  {n}")
+
+    header("storage XML 크기 분포")
+    import glob as _glob
+
+    sizes = sorted(
+        Path(f).stat().st_size for f in _glob.glob("storage/**/*.xml", recursive=True)
+    )
+    if sizes:
+        n = len(sizes)
+        print(f"  files       {n}")
+        print(f"  min/p50/p95/p99/max  {sizes[0]} / {sizes[n // 2]} / "
+              f"{sizes[int(n * 0.95)]} / {sizes[int(n * 0.99)]} / {sizes[-1]}")
+        big = [(s, f) for s, f in
+               ((Path(f).stat().st_size, f) for f in _glob.glob("storage/**/*.xml", recursive=True))
+               if s > 1024 * 1024]
+        if big:
+            print(f"  >1MB        {len(big)}  (Confluence 권장 한도 근접/초과)")
+            for s, f in sorted(big, reverse=True)[: args.limit]:
+                print(f"    {s:>9}  {f}")
+
+    header("Confluence 매크로 카운트 (storage 안)")
+    if sizes:
+        import re as _re
+        macro_counts: dict[str, int] = {}
+        for f in _glob.glob("storage/**/*.xml", recursive=True):
+            txt = Path(f).read_text(encoding="utf-8", errors="replace")
+            for m in _re.findall(r'ac:name="([^"]+)"', txt):
+                macro_counts[m] = macro_counts.get(m, 0) + 1
+        for name, n in sorted(macro_counts.items(), key=lambda x: -x[1]):
+            print(f"  {name:18s}  {n}")
+    else:
+        print("  (storage/ 디렉터리 없음 — convert 실행 필요)")
+
+    header("title 중복 (Confluence per-space-unique 위반 가능)")
+    dup = conn.execute(
+        "SELECT title, COUNT(*) FROM pages WHERE status='CONVERTED' AND title IS NOT NULL "
+        "GROUP BY title HAVING COUNT(*) > 1 LIMIT ?",
+        (args.limit,),
+    ).fetchall()
+    if not dup:
+        print("  (없음)")
+    else:
+        for t, n in dup:
+            print(f"  {n}x  {t}")
+
+    header("FAILED 첨부 샘플")
+    for page, mid, err in conn.execute(
+        "SELECT page_doku_id, media_id, last_error FROM attachments "
+        "WHERE status='FAILED' LIMIT ?",
+        (args.limit,),
+    ).fetchall():
+        print(f"  {page} / {mid}: {err}")
+
+    header("meta")
+    for k, v in conn.execute(
+        "SELECT key, value FROM meta ORDER BY key"
+    ).fetchall():
+        if len(v) <= 80:
+            print(f"  {k}: {v}")
+        else:
+            print(f"  {k}: {v[:77]}...")
+
+    conn.close()
+    return 0
+
+
+# ---------- 보조: preview (raw + storage 나란히) ----------
+
+def cmd_preview(args: argparse.Namespace) -> int:
+    """한 페이지의 dokuwiki raw HTML 과 Confluence storage XML 을 한
+    HTML 페이지에 좌우로 배치해 시각 검수에 쓴다."""
+    conn = db_connect(args.db)
+    row = conn.execute(
+        "SELECT doku_id, raw_xhtml_path, storage_path, title, content_hash, status "
+        "FROM pages WHERE doku_id=?",
+        (args.doku_id,),
+    ).fetchone()
+    if not row:
+        log(f"doku_id={args.doku_id} 가 state.db 에 없습니다.")
+        return 1
+    doku_id, raw_path, storage_path, title, content_hash, status = row
+
+    raw_html = ""
+    if raw_path and Path(raw_path).is_file():
+        raw_html = Path(raw_path).read_text(encoding="utf-8")
+
+    storage_xml = ""
+    if storage_path and Path(storage_path).is_file():
+        storage_xml = Path(storage_path).read_text(encoding="utf-8")
+
+    import html as _h
+
+    out = f"""<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>preview: {_h.escape(doku_id)}</title>
+<style>
+  body {{ font-family: -apple-system, sans-serif; margin: 0; padding: 1em; background: #f5f5f7; color: #1d1d1f; }}
+  header {{ background: #fff; padding: .8em 1em; border-radius: 8px; margin-bottom: 1em; }}
+  header h1 {{ margin: 0; font-size: 1.2em; }}
+  .meta {{ color: #6e6e73; font-size: .85em; margin-top: .4em; }}
+  .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 1em; }}
+  .col {{ background: #fff; padding: 1em; border-radius: 8px; overflow: auto; max-height: 80vh; }}
+  .col h2 {{ font-size: 1em; margin-top: 0; color: #6e6e73; }}
+  .col.raw .body, .col.storage .body {{ font-size: .95em; line-height: 1.5; }}
+  .col.storage pre {{ background: #f7f7f9; padding: .8em; border-radius: 6px; overflow-x: auto; font-size: .8em; }}
+  /* storage XML 의 일부 매크로/tag 를 시각화하기 위한 간단 스타일 */
+  ac\\:structured-macro {{ display: block; border-left: 4px solid #007aff; background: #f0f6ff; padding: .5em .8em; margin: .4em 0; }}
+  ac\\:structured-macro[ac\\:name="info"] {{ border-color: #007aff; background: #e8f3ff; }}
+  ac\\:structured-macro[ac\\:name="tip"]  {{ border-color: #34c759; background: #ecf8ec; }}
+  ac\\:structured-macro[ac\\:name="note"] {{ border-color: #ff9500; background: #fff5e6; }}
+  ac\\:structured-macro[ac\\:name="warning"] {{ border-color: #ff3b30; background: #fde8e6; }}
+  ac\\:structured-macro[ac\\:name="panel"] {{ border-color: #8e8e93; background: #f5f5f7; }}
+  ac\\:structured-macro[ac\\:name="code"] pre {{ background: #1d1d1f; color: #f5f5f7; }}
+</style>
+</head>
+<body>
+<header>
+  <h1>{_h.escape(doku_id)} — {_h.escape(title or '')}</h1>
+  <div class="meta">status={_h.escape(status)} / content_hash={_h.escape((content_hash or '')[:12])}…</div>
+</header>
+<div class="grid">
+  <div class="col raw">
+    <h2>DokuWiki raw (export_xhtmlbody)</h2>
+    <div class="body">{raw_html}</div>
+  </div>
+  <div class="col storage">
+    <h2>Confluence storage (approximate render)</h2>
+    <div class="body">{storage_xml}</div>
+    <details><summary>raw storage XML</summary><pre>{_h.escape(storage_xml)}</pre></details>
+  </div>
+</div>
+</body>
+</html>
+"""
+    out_path = Path(args.output) if args.output else Path(f"preview-{doku_id.replace(':', '_')}.html")
+    out_path.write_text(out, encoding="utf-8")
+    log(f"preview → {out_path}")
+    conn.close()
+    return 0
+
+
 # ---------- 보조: lint (storage XML 유효성 검사) ----------
 
 def cmd_lint(args: argparse.Namespace) -> int:
@@ -2325,6 +2511,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp_status = sub.add_parser("status", help="상태 요약")
     sp_status.set_defaults(func=cmd_status)
+
+    sp_report = sub.add_parser(
+        "report", help="corpus 통계 (pages/attachments/매크로/크기/title 충돌)"
+    )
+    sp_report.add_argument(
+        "--limit", type=int, default=10,
+        help="섹션별 상위 항목 표시 개수"
+    )
+    sp_report.set_defaults(func=cmd_report)
+
+    sp_preview = sub.add_parser(
+        "preview", help="한 페이지의 raw + storage 를 나란히 보여주는 HTML 생성"
+    )
+    sp_preview.add_argument("--doku-id", required=True, help="대상 doku_id")
+    sp_preview.add_argument(
+        "--output", help="출력 HTML 경로 (기본: preview-<doku_id>.html)"
+    )
+    sp_preview.set_defaults(func=cmd_preview)
 
     sp_lint = sub.add_parser("lint", help="storage XML 유효성 검사")
     sp_lint.add_argument(
