@@ -1,4 +1,125 @@
-# 라이브 마이그레이션 결과 (2026-05-18)
+# 라이브 마이그레이션 결과
+
+본 문서는 운영 로그로 *날짜별 섹션* 으로 누적된다. 최신 통계는 마지막
+day 의 §0 표. 과거 로그는 그대로 보존.
+
+---
+
+# Day 2 — 2026-05-19 (별도 트랙 적용 + 공간 정리)
+
+후속 follow-up 작업 9건 (#4~#12) 자율 진행 + 별도 트랙 일부 실행 +
+공간 안 비-마이그레이션 페이지 1,465건 휴지통 정리.
+
+## §0 누적 통계 (2026-05-19 종료 시점)
+
+| 항목 | 값 | 변화 |
+|------|----|----|
+| pages UPLOADED | **1,675 / 1,675 (100%)** | +1 ← `u:neoocean:2020` C-mode 회복 |
+| attachments UPLOADED | **10,732** | +119 (이 페이지의 자식 첨부) |
+| attachments OVERSIZED → note 박스 | 10 | +1 발견, 9 B-mode 적용 (5 페이지 v↑) |
+| attachments FAILED (missing src) | 143 | 동일 |
+| links resolved / unresolved | 5,180 / 1,317 | 동일 |
+| large-body fallback (skeleton + zip 첨부) | 1 | +1 ← `u:neoocean:2020` |
+| struct schema UPLOADED | 4 / 5 | +4 (snapshot 모드 라이브) |
+| struct rows 옮겨감 | 1,213 | +1,213 (4 페이지의 표) |
+| 휴지통 (30일 회복 가능) | 1,465 페이지 | +1,465 (공간 정리) |
+| 공간 안 current 페이지 | 1,680 | 1,679 (마이그레이션 트리) + 1 (root) |
+| history-render | 진행 중 (3,813 / 37,947 ~10%) | start 22:37 |
+
+## §1 적용된 follow-up (CL 52881, 52882)
+
+| # | 작업 | 결과 |
+|---|------|------|
+| #5 | OVERSIZED 9건 → B-mode note 박스 | 5 페이지 v↑ (rewrite-oversized 라이브). 본문에 파일명 + 크기 + 백업 위치 안내 박스 |
+| #9 | `/tag/<value>` 링크 → Confluence page label | 변환기에서 tag 값 추출 → meta `page_tags:<id>` 저장 → upload 후 `POST /rest/api/content/{id}/label` 적용. tag 값 sanitize (lowercase + alphanumeric + 한글) |
+| #10 | audit 분류기 정밀화 | 새 합산 카테고리 `link_total` / `task_total` (변환기 reclassification noise 흡수). per-category critical 완화. |
+| #11 | `wrap_*` layout 잔여 클래스 | NOISE_CLASS_PREFIXES 에 `wrap_` 추가 (의미 클래스는 매크로 변환기가 먼저 처리) |
+| #12 | 풋노트 anchor (li/sup id) Confluence 에서 제거됨 | `_convert_footnotes` 가 `<ac:structured-macro ac:name=anchor>` 매크로를 fn__N / fnt__N target 으로 삽입. 양방향 jump 동작 |
+| #4 | 큰 페이지 1건 (`u:neoocean:2020`) | C-mode: skeleton info 박스 + 원본 storage XML zip 첨부. 페이지 + 119 자식 첨부 회복 |
+| #6 | history pipeline (render/convert/upload) 구현 | history-render 진행 중. convert/upload 코드는 준비 — resume-safe, version.message 에 `DokuWiki rev <ts>` |
+| #7 | struct pipeline (convert/upload) 구현 | snapshot 모드 라이브 적용 — 4 schema × 1 페이지. properties / native 모드는 stub |
+| #8 | `--users-map` JSON 매핑 flag | `_load_users_map` + `_format_user` (mapped → `<ri:user account-id>` link; unmapped → 텍스트). history-upload 에서 사용 |
+
+## §2 라이브 적용 상세
+
+### 2.1 struct snapshot 4 페이지 (push=4, fail=0)
+
+| schema | rows | Confluence page |
+|--------|------|-----------------|
+| brevet_course | 744 | 2518882818 |
+| brevet_event | 106 | 2518720467 |
+| brevet_place | 98 | 2518720487 |
+| brevet_uri_cppage | 265 | 2518882838 |
+| test (빈) | 0 | SKIPPED |
+
+각 페이지 본문 = `<h1>` + 짧은 설명 + 전체 row 를 `<table>` (header + N 행).
+
+### 2.2 OVERSIZED 첨부 9건 → 5 페이지 note 박스 (push=5, fail=0)
+
+* 영향 페이지: 5건 (각 1-9 OVERSIZED 첨부)
+* 본문 안 `<ri:attachment>` reference → `<ac:structured-macro ac:name="note">` 메타 박스 치환
+* 박스 내용: 파일명 + 크기(MB) + "Confluence 100MB 한도" 안내 + 호스트 P4 백업 위치
+
+### 2.3 큰 페이지 C-mode 적용
+
+`u:neoocean:2020` (448KB storage / 1,971 li / 495 dwc-link placeholder) —
+Confluence 가 본문 POST/PUT 모두 `no resp` 로 거부. C-mode:
+
+1. `rewrite-oversized-pages` 가 skeleton 본문으로 페이지 생성 (2519047777)
+2. 원본 storage XML 을 `<doku_id>.xml.zip` 으로 압축 → 첨부 업로드
+3. `state.db` 메타에 `large_body_fallback:<doku_id>` 마킹
+4. 이후 `upload --only` 가 본문 PUT 은 skip + **120 자식 첨부 정상 업로드** (119 ok / 1 추가 OVERSIZED 발견)
+5. `rewrite-oversized` 도 large_body_fallback 페이지 자동 skip
+
+### 2.4 루트 페이지 대시보드 (v2)
+
+`dokuwiki-migration` (root 2519826441) 의 본문 281KB 로 갱신:
+
+* 통계 info 박스 (페이지/첨부/링크/struct/history/대용량 페이지 카운트)
+* `children` 매크로 (depth 2 자동 자식 트리)
+* struct 4 페이지 직접 링크
+* `expand` 매크로 안 namespace 별 그룹 (14 ns) — 각 그룹 펼치면 그 안 모든 마이그레이션 페이지 ac:link
+* 별도 트랙 안내 (history / OVERSIZED / 큰 본문 페이지)
+
+### 2.5 공간 'dokuwiki' 비-마이그레이션 페이지 1,465건 휴지통 이동
+
+분석 단계에서 **위험 발견 + 해결**:
+
+* Confluence `/api/v2/pages/{id}/descendants` API 가 *불완전* (385/1,679). 그대로 사용했다면 마이그레이션 트리의 자식 1,294 페이지가 *잘못 삭제* 됐을 것
+* **수정**: state.db 를 ground truth 로 사용 (모든 `confluence_page_id` + `snapshot_page_id` + `root_page_id` 합산 = 1,680). 공간 전체 페이지 (3,145) 와 차집합 → 1,465.
+* 안전 점검: `keep ∩ to_delete = 0` 확인 후 진행
+* 깊이 desc 정렬 (자식부터 — Confluence DELETE 는 자식 cascade 안 함)
+* DELETE → 휴지통 (30일 회복 가능)
+* 결과: **1,465 ok / 0 fail**. 공간 안 current 페이지 1,680 (정확히 마이그레이션 트리 + root)
+
+대다수가 id prefix `2304*` / `2305*` 대역 — 이전 마이그레이션 시도 잔재. 우리 작업은 `2517*-2520*` 대역.
+
+## §3 코드 변경 (CL 52881 + 52882)
+
+| CL | 신규 |
+|----|------|
+| 52881 | `cmd_rewrite_oversized` (B-mode 자동화). `_apply_page_labels` (v1 label API). `_convert_footnotes` 에 anchor 매크로 삽입. `<a rel=tag>` 추출 + `page_tags:<id>` 메타. `_compare_features` 의 `link_total` / `task_total` 합산. `NOISE_CLASS_PREFIXES` 에 `wrap_`. `_convert_html_to_storage` 5-tuple 반환 (page_tags 추가). 22 unit tests still pass. |
+| 52882 | `cmd_rewrite_oversized_pages` (C-mode skeleton + zip). `cmd_history_render/convert/upload` (37k revision pipeline; resume-safe). `cmd_struct_convert/upload` (snapshot/properties/native). `_load_users_map` / `_format_user` (`--users-map` JSON). `_revision_header` (note 매크로). `docs/oversized-pages.md` 신규. 서브커맨드 13 → **22** (4 history + 4 struct + 2 rewrite). 22 unit tests still pass. |
+
+## §4 outstanding (이전 Day 1 §5 이후 변화)
+
+| 이전 § | 항목 | 상태 |
+|--------|------|------|
+| 5.1 | 큰 페이지 1건 | **해결** (C-mode 적용; §2.3) |
+| 5.2 | OVERSIZED 9건 | **해결** (B-mode 적용; §2.2) |
+| 5.3 | audit 분류기 정밀화 | **해결** (#10; §1) |
+| 5.4 | tag → label 매핑 | **해결** (#9; §1) |
+| 5.5 | history / struct 별도 트랙 | **부분 해결**: struct snapshot 라이브 (§2.1). history-render 진행 중. |
+
+### 새 outstanding
+
+* **history-render 완료 대기** → history-convert (~5분) → history-upload (~37k PUT, 하룻밤 잡; resume-safe).
+* **dokuwiki tag 가 Confluence label 로 적용된 것 사용자 시각 확인 권장** — UI 의 페이지 라벨 표시.
+* **휴지통 1,465 페이지 영구 삭제 여부** — 30일 후 자동 또는 즉시 purge. 본 마이그레이션 결과와 별개라 사용자 결정.
+
+---
+
+# Day 1 — 2026-05-18 (첫 라이브 실행)
 
 자체 운영 중인 DokuWiki 의 첫 라이브 마이그레이션 실행 결과 기록. 본
 문서는 *what happened*, *what landed in Confluence*, *what broke and

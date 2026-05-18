@@ -96,7 +96,7 @@ done
 
 | 플러그인  | 대표 페이지                    | dokuwiki 출력                                                | 변환 결과                                                              |
 |-----------|--------------------------------|--------------------------------------------------------------|------------------------------------------------------------------------|
-| tag       | `u:note:notetaking`            | `<div class="tags"><a href=/tag/... rel="tag">공부법</a></div>` | placeholder `<a href="dwc-link:tag:공부법">공부법</a>` (S7 후 해결됨)  |
+| tag       | `u:note:notetaking`            | `<div class="tags"><a href=/tag/... rel="tag">공부법</a></div>` | tag 값 추출 → 페이지 meta `page_tags:<id>` → upload 후 v1 `POST /rest/api/content/{id}/label` 적용. `<a>` 는 텍스트만 남기고 unwrap. (CL 52881; tag namespace 가 dokuwiki 의 일급 페이지가 아니라 평문 격하 대신 *Confluence label* 로 매핑) |
 | wrap      | `u:lam:2020`, `ride:s200i`     | block: `<div class="wrap_<variant> ... plugin_wrap">`, 인라인: `<em class="wrap_em/wrap_hi ... plugin_wrap">` | **block**: 의미 클래스 → Confluence 매크로 (`info`/`tip`/`note`/`warning`/`panel`). **인라인**: `wrap_em` → `<strong>`, `wrap_hi` → 노란 background-color span. 정렬/레이아웃 변형 (`wrap_left/right/center` 등) 은 의미 없어 그대로 보존. 자세한 매핑 표: §6.4 (CL 52696) |
 | include   | `ride:구리300_cp목록`         | `<div class="plugin_include_content plugin_include__...">콘텐츠</div>` | div 의 plugin_ 클래스 제거, 콘텐츠 보존                                |
 | blog      | `u:note:start`                 | `<div class="inclmeta">` + 페이지 메타/링크/태그                | 그대로 통과 (페이지 링크는 dwc-link placeholder 로 변환)               |

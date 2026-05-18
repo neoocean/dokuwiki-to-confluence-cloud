@@ -108,14 +108,32 @@ sqlite3 state.db "SELECT resolved, COUNT(*) FROM links GROUP BY resolved"
 FAILED 페이지가 있으면 `--only <doku_id>` 로 개별 재시도. 매번 `last_error`
 컬럼 확인.
 
-## 8. 별도 트랙 (옵션, 키 받은 뒤로 미뤘던 작업)
+## 8. 별도 트랙 + 사후 처리 서브커맨드
 
-- **history**: `python run.py history-render --base-url http://127.0.0.1:18080`
-  (dev 컨테이너 필요) → `python run.py history-convert` →
-  `python run.py history-upload`. ~37k API 호출. 하룻밤 잡.
-- **struct**: `python run.py struct-discover` 이미 실행됨 →
-  `python run.py struct-upload --probe` 로 Confluence Database API 가용성 확인 →
-  본 작업. 1213 row.
+라이브 1차 후 *오류 / 한도 초과* 처리 자동화 (2026-05-19 적용):
+
+```sh
+# OVERSIZED 첨부 (>100MB) → 본문에 note 매크로 메타 박스
+python run.py rewrite-oversized
+# 본문 거부된 페이지 → skeleton + 원본 storage zip 첨부 (자식 첨부 회복)
+python run.py rewrite-oversized-pages
+```
+
+별도 트랙:
+
+```sh
+# 과거 리비전 이전 (~37k 호출, 하룻밤 잡; resume-safe)
+python run.py history-discover                                        # attic 인덱싱
+python run.py history-render --base-url http://127.0.0.1:18080 --delay 0.05
+python run.py history-convert                                         # storage XML + 헤더 박스
+python run.py history-upload [--users-map users.json] [--limit N]    # 시간순 PUT replay
+
+# struct 데이터 (4 schema / 1,213 row)
+python run.py struct-discover                                         # sqlite 인덱싱
+python run.py struct-upload --probe                                   # Database API 가용성
+python run.py struct-convert --mode snapshot                          # 또는 properties / native
+python run.py struct-upload                                           # 라이브
+```
 
 ## 9. 롤백 / 실패 대응
 

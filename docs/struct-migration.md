@@ -1,5 +1,18 @@
 # DokuWiki struct → Confluence 데이터베이스 이전 시나리오
 
+**상태 (2026-05-19): snapshot 모드 라이브 적용 완료.** 4 활성 schema
+(brevet_course 744 / brevet_event 106 / brevet_place 98 /
+brevet_uri_cppage 265 = 1,213 rows) → 각 1 페이지의 큰 table 형태로
+업로드 (test schema 는 빈 schema 라 SKIPPED). 구현 (CL 52882):
+`cmd_struct_convert --mode {snapshot|properties|native}` +
+`cmd_struct_upload --probe`. snapshot 모드는 end-to-end 동작, properties
+/ native 모드는 stub (본 인스턴스에서 추가 필요 없음).
+`docs/migration-result.md §2.1` 참고.
+
+---
+
+
+
 본 문서는 [`plugin-validation.md` §6.3](plugin-validation.md) 에서 채택된
 **"schema → Confluence DB 매크로 매핑"** 옵션의 구체 설계다. 텍스트/표
 스냅샷이 아니라 *Confluence 측에서도 데이터베이스로서 동작*하도록 옮기는

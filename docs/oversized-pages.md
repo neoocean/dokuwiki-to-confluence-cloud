@@ -1,5 +1,15 @@
 # 본문이 큰 페이지 처리 시나리오
 
+**상태 (2026-05-19): C 모드 라이브 적용 완료.** §4.1 의 skeleton +
+storage XML zip 첨부 패턴으로 1 페이지 회복 + 119 자식 첨부 정착.
+구현 + 적용 명령: `python run.py rewrite-oversized-pages`. `cmd_upload`
+도 `large_body_fallback:<doku_id>` meta 확인해 본문 PUT 영구 skip +
+첨부만 처리. `docs/migration-result.md §2.3` 참고.
+
+---
+
+
+
 Confluence Cloud 가 *본문 자체가 너무 크거나 구조적으로 복잡한* 페이지의
 POST/PUT 을 거부하는 경우의 대응 방안. `oversized-attachments.md` (첨부
 파일 한도) 와는 *별개*. 본문 측 한계.

@@ -74,6 +74,9 @@ dokuwiki 만의 시각/의미 마크업을 Confluence 의 *동등한 native 표�
 | todo (mixed/nested) | 위와 같은 마크업이 텍스트와 섞인 li | `[x] X` / `[ ] X` 인라인 텍스트 마커 (Confluence task-list 가 block-level 이라 inline 컨텍스트 회피) | `_convert_todos` step-2 |
 | `?do=edit` 액션 링크 (section edit) | `<a href="?do=edit&id=...">` | 액션 링크는 textContent 만 남기고 `<a>` 언래핑 | `_categorize_href` action 분기 |
 | HTML 코멘트 `<!-- EDIT{...} -->` | 그대로 | 모두 제거 (D 참조) | comment 일괄 제거 |
+| smiley `<img class="icon smiley" alt=":-)">` | `<img>` (dokuwiki 호스팅) | 유니코드 emoji 텍스트 (`SMILEY_EMOJI_MAP` 24 entry) — 깨진 link 방지 | `_convert_smileys` |
+| `<a rel="tag" href="/tag/X">` (DokuWiki tag) | `<a class="wikilink1">X</a>` | a 텍스트만 남기고 unwrap + tag 값을 페이지 meta `page_tags:<id>` 에 저장 → upload 후 Confluence label API 적용 | `_convert_html_to_storage` step 4-pre + `cmd_upload` + `_apply_page_labels` |
+| 풋노트 `((text))` | `<sup><a id="fnt__N">N)</a></sup>` 본문 + `<div class="footnotes">` 끝 | `<ac:structured-macro ac:name="anchor">` 으로 jump target 표시 + `<hr/><ol><li>` 풋노트 섹션 (Confluence 가 li/sup id 제거하는 우회) | `_convert_footnotes` |
 
 **보조 변환 (간접)**:
 - `[[page|alias text]]` 의 alias text 가 dwc-link placeholder 의 anchor 내부 텍스트로 보존. S7 의 ac:plain-text-link-body 에 CDATA 로 들어감.

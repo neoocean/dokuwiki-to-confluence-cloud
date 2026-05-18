@@ -9,15 +9,18 @@ format 으로 변환, 네임스페이스 트리를 그대로 페이지 계층에
 
 ## 상태
 
-**1차 라이브 마이그레이션 완료 (2026-05-18)**:
+**라이브 마이그레이션 + 후속 정리 완료 (2026-05-18 / 19)**:
 
 | 지표 | 값 |
 |------|----|
-| 페이지 UPLOADED | 1,674 / 1,675 (1건 별도 트랙) |
-| 첨부 UPLOADED | 10,613 (OVERSIZED 9 + missing 143 별도) |
+| 페이지 UPLOADED | **1,675 / 1,675 (100%)** |
+| 첨부 UPLOADED | 10,732 (OVERSIZED 10건은 note 박스로 처리) |
 | 내부 링크 resolved | 5,180 / unresolved 1,317 (평문 격하) |
 | audit 통과율 | 64% 명백 OK + 36% 분류기 한계 (실손실 0) |
-| 변환기 버그 fix | 4종 (라이브 audit 발견) |
+| 변환기 버그 fix | 9종 (라이브 + 후속 audit 발견) |
+| struct schema 라이브 | 4 / 5 (1,213 rows; snapshot mode) |
+| 공간 정리 | 1,465 비-마이그레이션 페이지 휴지통 (30일 회복 가능) |
+| 진행 중 | history-render (~37k 리비전) |
 
 자세한 결과는 [`docs/migration-result.md`](docs/migration-result.md).
 
@@ -102,8 +105,10 @@ python run.py dev down --purge
 |  | `preview --doku-id <id>` | raw + storage side-by-side HTML |
 |  | `status` | 상태 요약 |
 | 운영 | `dev up` / `dev down [--purge]` | 로컬 DokuWiki 테스트 컨테이너 |
-| 별도 트랙 (read-only) | `history-discover` / `history-status` | attic 인덱싱 |
-|  | `struct-discover` / `struct-status` | struct.sqlite3 인덱싱 |
+| 사후 처리 | `rewrite-oversized` | 100MB+ 첨부 → note 매크로 박스 (B 모드) |
+|  | `rewrite-oversized-pages` | 본문 거부 페이지 → skeleton + storage zip 첨부 (C 모드) |
+| history (37k 리비전) | `history-discover` / `history-render` / `history-convert` / `history-upload` / `history-status` | attic 인덱싱 → ?rev= 캐시 → storage XML + 헤더 박스 → 시간순 PUT replay |
+| struct (1,213 row) | `struct-discover` / `struct-convert` / `struct-upload` / `struct-status` | sqlite 인덱싱 → snapshot/properties/native 변환 → 라이브 |
 
 ## 문서 구조
 
@@ -111,30 +116,28 @@ python run.py dev down --purge
 docs/
   scenarios.md             — 메인 시나리오 + 모든 별도 트랙 인덱스
   runbook.md               — 라이브 마이그레이션 단계별 절차 + 롤백
-  migration-result.md      — 2026-05-18 첫 라이브 실행 운영 로그
+  migration-result.md      — Day 1 (2026-05-18) + Day 2 (2026-05-19) 운영 로그
   element-mapping.md       — DokuWiki 구성요소 → Confluence 변환 매트릭스
                              (Pass-through / Transformed / Partial /
                              Dropped / Separate-track)
   plugin-validation.md     — 활성 플러그인 검증 결과 + struct 플러그인
                              고아 데이터 정리
-  oversized-attachments.md — 100MB 초과 첨부 이전 6모드 매트릭스
-  history-migration.md     — 과거 리비전 이전 (B+A+F 채택, 구현 대기)
-  struct-migration.md      — struct 스키마 → Confluence Database
-                             매핑 (3모드 우선순위, 구현 대기)
+  oversized-attachments.md — 100MB 초과 첨부 이전 6모드 (B 적용됨)
+  oversized-pages.md       — 본문 너무 큰 페이지 6모드 (C 적용됨)
+  history-migration.md     — 과거 리비전 이전 (B+A+F 채택, 구현 완료, 진행 중)
+  struct-migration.md      — struct 스키마 → Confluence (snapshot 라이브 적용)
   MEMORY.md                — 미래 세션이 먼저 읽을 컨텍스트 인덱스
 ```
 
-## 별도 트랙 (라이브 후속)
+## 별도 트랙 (적용 완료 / 진행 중)
 
-본 파이프라인은 *현재 시점 페이지 본문* 만 다룬다. 다음은 별도 PR
-대기:
-
-- **과거 리비전 이전**: attic 의 ~37k 리비전을 시간순 PUT replay 로
-  Confluence 버전 체인에 — `docs/history-migration.md`.
-- **struct 데이터**: `meta/struct.sqlite3` 의 1,213 row 를 Confluence
-  native Database 로 (A 우선, B 폴백) — `docs/struct-migration.md`.
-- **100MB+ 첨부**: 본 corpus 9건 영향. 본문 메타 푸터 또는 외부
-  호스팅 — `docs/oversized-attachments.md`.
+| 트랙 | 상태 | 비고 |
+|------|------|------|
+| **OVERSIZED 첨부 → note 박스** | ✅ B 모드 적용 (9건, 5 페이지 v↑) | `docs/oversized-attachments.md` |
+| **큰 본문 페이지 → skeleton + zip** | ✅ C 모드 적용 (1건, 119 자식 첨부 회복) | `docs/oversized-pages.md` |
+| **struct 데이터 → Confluence 페이지** | ✅ snapshot 모드 라이브 (4 schema, 1,213 rows) | `docs/struct-migration.md` (properties/native 모드는 stub) |
+| **과거 리비전 이전 (~37k)** | ⏳ history-render 진행 중 | `docs/history-migration.md` (B+A+F 채택, code 완료) |
+| **공간 비-마이그레이션 페이지 정리** | ✅ 1,465 휴지통 (30일 회복) | `docs/migration-result.md §2.5` |
 
 ## 개발
 
@@ -164,13 +167,14 @@ python run.py audit --full         # 결과 검증
 `state.db` 가 P4 에 추적되므로 재실행은 자동 resume. 새 페이지만 신규
 생성되고 기존 페이지는 변경분만 PUT.
 
-## 미해결 (별도 처리 대기)
+## 미해결
 
-- 큰 일지 페이지 1건 (`docs/migration-result.md §5.1`) — Confluence
-  가 본문 parsing 거부. 분할/외부 호스팅 결정 필요.
-- audit 분류기 정밀화 (실손실은 0이지만 분류 mismatch 가 시각적
-  noise).
-- 별도 트랙 (history / struct / oversized) 채택안 구현.
+| 항목 | 상태 |
+|------|------|
+| history-render | 진행 중 (3,813 / 37,947 ~10%) — 완료 후 자동 convert + upload |
+| history-upload | ~37k PUT, 하룻밤 잡; resume-safe |
+| struct properties / native 모드 | snapshot 만 라이브 적용. 본 인스턴스는 추가 필요 없음 |
+| 휴지통 1,465 페이지 영구 삭제 | 30일 자동 또는 사용자 즉시 purge 결정 |
 
 ## 라이선스
 

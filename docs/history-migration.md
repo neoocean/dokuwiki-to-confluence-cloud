@@ -1,5 +1,17 @@
 # 히스토리/과거 버전 보존 시나리오
 
+**상태 (2026-05-19): pipeline 구현 완료 + history-render 진행 중.**
+`history-discover` 결과 37,947 리비전 인덱싱 완료. `history-render`
+백그라운드 진행 (~10%). 완료 후 `history-convert` → `history-upload`
+자동. 코드 (CL 52882): `cmd_history_render/convert/upload` +
+`_revision_header` (note 매크로) + `--users-map` flag (`_load_users_map`/
+`_format_user`). resume-safe via `history_meta.last_replayed_rev_ts`.
+`docs/migration-result.md §1 #6` 참고.
+
+---
+
+
+
 본 문서는 [`scenarios.md` §3 비범위](scenarios.md) 에서 명시적으로 제외했던
 "DokuWiki 페이지의 과거 리비전 / 변경 이력 / 미디어 히스토리"를 Confluence
 Cloud 로 이전할 때의 옵션과 트레이드오프를 정리한다.
