@@ -1447,6 +1447,41 @@ CREDENTIAL_HELP = """
 또는 --email / --api-token 인자로 직접 전달.""".strip()
 
 
+def _load_users_map(path: str | None) -> dict[str, str]:
+    """
+    --users-map <json> 파일에서 dokuwiki 사용자명 -> Confluence accountId
+    매핑을 로드.
+
+    Format: { "neoocean": "5e7f1234...", "lam": "60a01234..." }
+
+    매핑 없으면 빈 dict — 호출자가 fallback 으로 텍스트만 표시.
+    """
+    if not path:
+        return {}
+    import json as _json
+    try:
+        data = _json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            log(f"users-map: dict 형식 아님 → 무시")
+            return {}
+        return {str(k): str(v) for k, v in data.items() if v}
+    except (OSError, ValueError) as e:
+        log(f"users-map 로드 실패 ({path}): {e}")
+        return {}
+
+
+def _format_user(user: str, users_map: dict[str, str]) -> str:
+    """dokuwiki user name -> Confluence storage 의 user 표시 형식.
+
+    매핑 있을 때: <ac:link><ri:user ri:account-id='...'/></ac:link>
+    매핑 없을 때: 일반 텍스트 user name (escape 처리는 호출자)
+    """
+    account_id = users_map.get(user)
+    if account_id:
+        return f'<ac:link><ri:user ri:account-id="{account_id}"/></ac:link>'
+    return user
+
+
 def _apply_page_labels(session, base_url: str, page_id: str, labels: list[str]) -> None:
     """페이지에 Confluence label 들을 적용. v1 API (POST /rest/api/content/{id}/label)
     사용 — v2 의 label API 는 read-only 라 추가는 v1 endpoint 만 가능.
@@ -2028,8 +2063,12 @@ def cmd_upload(args: argparse.Namespace) -> int:
                 created += 1
                 log(f"  [CREATED] {doku_id} -> page {new_id}")
         else:
-            prev_hash = db_get_meta(conn, f"uploaded_hash:{doku_id}")
-            if prev_hash == content_hash:
+            # large body fallback 적용된 페이지는 본문 PUT 을 영구히 skip
+            # (storage 가 너무 커서 Confluence 가 거부). 첨부만 업로드.
+            if db_get_meta(conn, f"large_body_fallback:{doku_id}"):
+                log(f"  [SKIP] {doku_id}: large body fallback 적용됨 — 본문 PUT 생략, 첨부만 처리")
+                skipped += 1
+            elif (prev_hash := db_get_meta(conn, f"uploaded_hash:{doku_id}")) == content_hash:
                 log(f"  [SKIP] {doku_id}: content_hash 변경 없음")
                 skipped += 1
             else:
@@ -2506,6 +2545,334 @@ def cmd_history_discover(args: argparse.Namespace) -> int:
     return 0
 
 
+HISTORY_RAW_DIR = Path("raw_history")
+HISTORY_STORAGE_DIR = Path("storage_history")
+
+
+def cmd_history_render(args: argparse.Namespace) -> int:
+    """attic 의 각 리비전을 dokuwiki ?rev=<ts> 로 받아 캐시.
+
+    revisions 테이블에서 status='DISCOVERED' 인 행만 처리. raw_history/
+    <doku_id 의 :를 />.<ts>.html 로 저장.
+    """
+    try:
+        import requests
+    except ImportError:
+        log("requests 필요: pip install -r requirements.txt")
+        return 2
+
+    conn = db_connect(args.db)
+    base_url = args.base_url.rstrip("/")
+    if not base_url:
+        log("--base-url 필요 (DOKUWIKI_BASE_URL).")
+        return 2
+
+    HISTORY_RAW_DIR.mkdir(exist_ok=True)
+    session = requests.Session()
+    if args.user and args.password:
+        session.post(
+            f"{base_url}/doku.php",
+            data={"do": "login", "u": args.user, "p": args.password},
+            timeout=30, allow_redirects=True,
+        )
+
+    where = "status='DISCOVERED'" if not args.force else "1=1"
+    params: tuple = ()
+    if args.only:
+        where = "doku_id=?"
+        params = (args.only,)
+
+    rows = conn.execute(
+        f"SELECT doku_id, rev_ts FROM revisions WHERE {where} ORDER BY doku_id, rev_ts",
+        params,
+    ).fetchall()
+    log(f"history-render 대상: {len(rows)} 리비전")
+
+    ok = empty = failed = 0
+    for i, (doku_id, rev_ts) in enumerate(rows, 1):
+        url = f"{base_url}/doku.php"
+        try:
+            resp = session.get(
+                url,
+                params={"id": doku_id, "rev": rev_ts, "do": "export_xhtmlbody"},
+                timeout=60,
+            )
+        except requests.RequestException as e:
+            conn.execute(
+                "UPDATE revisions SET status='FAILED', last_error=?, last_checked_at=? "
+                "WHERE doku_id=? AND rev_ts=?",
+                (str(e), now_iso(), doku_id, rev_ts),
+            )
+            conn.commit()
+            failed += 1
+            continue
+
+        if resp.status_code == 404 or not resp.text.strip():
+            conn.execute(
+                "UPDATE revisions SET status='SKIPPED', last_error='empty/404', last_checked_at=? "
+                "WHERE doku_id=? AND rev_ts=?",
+                (now_iso(), doku_id, rev_ts),
+            )
+            conn.commit()
+            empty += 1
+            continue
+
+        if resp.status_code >= 400:
+            conn.execute(
+                "UPDATE revisions SET status='FAILED', last_error=?, last_checked_at=? "
+                "WHERE doku_id=? AND rev_ts=?",
+                (f"HTTP {resp.status_code}", now_iso(), doku_id, rev_ts),
+            )
+            conn.commit()
+            failed += 1
+            continue
+
+        rel = Path(*doku_id.split(":"))
+        cache_path = HISTORY_RAW_DIR / rel.parent / f"{rel.name}.{rev_ts}.html"
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(resp.text, encoding="utf-8")
+        conn.execute(
+            "UPDATE revisions SET raw_xhtml_path=?, status='RENDERED', "
+            "last_error=NULL, last_checked_at=? WHERE doku_id=? AND rev_ts=?",
+            (str(cache_path), now_iso(), doku_id, rev_ts),
+        )
+        conn.commit()
+        ok += 1
+
+        if args.delay:
+            time.sleep(args.delay)
+        if args.limit and ok >= args.limit:
+            log(f"--limit {args.limit} 도달")
+            break
+
+    log(f"history-render 완료: ok={ok} empty={empty} failed={failed}")
+    conn.close()
+    return 0
+
+
+def _revision_header(rev_ts: int, user: str | None, comment: str | None,
+                     type_code: str | None, users_map: dict[str, str]) -> str:
+    """각 revision body 최상단에 박을 메타 헤더 박스 (history-migration §6.4)."""
+    from datetime import datetime, timezone
+    dt = datetime.fromtimestamp(rev_ts, tz=timezone.utc).isoformat(timespec="seconds")
+    user_repr = _format_user(user, users_map) if user else "(unknown)"
+    type_label = {
+        "C": "create", "E": "edit", "e": "minor edit",
+        "R": "revert", "D": "delete",
+    }.get(type_code or "", type_code or "?")
+    import html as _h
+    comment_h = _h.escape(comment or "") if comment else "(no comment)"
+    return (
+        f'<ac:structured-macro ac:name="note">'
+        f'<ac:rich-text-body>'
+        f'<p>DokuWiki revision: <code>{dt}</code> ({type_label})</p>'
+        f'<p>Author: {user_repr}</p>'
+        f'<p>Comment: <code>{comment_h}</code></p>'
+        f'</ac:rich-text-body>'
+        f'</ac:structured-macro>'
+    )
+
+
+def cmd_history_convert(args: argparse.Namespace) -> int:
+    """raw_history/*.html 을 storage XML 로 변환. 본문 최상단에 §6.4 헤더 박스.
+
+    content_hash 가 직전 revision 과 같으면 status='SKIPPED' (revert
+    중복 본문 — Confluence 가 어차피 동일 body PUT 거부).
+    """
+    try:
+        import bs4  # noqa: F401
+    except ImportError:
+        log("beautifulsoup4 필요")
+        return 2
+
+    conn = db_connect(args.db)
+    src = db_get_meta(conn, "dokuwiki_src")
+    if not src:
+        log("dokuwiki_src 메타 없음 — discover 먼저")
+        return 2
+    src_root = Path(src)
+    HISTORY_STORAGE_DIR.mkdir(exist_ok=True)
+
+    where = "status='RENDERED'" if not args.force else "status IN ('RENDERED','CONVERTED','FAILED')"
+    params: tuple = ()
+    if args.only:
+        where = "doku_id=? AND status IN ('RENDERED','CONVERTED','FAILED')"
+        params = (args.only,)
+
+    rows = conn.execute(
+        f"SELECT doku_id, rev_ts, raw_xhtml_path, type, user, comment FROM revisions "
+        f"WHERE {where} ORDER BY doku_id, rev_ts",
+        params,
+    ).fetchall()
+    log(f"history-convert 대상: {len(rows)} 리비전")
+
+    users_map: dict[str, str] = {}  # history-upload 단계에서 받은 매핑 사용. 헤더에서는 텍스트 representation.
+    ok = skipped = failed = 0
+    prev_hash_by_page: dict[str, str | None] = {}
+
+    for doku_id, rev_ts, raw_path, type_code, user, comment in rows:
+        if not raw_path or not Path(raw_path).is_file():
+            conn.execute(
+                "UPDATE revisions SET status='FAILED', last_error='raw missing', last_checked_at=? "
+                "WHERE doku_id=? AND rev_ts=?",
+                (now_iso(), doku_id, rev_ts),
+            )
+            failed += 1
+            continue
+        try:
+            raw_html = Path(raw_path).read_text(encoding="utf-8", errors="replace")
+            storage_xml, _links, _atts, _title, _tags = _convert_html_to_storage(
+                raw_html, src_root
+            )
+        except Exception as e:  # noqa: BLE001
+            conn.execute(
+                "UPDATE revisions SET status='FAILED', last_error=?, last_checked_at=? "
+                "WHERE doku_id=? AND rev_ts=?",
+                (f"convert error: {e!r}", now_iso(), doku_id, rev_ts),
+            )
+            conn.commit()
+            failed += 1
+            continue
+
+        header = _revision_header(rev_ts, user, comment, type_code, users_map)
+        full_body = header + storage_xml
+        content_hash = sha256_bytes(full_body.encode("utf-8"))
+
+        # revert / 본문 동일 dedup
+        if prev_hash_by_page.get(doku_id) == content_hash:
+            conn.execute(
+                "UPDATE revisions SET status='SKIPPED', last_error='content_hash == prev', "
+                "last_checked_at=? WHERE doku_id=? AND rev_ts=?",
+                (now_iso(), doku_id, rev_ts),
+            )
+            conn.commit()
+            skipped += 1
+            continue
+        prev_hash_by_page[doku_id] = content_hash
+
+        rel = Path(*doku_id.split(":"))
+        out_path = HISTORY_STORAGE_DIR / rel.parent / f"{rel.name}.{rev_ts}.xml"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(full_body, encoding="utf-8")
+        conn.execute(
+            "UPDATE revisions SET storage_path=?, content_hash=?, status='CONVERTED', "
+            "last_error=NULL, last_checked_at=? WHERE doku_id=? AND rev_ts=?",
+            (str(out_path), content_hash, now_iso(), doku_id, rev_ts),
+        )
+        conn.commit()
+        ok += 1
+
+    log(f"history-convert 완료: ok={ok} skipped={skipped} failed={failed}")
+    conn.close()
+    return 0
+
+
+def cmd_history_upload(args: argparse.Namespace) -> int:
+    """페이지마다 ts 오름차순으로 PUT replay. 각 PUT 의 version.message 에
+    원본 dokuwiki rev 메타 (ts/user/comment) 동봉. resume 안전.
+
+    *조심*: ~37k API 호출 가능. --limit 또는 --only 권장.
+    """
+    if not args.email or not args.api_token:
+        log("자격증명 필요.")
+        for line in CREDENTIAL_HELP.splitlines():
+            log("  " + line)
+        return 2
+
+    conn = db_connect(args.db)
+    session = _confluence_session(args)
+    if session is None:
+        return 2
+    base = args.base_url.rstrip("/")
+    users_map = _load_users_map(args.users_map)
+
+    # 대상 페이지: 메인 파이프라인에서 UPLOADED 된 페이지 + CONVERTED revision 가진 페이지
+    where = "p.status='UPLOADED' AND p.confluence_page_id IS NOT NULL"
+    params: tuple = ()
+    if args.only:
+        where = "p.doku_id=?"
+        params = (args.only,)
+
+    pages = conn.execute(
+        f"SELECT p.doku_id, p.confluence_page_id, p.title FROM pages p "
+        f"WHERE {where} ORDER BY p.doku_id",
+        params,
+    ).fetchall()
+
+    log(f"history-upload 페이지 후보: {len(pages)}")
+    page_ok = page_fail = rev_ok = rev_fail = 0
+
+    for doku_id, cid, title in pages:
+        # large body fallback 페이지 skip — 본문 PUT 거부
+        if db_get_meta(conn, f"large_body_fallback:{doku_id}"):
+            continue
+        # 마지막 replayed_rev_ts 확인 (resume)
+        hm = conn.execute(
+            "SELECT last_replayed_rev_ts FROM history_meta WHERE doku_id=?", (doku_id,)
+        ).fetchone()
+        last_ts = hm[0] if hm and hm[0] else 0
+        revs = conn.execute(
+            "SELECT rev_ts, storage_path FROM revisions "
+            "WHERE doku_id=? AND status='CONVERTED' AND rev_ts > ? "
+            "ORDER BY rev_ts",
+            (doku_id, last_ts),
+        ).fetchall()
+        if not revs:
+            continue
+        log(f"  {doku_id}: {len(revs)} 리비전 replay")
+
+        for rev_ts, sp in revs:
+            if not sp or not Path(sp).is_file():
+                rev_fail += 1
+                continue
+            body = Path(sp).read_text(encoding="utf-8")
+            cur_ver = _get_page_version(session, base, cid)
+            if cur_ver is None:
+                rev_fail += 1
+                break
+            payload = {
+                "id": cid, "status": "current", "title": title,
+                "body": {"representation": "storage", "value": body},
+                "version": {
+                    "number": cur_ver + 1,
+                    "message": f"DokuWiki rev {rev_ts}",
+                },
+            }
+            resp = _request_with_retry(
+                session, "PUT", f"{base}/api/v2/pages/{cid}", json=payload
+            )
+            if resp is None or resp.status_code >= 400:
+                conn.execute(
+                    "UPDATE revisions SET status='FAILED', last_error=?, last_checked_at=? "
+                    "WHERE doku_id=? AND rev_ts=?",
+                    (f"PUT {resp.status_code if resp else 'no resp'}", now_iso(), doku_id, rev_ts),
+                )
+                conn.commit()
+                rev_fail += 1
+                break  # 같은 페이지의 다음 rev 도 같은 base version 충돌 우려
+            conn.execute(
+                "UPDATE revisions SET status='UPLOADED', last_error=NULL, last_checked_at=? "
+                "WHERE doku_id=? AND rev_ts=?",
+                (now_iso(), doku_id, rev_ts),
+            )
+            conn.execute(
+                "INSERT INTO history_meta(doku_id, last_replayed_rev_ts) VALUES(?, ?) "
+                "ON CONFLICT(doku_id) DO UPDATE SET last_replayed_rev_ts=excluded.last_replayed_rev_ts",
+                (doku_id, rev_ts),
+            )
+            conn.commit()
+            rev_ok += 1
+            if args.limit and rev_ok >= args.limit:
+                log(f"--limit {args.limit} 도달")
+                conn.close()
+                return 0
+        page_ok += 1
+
+    log(f"history-upload 완료: pages={page_ok} rev_ok={rev_ok} rev_fail={rev_fail}")
+    conn.close()
+    return 0 if rev_fail == 0 else 1
+
+
 def cmd_history_status(args: argparse.Namespace) -> int:
     conn = db_connect(args.db)
     print("==== history_meta 요약 ====")
@@ -2736,6 +3103,222 @@ def cmd_struct_discover(args: argparse.Namespace) -> int:
     return 0
 
 
+def _struct_row_to_storage_table(conn, sid: int, payload: dict) -> str:
+    """단일 struct row 를 본문에 박을 storage XML 표로. snapshot/properties 모드 공용."""
+    cols = conn.execute(
+        "SELECT colref, name, dokuwiki_class FROM struct_columns "
+        "WHERE sid=? AND enabled=1 OR sid=? ORDER BY sort",
+        (sid, sid),
+    ).fetchall()
+    import html as _h
+    rows_html = []
+    for colref, name, cls in cols:
+        val = payload.get(str(colref))
+        if val is None:
+            display = ""
+        elif isinstance(val, list):
+            display = ", ".join(str(v) for v in val)
+        else:
+            display = str(val)
+        rows_html.append(
+            f"<tr><th>{_h.escape(name or f'col{colref}')}</th>"
+            f"<td>{_h.escape(display)}</td></tr>"
+        )
+    return f"<table>{''.join(rows_html)}</table>"
+
+
+def cmd_struct_convert(args: argparse.Namespace) -> int:
+    """struct_rows 의 payload_json 을 storage XML 표/리스트로 변환.
+
+    mode=snapshot: 각 schema 마다 모든 row 를 큰 표로 (대량 페이지 1개)
+    mode=properties: 각 row 마다 자식 페이지 + Page Properties 매크로
+    mode=native: Confluence Database API 사용 (probe 필요; 미구현 fallback → properties)
+
+    이 함수는 *storage 만 만들고 DB 행에 path 기록*. 업로드는 struct-upload.
+    """
+    conn = db_connect(args.db)
+    out_dir = Path("storage_struct")
+    out_dir.mkdir(exist_ok=True)
+    mode = args.mode
+
+    schemas = conn.execute(
+        "SELECT sid, tbl, row_count, status FROM struct_schemas "
+        "WHERE status NOT IN ('SKIPPED', 'UPLOADED') ORDER BY tbl"
+    ).fetchall()
+    if not schemas:
+        log("struct-convert 대상 schema 없음.")
+        return 0
+
+    import json as _json
+    import html as _h
+
+    converted = 0
+    for sid, tbl, row_count, status in schemas:
+        if row_count == 0:
+            continue
+        log(f"=== {tbl} (sid={sid}, {row_count} rows, mode={mode}) ===")
+        rows = conn.execute(
+            "SELECT pid, bound_doku_id, payload_json FROM struct_rows "
+            "WHERE sid=? AND status='DISCOVERED' ORDER BY pid",
+            (sid,),
+        ).fetchall()
+        if not rows:
+            continue
+
+        cols = conn.execute(
+            "SELECT colref, name FROM struct_columns WHERE sid=? ORDER BY sort",
+            (sid,),
+        ).fetchall()
+        col_headers = [_h.escape(name or f"col{cr}") for cr, name in cols]
+
+        if mode == "snapshot":
+            # 한 페이지에 모든 row 를 표로
+            header_row = "<tr>" + "".join(f"<th>{h}</th>" for h in col_headers) + "</tr>"
+            body_rows = []
+            for pid, bound, payload_json in rows:
+                payload = _json.loads(payload_json)
+                cells = []
+                for colref, _name in cols:
+                    val = payload.get(str(colref), "")
+                    if isinstance(val, list):
+                        val = ", ".join(str(v) for v in val)
+                    cells.append(f"<td>{_h.escape(str(val))}</td>")
+                body_rows.append("<tr>" + "".join(cells) + "</tr>")
+            body = (
+                f'<h1>{_h.escape(tbl)} ({row_count} rows)</h1>'
+                f'<p>DokuWiki struct schema sid={sid} 로부터 자동 생성.</p>'
+                f'<table>{header_row}{"".join(body_rows)}</table>'
+            )
+            out = out_dir / f"{tbl}.snapshot.xml"
+            out.write_text(body, encoding="utf-8")
+            conn.execute(
+                "UPDATE struct_schemas SET chosen_mode='snapshot', snapshot_page_id=NULL, status='DEFINED' WHERE sid=?",
+                (sid,),
+            )
+            log(f"  snapshot storage → {out}")
+            converted += 1
+        elif mode == "properties":
+            # 각 row 마다 별도 storage 파일 + index 페이지 storage
+            for pid, bound, payload_json in rows:
+                payload = _json.loads(payload_json)
+                pp = _struct_row_to_storage_table(conn, sid, payload)
+                pp_macro = (
+                    "<ac:structured-macro ac:name='details'>"
+                    "<ac:rich-text-body>" + pp + "</ac:rich-text-body>"
+                    "</ac:structured-macro>"
+                )
+                out = out_dir / f"{tbl}.row.{pid}.xml"
+                out.write_text(pp_macro, encoding="utf-8")
+            # index 페이지: Page Properties Report
+            index = (
+                f"<h1>{_h.escape(tbl)} index</h1>"
+                "<ac:structured-macro ac:name='detailssummary'>"
+                f"<ac:parameter ac:name='cql'>label = \"dokuwiki-struct-{tbl}\"</ac:parameter>"
+                "</ac:structured-macro>"
+            )
+            (out_dir / f"{tbl}.index.xml").write_text(index, encoding="utf-8")
+            conn.execute(
+                "UPDATE struct_schemas SET chosen_mode='properties', status='DEFINED' WHERE sid=?",
+                (sid,),
+            )
+            log(f"  properties storage → {len(rows)} row 페이지 + 1 index")
+            converted += len(rows)
+        elif mode == "native":
+            log(f"  native: Database API probe 필요 — struct-upload 단계에서.")
+            conn.execute(
+                "UPDATE struct_schemas SET chosen_mode='native', status='DEFINED' WHERE sid=?",
+                (sid,),
+            )
+
+    conn.commit()
+    log(f"struct-convert 완료: schemas 처리됨")
+    conn.close()
+    return 0
+
+
+def cmd_struct_upload(args: argparse.Namespace) -> int:
+    """struct-convert 결과를 Confluence 에.
+
+    --mode=native 면 먼저 --probe 로 API 가용성 확인.
+    properties / snapshot 은 storage XML 을 페이지로 생성 (메인
+    파이프라인의 cmd_upload 와 유사).
+    """
+    if not args.email or not args.api_token:
+        log("자격증명 필요.")
+        for line in CREDENTIAL_HELP.splitlines():
+            log("  " + line)
+        return 2
+    if not args.space_key or not args.root_page_id:
+        log("--space-key / --root-page-id 필요.")
+        return 2
+
+    conn = db_connect(args.db)
+    session = _confluence_session(args)
+    if session is None:
+        return 2
+    base = args.base_url.rstrip("/")
+    space_id = _resolve_space_id(session, base, args.space_key)
+    if not space_id:
+        return 1
+
+    if args.probe:
+        # 빈 Database 1개 만들고 컬럼 추가 가능한지 시도
+        log("=== Confluence Database API probe ===")
+        resp = _request_with_retry(
+            session, "POST", f"{base}/api/v2/databases",
+            json={"spaceId": space_id, "title": "dwc-probe"},
+        )
+        log(f"  POST /api/v2/databases → {resp.status_code if resp else 'no resp'}")
+        if resp and resp.status_code < 400:
+            db_id = resp.json().get("id")
+            log(f"  생성된 db: {db_id}")
+            log("  추가 column/row API 는 별도 — 본 probe 는 endpoint 가용성만 확인.")
+        log("=== probe 종료 ===")
+        return 0
+
+    out_dir = Path("storage_struct")
+    schemas = conn.execute(
+        "SELECT sid, tbl, chosen_mode FROM struct_schemas WHERE status='DEFINED' ORDER BY tbl"
+    ).fetchall()
+
+    pushed = failed = 0
+    for sid, tbl, mode in schemas:
+        log(f"=== {tbl} (mode={mode}) ===")
+        if mode == "snapshot":
+            sp = out_dir / f"{tbl}.snapshot.xml"
+            if not sp.is_file():
+                continue
+            payload = {
+                "spaceId": space_id,
+                "parentId": args.root_page_id,
+                "title": f"dokuwiki struct: {tbl}",
+                "body": {"representation": "storage", "value": sp.read_text(encoding="utf-8")},
+            }
+            resp = _request_with_retry(session, "POST", f"{base}/api/v2/pages", json=payload)
+            if resp is None or resp.status_code >= 400:
+                # title 충돌 disambig
+                if resp is not None and resp.status_code == 400 and "title" in (resp.text or "").lower():
+                    payload["title"] = f"{payload['title']} ({sid})"
+                    resp = _request_with_retry(session, "POST", f"{base}/api/v2/pages", json=payload)
+            if resp is None or resp.status_code >= 400:
+                log(f"  [FAIL] {tbl}: {resp.status_code if resp else 'no resp'}")
+                failed += 1
+                continue
+            page_id = resp.json()["id"]
+            conn.execute(
+                "UPDATE struct_schemas SET snapshot_page_id=?, status='UPLOADED', last_checked_at=? WHERE sid=?",
+                (str(page_id), now_iso(), sid),
+            )
+            conn.commit()
+            log(f"  [SNAPSHOT] {tbl} → page {page_id}")
+            pushed += 1
+        else:
+            log(f"  mode={mode} upload 미구현 — TODO. struct-migration.md §5 참고.")
+    log(f"struct-upload 완료: pushed={pushed} failed={failed}")
+    conn.close()
+    return 0 if failed == 0 else 1
+
+
 def cmd_struct_status(args: argparse.Namespace) -> int:
     conn = db_connect(args.db)
     print("==== struct_schemas ====")
@@ -2764,6 +3347,169 @@ def cmd_struct_status(args: argparse.Namespace) -> int:
         print(f"  resolved={resolved}: {n}")
     conn.close()
     return 0
+
+
+# ---------- rewrite-oversized-pages: 본문 거부된 페이지 → skeleton + 첨부 ----------
+
+def cmd_rewrite_oversized_pages(args: argparse.Namespace) -> int:
+    """
+    Confluence 본문 한계를 넘은 페이지 (status='FAILED' AND
+    last_error LIKE '%no resp%') 를 skeleton 본문 + 원본 storage XML
+    첨부로 처리. 상세: docs/oversized-pages.md (C 모드).
+    """
+    if not args.email or not args.api_token:
+        log("자격증명 필요.")
+        for line in CREDENTIAL_HELP.splitlines():
+            log("  " + line)
+        return 2
+
+    conn = db_connect(args.db)
+    session = _confluence_session(args)
+    if session is None:
+        return 2
+    base = args.base_url.rstrip("/")
+
+    # 대상 식별
+    if args.only:
+        rows = conn.execute(
+            "SELECT doku_id, title, parent_doku_id, storage_path, confluence_page_id "
+            "FROM pages WHERE doku_id=?", (args.only,)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT doku_id, title, parent_doku_id, storage_path, confluence_page_id "
+            "FROM pages WHERE status='FAILED' AND last_error LIKE '%no resp%'"
+        ).fetchall()
+    if not rows:
+        log("대상 페이지 없음.")
+        return 0
+    log(f"oversized-page fallback 대상: {len(rows)} 페이지")
+
+    space_id = _resolve_space_id(session, base, args.space_key) if args.space_key else None
+    if not space_id and not args.only:
+        log("--space-key 필요 (또는 환경변수 CONFLUENCE_SPACE_KEY).")
+        return 2
+
+    import zipfile
+    import io
+
+    pushed = failed = 0
+    for doku_id, title, parent_doku_id, storage_path, cur_page_id in rows:
+        if not storage_path or not Path(storage_path).is_file():
+            log(f"  [SKIP] {doku_id}: storage 파일 없음")
+            continue
+
+        # 부모 confluence_page_id 결정
+        parent_page_id = args.root_page_id
+        if parent_doku_id:
+            prow = conn.execute(
+                "SELECT confluence_page_id FROM pages WHERE doku_id=?", (parent_doku_id,)
+            ).fetchone()
+            if prow and prow[0]:
+                parent_page_id = prow[0]
+
+        # storage XML 크기 + li 카운트
+        body = Path(storage_path).read_text(encoding="utf-8")
+        size_kb = len(body.encode("utf-8")) / 1024
+        li_count = body.count("<li")
+
+        # skeleton 본문
+        skeleton = (
+            "<ac:structured-macro ac:name='info'>"
+            "<ac:parameter ac:name='title'>본문 큰 페이지</ac:parameter>"
+            "<ac:rich-text-body>"
+            f"<p>이 페이지의 원본 본문은 Confluence 의 storage parsing 한계를 "
+            f"넘어 직접 표시되지 않습니다.</p>"
+            "<ul>"
+            f"<li>크기: 약 {size_kb:.0f} KB</li>"
+            f"<li>&lt;li&gt; 개수: {li_count:,}</li>"
+            f"<li>원본 본문은 페이지 첨부의 <code>{doku_id}.xml.zip</code> 에 보존됨</li>"
+            f"<li>호스트 백업: P4 depot 의 <code>storage/{doku_id.replace(':', '/')}.xml</code></li>"
+            "</ul>"
+            "</ac:rich-text-body>"
+            "</ac:structured-macro>"
+        )
+
+        # POST 또는 PUT
+        if cur_page_id:
+            cur_ver = _get_page_version(session, base, cur_page_id)
+            if cur_ver is None:
+                failed += 1
+                continue
+            payload = {
+                "id": cur_page_id, "status": "current", "title": title,
+                "body": {"representation": "storage", "value": skeleton},
+                "version": {"number": cur_ver + 1},
+            }
+            resp = _request_with_retry(
+                session, "PUT", f"{base}/api/v2/pages/{cur_page_id}", json=payload
+            )
+            new_page_id = cur_page_id
+        else:
+            payload = {
+                "spaceId": space_id,
+                "parentId": parent_page_id,
+                "title": title,
+                "body": {"representation": "storage", "value": skeleton},
+            }
+            resp = _request_with_retry(
+                session, "POST", f"{base}/api/v2/pages", json=payload
+            )
+            if resp is None or resp.status_code >= 400:
+                # title 충돌 — disambiguation 재시도
+                if resp is not None and resp.status_code == 400 and "title" in (resp.text or "").lower():
+                    payload["title"] = f"{title} ({doku_id})"
+                    resp = _request_with_retry(
+                        session, "POST", f"{base}/api/v2/pages", json=payload
+                    )
+                    title = payload["title"]
+            if resp is None or resp.status_code >= 400:
+                err = f"skeleton create: {resp.status_code if resp else 'no resp'}"
+                log(f"  [FAIL] {doku_id}: {err}")
+                failed += 1
+                continue
+            new_page_id = str(resp.json()["id"])
+
+        # storage XML 을 zip 으로
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(f"{doku_id}.xml", body)
+        zip_buf.seek(0)
+        zip_bytes = zip_buf.read()
+        zip_name = f"{doku_id.replace(':', '_')}.xml.zip"
+
+        # 첨부 업로드 — v1 multipart
+        from requests_toolbelt.multipart import encoder as tb_encoder
+        m = tb_encoder.MultipartEncoder(
+            fields={"file": (zip_name, io.BytesIO(zip_bytes), "application/zip")}
+        )
+        att_resp = session.post(
+            f"{base}/rest/api/content/{new_page_id}/child/attachment",
+            headers={
+                "X-Atlassian-Token": "no-check",
+                "Content-Type": m.content_type,
+            },
+            data=m, timeout=120,
+        )
+        att_ok = att_resp.status_code < 400 or (
+            att_resp.status_code == 400 and "same file name" in (att_resp.text or "")
+        )
+
+        # state.db 갱신
+        conn.execute(
+            "UPDATE pages SET confluence_page_id=?, status='UPLOADED', "
+            "last_error=NULL, uploaded_at=?, last_checked_at=?, title=? WHERE doku_id=?",
+            (new_page_id, now_iso(), now_iso(), title, doku_id),
+        )
+        db_set_meta(conn, f"large_body_fallback:{doku_id}", "C-mode skeleton + storage zip")
+        conn.commit()
+
+        log(f"  [FALLBACK] {doku_id} -> page {new_page_id}, storage zip attached={att_ok}")
+        pushed += 1
+
+    log(f"rewrite-oversized-pages 완료: pushed={pushed} failed={failed}")
+    conn.close()
+    return 0 if failed == 0 else 1
 
 
 # ---------- rewrite-oversized: OVERSIZED 첨부 reference 를 메타 박스로 ----------
@@ -2804,6 +3550,11 @@ def cmd_rewrite_oversized(args: argparse.Namespace) -> int:
 
     changed_pages: list[str] = []
     for page_id, items in by_page.items():
+        # large body fallback 페이지는 본문이 skeleton 으로 교체되어 ri:attachment
+        # reference 자체가 없다. 또한 본문 PUT 도 거부되므로 skip.
+        if db_get_meta(conn, f"large_body_fallback:{page_id}"):
+            log(f"  [SKIP] {page_id}: large body fallback 페이지 (skeleton 본문)")
+            continue
         row = conn.execute(
             "SELECT storage_path FROM pages WHERE doku_id=?", (page_id,)
         ).fetchone()
@@ -3916,6 +4667,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp_hd.set_defaults(func=cmd_history_discover)
 
+    sp_hr = sub.add_parser("history-render", help="attic 리비전을 ?rev= 로 받아 캐시")
+    sp_hr.add_argument(
+        "--base-url", default=env_default("DOKUWIKI_BASE_URL"),
+    )
+    sp_hr.add_argument("--user", default=env_default("DOKUWIKI_USER"))
+    sp_hr.add_argument("--password", default=env_default("DOKUWIKI_PASSWORD"))
+    sp_hr.add_argument("--force", action="store_true")
+    sp_hr.add_argument("--only", help="특정 doku_id 만")
+    sp_hr.add_argument("--delay", type=float, default=0.0)
+    sp_hr.add_argument("--limit", type=int, help="처음 N 개만")
+    sp_hr.set_defaults(func=cmd_history_render)
+
+    sp_hc = sub.add_parser("history-convert", help="raw_history → storage_history + 헤더 박스")
+    sp_hc.add_argument("--force", action="store_true")
+    sp_hc.add_argument("--only", help="특정 doku_id 만")
+    sp_hc.set_defaults(func=cmd_history_convert)
+
+    sp_hu = sub.add_parser("history-upload", help="시간순 PUT replay → Confluence 버전 체인")
+    sp_hu.add_argument(
+        "--base-url",
+        default=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+    )
+    sp_hu.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
+    sp_hu.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
+    sp_hu.add_argument("--only", help="특정 doku_id 만 replay")
+    sp_hu.add_argument("--limit", type=int, help="처음 N revision PUT 후 종료")
+    sp_hu.add_argument("--users-map", help="dokuwiki user → Confluence accountId JSON 매핑")
+    sp_hu.set_defaults(func=cmd_history_upload)
+
     sp_hs = sub.add_parser("history-status", help="history 진행 상황 요약")
     sp_hs.set_defaults(func=cmd_history_status)
 
@@ -3925,8 +4705,43 @@ def build_parser() -> argparse.ArgumentParser:
     sp_sd.add_argument("--struct-db", help="명시적 struct.sqlite3 경로 (기본: <dokuwiki_src>/meta/struct.sqlite3)")
     sp_sd.set_defaults(func=cmd_struct_discover)
 
+    sp_sc = sub.add_parser("struct-convert", help="struct rows → storage XML (snapshot/properties)")
+    sp_sc.add_argument(
+        "--mode", default="snapshot",
+        choices=("snapshot", "properties", "native"),
+        help="변환 모드 (snapshot=1 페이지에 큰 표; properties=row 당 자식 페이지; native=Database API)",
+    )
+    sp_sc.set_defaults(func=cmd_struct_convert)
+
+    sp_su = sub.add_parser("struct-upload", help="struct-convert 결과를 Confluence 에 업로드")
+    sp_su.add_argument(
+        "--base-url",
+        default=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+    )
+    sp_su.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
+    sp_su.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
+    sp_su.add_argument("--space-key", default=env_default("CONFLUENCE_SPACE_KEY"))
+    sp_su.add_argument("--root-page-id", default=env_default("CONFLUENCE_ROOT_PAGE_ID"))
+    sp_su.add_argument("--probe", action="store_true", help="Confluence Database API 가용성만 측정")
+    sp_su.set_defaults(func=cmd_struct_upload)
+
     sp_ss = sub.add_parser("struct-status", help="struct 진행 상황 요약")
     sp_ss.set_defaults(func=cmd_struct_status)
+
+    sp_rop = sub.add_parser(
+        "rewrite-oversized-pages",
+        help="본문 거부된 페이지를 skeleton + storage XML 첨부로 fallback (docs/oversized-pages.md C 모드)",
+    )
+    sp_rop.add_argument(
+        "--base-url",
+        default=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+    )
+    sp_rop.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
+    sp_rop.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
+    sp_rop.add_argument("--space-key", default=env_default("CONFLUENCE_SPACE_KEY"))
+    sp_rop.add_argument("--root-page-id", default=env_default("CONFLUENCE_ROOT_PAGE_ID"))
+    sp_rop.add_argument("--only", help="특정 doku_id 만 처리")
+    sp_rop.set_defaults(func=cmd_rewrite_oversized_pages)
 
     sp_ro = sub.add_parser(
         "rewrite-oversized",
