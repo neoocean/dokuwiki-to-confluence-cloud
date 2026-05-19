@@ -32,7 +32,7 @@
 python run.py dev up --src ~/backup/wiki-data-only
 
 # full install 케이스
-python run.py dev up --src /Users/neoocean/p4/playground/docker/dokuwiki/data
+python run.py dev up --src /path/to/your/dokuwiki/data
 
 # 강제 bootstrap (full install 이어도 core 새로 받음)
 python run.py dev up --src /path --bootstrap
@@ -71,7 +71,7 @@ plugin-audit 는 잔존 매크로 (`~~MACRO~~`) 를 표시 + 사용자가 "rende
 
 | 항목 | 어디서 받는가 | 본 인스턴스 추정값 |
 |------|---------------|-------------------|
-| Atlassian 이메일 | 자신의 Atlassian 계정 | `me@woojinkim.org` |
+| Atlassian 이메일 | 자신의 Atlassian 계정 | `you@example.org` |
 | API 토큰 | <https://id.atlassian.com/manage-profile/security/api-tokens> 에서 생성. 본 작업 전용 토큰을 분리 발급 권장 | (별도 발급) |
 | 공간 키 (`spaceKey`) | Confluence UI 의 공간 설정 → 공간 키. 영문 대문자. | 미정 (e.g. `MIGRATE` 등 임시 공간 신규 생성 권장) |
 | 루트 페이지 ID | UI 에서 페이지 → "..." → "페이지 정보" 또는 URL 의 `pageId=` 파라미터에 보임 | 미정 (해당 공간의 빈 페이지 한 개 생성 후 그 ID) |
@@ -84,11 +84,11 @@ plugin-audit 는 잔존 매크로 (`~~MACRO~~`) 를 표시 + 사용자가 "rende
 ## 2. 환경 변수 설정
 
 ```sh
-export CONFLUENCE_EMAIL=me@woojinkim.org
+export CONFLUENCE_EMAIL=you@example.org
 export CONFLUENCE_API_TOKEN='ATATT3xFf...'
 export CONFLUENCE_SPACE_KEY=MIGRATE          # 위에서 결정한 공간 키
 export CONFLUENCE_ROOT_PAGE_ID=123456789     # 위에서 결정한 페이지 ID
-export CONFLUENCE_BASE_URL=https://woojinkim.atlassian.net/wiki   # 기본값과 같음
+export CONFLUENCE_BASE_URL=https://YOUR-DOMAIN.atlassian.net/wiki
 ```
 
 `.env` 파일 + `direnv` 또는 단일 세션 내 export 둘 다 OK. 환경변수

@@ -6,9 +6,9 @@
 
 ## 본 저장소 한 줄
 
-자체 호스팅 DokuWiki → Confluence Cloud (`woojinkim.atlassian.net/wiki`)
-일회성/반복 마이그레이션 도구. 본 인스턴스의 라이브는 **Day 1-4 완료**
-(2026-05-19).
+자체 호스팅 DokuWiki → Confluence Cloud (`$CONFLUENCE_BASE_URL`) 일회성/
+반복 마이그레이션 도구. 원 작성자 인스턴스의 라이브는 **Day 1-4 완료**
+(2026-05-19). 다른 인스턴스 배포는 [DEPLOY.md](DEPLOY.md).
 
 ## 가장 먼저 할 것
 

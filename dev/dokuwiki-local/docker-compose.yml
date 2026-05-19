@@ -1,28 +1,34 @@
-# 마이그레이션 스크립트의 라이브 테스트를 위해 호스트의 DokuWiki 데이터를
-# APFS clonefile 로 만든 카피에서 띄우는 컴포즈. 호스트 원본 디렉터리
-# `/Users/neoocean/p4/playground/docker/dokuwiki/data` 는 절대 수정되지 않는다.
+# 마이그레이션 스크립트의 라이브 테스트를 위한 도쿠위키 컨테이너 compose.
+# 호스트의 DokuWiki 데이터를 `/tmp/dwc_test_dokuwiki/dwdata` 에 클론한 후
+# 그 클론을 마운트. 원본은 손대지 않음.
 #
-# 사용:
-#   # 14GB 데이터를 APFS clonefile 로 즉시 복제 (디스크 사용 거의 0).
-#   cp -cR /Users/neoocean/p4/playground/docker/dokuwiki/data \
-#          /tmp/dwc_test_dokuwiki/dwdata
+# `python run.py dev up` 이 자동으로:
+#   1. --src (또는 DOKUWIKI_SRC env) 디렉터리를 검사
+#   2. full install (doku.php+lib/) 이면 `cp -cR` (macOS APFS clonefile, 9.5초·디스크 0)
+#      또는 `cp -R` (다른 FS, 디스크 실제 소비) 로 /tmp/dwc_test_dokuwiki/dwdata 에 복제
+#   3. data-only (pages/+media/) 이면 DokuWiki stable tarball 다운로드 +
+#      데이터 overlay + 플러그인 자동 감지·설치
+#   4. ACL bypass 패치 (conf/local.php useacl=0) 후 docker compose up -d
+#
+# 수동 사용 (run.py 안 쓸 때):
+#   # 호스트 데이터를 /tmp 로 클론
+#   cp -cR /path/to/your/dokuwiki/data /tmp/dwc_test_dokuwiki/dwdata   # macOS
+#   cp -R  /path/to/your/dokuwiki/data /tmp/dwc_test_dokuwiki/dwdata   # 기타
+#
 #   docker compose -f dev/dokuwiki-local/docker-compose.yml up -d
+#   curl http://127.0.0.1:18080/doku.php?id=wiki:syntax\&do=export_xhtmlbody
 #
-#   # 띄운 인스턴스로 라이브 변환 테스트:
-#   python run.py render  --base-url http://127.0.0.1:18080 --only wiki:syntax
-#   python run.py convert --only wiki:syntax
-#
-#   # 끝나면:
+#   # 끝나면
 #   docker compose -f dev/dokuwiki-local/docker-compose.yml down
 #   rm -rf /tmp/dwc_test_dokuwiki/dwdata
 #
 # 주의:
-#  - 마운트 경로는 호스트 절대경로 (macOS / 본 워크스테이션 기준). 다른 머신에서
-#    쓰려면 두 경로를 환경에 맞춰 수정.
+#  - 마운트 경로 `/tmp/dwc_test_dokuwiki/dwdata` 는 macOS / Linux 모두 동일.
+#    Windows 라면 WSL2 안에서 실행해야 함 (또는 경로를 윈도우 친화적으로 수정).
 #  - DokuWiki 가 `data/pages` 등 여러 서브디렉터리에 대해 부팅 시 writable
-#    검증을 수행하기 때문에 트리 전체를 writable 로 마운트해야 한다. APFS
-#    clonefile 로 만든 복제본을 쓰므로 원본은 영향 없음.
-#  - PHP 8.2 의 deprecation/warning 들이 export 응답 앞부분에 섞이지 않도록
+#    검증을 수행하기 때문에 트리 전체를 writable 로 마운트해야 한다. 클론을
+#    쓰므로 원본은 영향 없음.
+#  - PHP 8.2 의 deprecation warning 들이 export 응답 앞부분에 섞이지 않도록
 #    `display_errors=Off` + `error_reporting=E_ERROR` 로 잠재운다.
 
 services:

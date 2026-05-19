@@ -1455,9 +1455,15 @@ MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024  # 100MB
 
 CREDENTIAL_HELP = """
 필요 환경변수:
+  CONFLUENCE_BASE_URL    https://<your-domain>.atlassian.net/wiki
   CONFLUENCE_EMAIL       Atlassian 계정 이메일
   CONFLUENCE_API_TOKEN   API 토큰 (https://id.atlassian.com/manage-profile/security/api-tokens 에서 생성)
-또는 --email / --api-token 인자로 직접 전달.""".strip()
+  CONFLUENCE_SPACE_KEY   대상 공간 키 (UI → 공간 설정)
+  CONFLUENCE_ROOT_PAGE_ID  마이그레이션 트리 루트 페이지 ID
+또는 --base-url / --email / --api-token / --space-key / --root-page-id 인자로 직접 전달.
+
+.secrets/confluence.env 파일에 KEY=VALUE 로 적고 `set -a; source .secrets/confluence.env; set +a` 권장.
+샘플은 저장소 루트의 .env.example 참고.""".strip()
 
 
 def _load_users_map(path: str | None) -> dict[str, str]:
@@ -1465,7 +1471,7 @@ def _load_users_map(path: str | None) -> dict[str, str]:
     --users-map <json> 파일에서 dokuwiki 사용자명 -> Confluence accountId
     매핑을 로드.
 
-    Format: { "neoocean": "5e7f1234...", "lam": "60a01234..." }
+    Format: { "alice": "5e7f1234...", "bob": "60a01234..." }
 
     매핑 없으면 빈 dict — 호출자가 fallback 으로 텍스트만 표시.
     """
@@ -1524,11 +1530,18 @@ def _apply_page_labels(session, base_url: str, page_id: str, labels: list[str]) 
 
 
 def _confluence_session(args: argparse.Namespace):
-    """인증된 requests.Session 반환. 자격증명 누락 시 None."""
+    """인증된 requests.Session 반환. 자격증명/base_url 누락 시 None."""
     import requests
 
-    if not args.email or not args.api_token:
-        log("자격증명 누락 — Confluence API 호출 불가.")
+    missing = []
+    if not getattr(args, "base_url", None):
+        missing.append("CONFLUENCE_BASE_URL")
+    if not args.email:
+        missing.append("CONFLUENCE_EMAIL")
+    if not args.api_token:
+        missing.append("CONFLUENCE_API_TOKEN")
+    if missing:
+        log(f"자격증명/설정 누락 — Confluence API 호출 불가. 누락: {', '.join(missing)}")
         for line in CREDENTIAL_HELP.splitlines():
             log("  " + line)
         return None
@@ -5236,7 +5249,8 @@ def cmd_lint(args: argparse.Namespace) -> int:
 
 DEV_COMPOSE_REL = Path("dev/dokuwiki-local/docker-compose.yml")
 DEV_CLONE_DST = Path("/tmp/dwc_test_dokuwiki/dwdata")
-DEV_DEFAULT_SRC = Path("/Users/neoocean/p4/playground/docker/dokuwiki/data")
+# DOKUWIKI_SRC 환경 변수 또는 --src 명시 필요 — 머신 별 경로 하드코딩 금지
+DEV_DEFAULT_SRC: Path | None = None
 DEV_BASE_URL = "http://127.0.0.1:18080"
 DEV_HEALTH_PROBE = "/doku.php?id=wiki:syntax&do=export_xhtmlbody"
 DEV_HEALTH_TIMEOUT = 30
@@ -5507,9 +5521,14 @@ def cmd_dev(args: argparse.Namespace) -> int:
         return 2
 
     if args.action == "up":
-        src = Path(args.src).expanduser().resolve() if args.src else DEV_DEFAULT_SRC
+        if not args.src:
+            log("DokuWiki 데이터 경로 미지정.")
+            log("  --src /path/to/dokuwiki/data 또는 DOKUWIKI_SRC env 설정.")
+            log("  data-only (pages/ + media/ 만) / full install (doku.php + lib/) 모두 가능.")
+            return 2
+        src = Path(args.src).expanduser().resolve()
         if not src.is_dir():
-            log(f"호스트 DokuWiki 데이터 디렉터리가 없습니다: {src}")
+            log(f"DokuWiki 데이터 디렉터리 없음: {src}")
             return 2
 
         full_install = _dev_is_full_install(src)
@@ -6950,11 +6969,18 @@ def _wiz_prereq(conn, args) -> str:
         masked = ("***" if "TOKEN" in k else v) if v else "(미설정)"
         print(f"  {k:24s} = {masked}")
     if missing:
-        raise RuntimeError(f"환경 변수 누락: {', '.join(missing)} — .secrets/confluence.env 등에 추가 후 재실행")
-    # docker / python 존재 확인
+        print()
+        print("  → .env.example 을 .secrets/confluence.env 로 복사 후 값 채우고")
+        print("    `set -a; source .secrets/confluence.env; set +a` 실행 후 재시도")
+        raise RuntimeError(f"환경 변수 누락: {', '.join(missing)}")
+    # docker / curl / tar 존재 확인 (배포 환경 휴대성)
     has_docker = shutil.which("docker") is not None
-    print(f"  docker available: {has_docker}")
-    return f"env vars OK ({len(needed)}개) docker={has_docker}"
+    has_curl = shutil.which("curl") is not None
+    has_tar = shutil.which("tar") is not None
+    print(f"  docker available:   {has_docker}")
+    print(f"  curl available:     {has_curl}   (data-only bootstrap 시 필요)")
+    print(f"  tar available:      {has_tar}   (data-only bootstrap 시 필요)")
+    return f"env vars OK ({len(needed)}개) docker={has_docker} curl={has_curl} tar={has_tar}"
 
 
 def _wiz_dev_up(conn, args) -> str:
@@ -7037,7 +7063,7 @@ def _wiz_convert(conn, args) -> str:
 def _wiz_upload(conn, args) -> str:
     ns = argparse.Namespace(
         db=args.db,
-        base_url=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+        base_url=env_default("CONFLUENCE_BASE_URL"),
         email=env_default("CONFLUENCE_EMAIL"),
         api_token=env_default("CONFLUENCE_API_TOKEN"),
         space_key=env_default("CONFLUENCE_SPACE_KEY"),
@@ -7055,7 +7081,7 @@ def _wiz_upload(conn, args) -> str:
 def _wiz_rewrite_links(conn, args) -> str:
     ns = argparse.Namespace(
         db=args.db,
-        base_url=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+        base_url=env_default("CONFLUENCE_BASE_URL"),
         email=env_default("CONFLUENCE_EMAIL"),
         api_token=env_default("CONFLUENCE_API_TOKEN"),
         dry_run=False, only=None,
@@ -7092,7 +7118,7 @@ def _wiz_history(conn, args) -> str:
     log("→ history-upload")
     rc = cmd_history_upload(argparse.Namespace(
         db=args.db,
-        base_url=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+        base_url=env_default("CONFLUENCE_BASE_URL"),
         email=env_default("CONFLUENCE_EMAIL"),
         api_token=env_default("CONFLUENCE_API_TOKEN"),
         only=None, limit=None, users_map=None,
@@ -7122,7 +7148,7 @@ def _wiz_struct(conn, args) -> str:
     log("→ struct-upload --mode native")
     rc = cmd_struct_upload(argparse.Namespace(
         db=args.db,
-        base_url=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+        base_url=env_default("CONFLUENCE_BASE_URL"),
         email=env_default("CONFLUENCE_EMAIL"),
         api_token=env_default("CONFLUENCE_API_TOKEN"),
         space_key=env_default("CONFLUENCE_SPACE_KEY"),
@@ -7135,7 +7161,7 @@ def _wiz_struct(conn, args) -> str:
     log("→ struct-embed-on-bound-pages")
     rc = cmd_struct_embed_on_bound_pages(argparse.Namespace(
         db=args.db,
-        base_url=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+        base_url=env_default("CONFLUENCE_BASE_URL"),
         email=env_default("CONFLUENCE_EMAIL"),
         api_token=env_default("CONFLUENCE_API_TOKEN"),
         only_doku=None,
@@ -7150,7 +7176,7 @@ def _wiz_audit(conn, args) -> str:
     sample = args.audit_sample or 50
     ns = argparse.Namespace(
         db=args.db,
-        base_url=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+        base_url=env_default("CONFLUENCE_BASE_URL"),
         email=env_default("CONFLUENCE_EMAIL"),
         api_token=env_default("CONFLUENCE_API_TOKEN"),
         only=None, sample=sample, full=False, failed_only=False,
@@ -7165,7 +7191,7 @@ def _wiz_verify(conn, args) -> str:
     sample = args.verify_sample or 100
     ns = argparse.Namespace(
         db=args.db,
-        base_url=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+        base_url=env_default("CONFLUENCE_BASE_URL"),
         email=env_default("CONFLUENCE_EMAIL"),
         api_token=env_default("CONFLUENCE_API_TOKEN"),
         sample=sample, strategy="auto", output=str(out),
@@ -7199,7 +7225,7 @@ def _wiz_report_publish(conn, args) -> str:
     body = _wizard_build_report_body(conn)
     ns = argparse.Namespace(
         db=args.db,
-        base_url=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+        base_url=env_default("CONFLUENCE_BASE_URL"),
         email=env_default("CONFLUENCE_EMAIL"),
         api_token=env_default("CONFLUENCE_API_TOKEN"),
         space_key=env_default("CONFLUENCE_SPACE_KEY"),
@@ -7538,7 +7564,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp_upload.add_argument(
         "--base-url",
-        default=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+        default=env_default("CONFLUENCE_BASE_URL"),
     )
     sp_upload.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
     sp_upload.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
@@ -7554,7 +7580,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp_rewrite = sub.add_parser("rewrite-links", help="내부 링크 2-pass 치환 (S7)")
     sp_rewrite.add_argument(
         "--base-url",
-        default=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+        default=env_default("CONFLUENCE_BASE_URL"),
     )
     sp_rewrite.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
     sp_rewrite.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
@@ -7590,7 +7616,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp_hu = sub.add_parser("history-upload", help="시간순 PUT replay → Confluence 버전 체인")
     sp_hu.add_argument(
         "--base-url",
-        default=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+        default=env_default("CONFLUENCE_BASE_URL"),
     )
     sp_hu.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
     sp_hu.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
@@ -7620,7 +7646,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp_su = sub.add_parser("struct-upload", help="struct-convert 결과를 Confluence 에 업로드")
     sp_su.add_argument(
         "--base-url",
-        default=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+        default=env_default("CONFLUENCE_BASE_URL"),
     )
     sp_su.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
     sp_su.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
@@ -7654,7 +7680,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp_se.add_argument(
         "--base-url",
-        default=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+        default=env_default("CONFLUENCE_BASE_URL"),
     )
     sp_se.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
     sp_se.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
@@ -7667,7 +7693,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp_rop.add_argument(
         "--base-url",
-        default=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+        default=env_default("CONFLUENCE_BASE_URL"),
     )
     sp_rop.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
     sp_rop.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
@@ -7682,7 +7708,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp_ro.add_argument(
         "--base-url",
-        default=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+        default=env_default("CONFLUENCE_BASE_URL"),
     )
     sp_ro.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
     sp_ro.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
@@ -7694,7 +7720,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp_audit.add_argument(
         "--base-url",
-        default=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+        default=env_default("CONFLUENCE_BASE_URL"),
     )
     sp_audit.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
     sp_audit.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
@@ -7789,7 +7815,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp_verify_build.add_argument(
         "--base-url",
-        default=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+        default=env_default("CONFLUENCE_BASE_URL"),
     )
     sp_verify_build.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
     sp_verify_build.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
@@ -7876,7 +7902,7 @@ def build_parser() -> argparse.ArgumentParser:
         "report-publish",
         help="state.db 통계 기반 결과 보고서를 Confluence 페이지로 발행/갱신",
     )
-    sp_rp.add_argument("--base-url", default=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"))
+    sp_rp.add_argument("--base-url", default=env_default("CONFLUENCE_BASE_URL"))
     sp_rp.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
     sp_rp.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
     sp_rp.add_argument("--space-key", default=env_default("CONFLUENCE_SPACE_KEY"))

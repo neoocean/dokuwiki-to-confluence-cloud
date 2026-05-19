@@ -6,7 +6,7 @@
 
 ## 0. 전제
 
-- 원본 위치: `~/p4/playground/docker/dokuwiki/data/data/`
+- 원본 위치: `$DOKUWIKI_SRC` (env, 본 도구 작성자 인스턴스의 경우 `~/p4/playground/docker/dokuwiki/data/data/`)
   - `pages/<namespace>/<page>.txt` — DokuWiki 마크업 원본
   - `media/<namespace>/<file>` — 첨부(이미지, PDF 등)
   - `meta/<namespace>/<page>.meta` — 마지막 수정자/시각 등 메타데이터
@@ -14,7 +14,7 @@
 - 렌더링 책임: DokuWiki 본체. 별도 파서를 구현하지 않고
   `http://<dokuwiki>/doku.php?id=<page>&do=export_xhtmlbody` 의 출력을 사용한다.
   → 플러그인/매크로/테마가 적용된 "최종 화면 상태"를 그대로 보존하기 위함.
-- 대상: Confluence Cloud (`https://woojinkim.atlassian.net/wiki`), API v2 + storage format.
+- 대상: Confluence Cloud (`$CONFLUENCE_BASE_URL`, 형식: `https://<your-domain>.atlassian.net/wiki`), API v2 + storage format.
 - 인증: Atlassian API 토큰(이메일과 Basic 인증). `upload_to_confluence/run.py` 와 동일한 자격증명 관례를 따른다.
 - 상태 저장: SQLite (`state.db`). 페이지/첨부 단위 멱등성 확보.
 
@@ -127,7 +127,7 @@
 
 ## 4. 마이그레이션 실행 순서 (Runbook)
 
-1. `python run.py discover --src ~/p4/playground/docker/dokuwiki/data/data` → 페이지 목록 확정.
+1. `python run.py discover --src $DOKUWIKI_SRC` → 페이지 목록 확정.
 2. `python run.py render --base-url http://dokuwiki.local` → XHTML 캐시 채움.
 3. `python run.py convert` → storage format 생성, 첨부 목록 추출.
 4. `python run.py upload --space-key WIKI --root-page-id <id> --dry-run` 으로 점검.
@@ -137,7 +137,7 @@
 
 ## 5. 로컬 DokuWiki 테스트 환경
 
-라이브 테스트는 호스트의 `~/p4/playground/docker/dokuwiki/data` 를 절대
+라이브 테스트는 호스트의 `$DOKUWIKI_SRC` (작성자: ~/p4/playground/docker/dokuwiki/data) 를 절대
 수정하지 않으면서 `?do=export_xhtmlbody` 가 응답하는 인스턴스를 띄워야 한다.
 실제로 시도해 본 결과를 정리한다.
 
@@ -155,7 +155,7 @@
 `dev/dokuwiki-local/docker-compose.yml` 에 보존. 핵심:
 
 - 이미지: `php:8.2-apache` (DokuWiki 트리에 `doku.php` 와 `vendor/` 가 모두 포함돼 있어 별도 dokuwiki 이미지 불필요).
-- 데이터 마운트: `/tmp/dwc_test_dokuwiki/dwdata:/var/www/html:rw` — `cp -cR /Users/neoocean/p4/playground/docker/dokuwiki/data /tmp/dwc_test_dokuwiki/dwdata` 로 만든 APFS clonefile 복제본.
+- 데이터 마운트: `/tmp/dwc_test_dokuwiki/dwdata:/var/www/html:rw` — `cp -cR $DOKUWIKI_SRC /tmp/dwc_test_dokuwiki/dwdata` 로 만든 APFS clonefile 복제본.
 - 포트: `127.0.0.1:18080:80` (로컬 한정).
 - PHP 8.2 deprecation/warning 억제: 컨테이너 시작 시 `display_errors=Off`, `error_reporting=E_ERROR` 를 `/usr/local/etc/php/conf.d/zz-quiet.ini` 에 주입. 그러지 않으면 export 응답 본문 앞에 `<br /><b>Warning</b>: Trying to access array offset on value of type bool ...` 가 섞여 들어와 bs4 가 잘못 파싱한다.
 - mod_rewrite 활성화 (`a2enmod rewrite`) — DokuWiki 의 path 스타일 URL 처리에 필요.
@@ -172,7 +172,7 @@ python run.py dev up
 # (필요하면 다른 원본 디렉터리로: `python run.py dev up --src /other/path`)
 
 # 한 페이지로 end-to-end 검증
-python run.py discover --src /Users/neoocean/p4/playground/docker/dokuwiki/data/data
+python run.py discover --src $DOKUWIKI_SRC
 python run.py render   --base-url http://127.0.0.1:18080 --only wiki:syntax
 python run.py convert  --only wiki:syntax
 python run.py status

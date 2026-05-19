@@ -1,12 +1,28 @@
-# Runtime state — sqlite WAL/SHM included
+# Runtime state — sqlite (per-instance, never bundled in deploy)
 state.db
 state.db-wal
 state.db-shm
 
 # Cached intermediates (regenerable by discover/render/convert)
 raw/
+raw_history/
 storage/
+storage_history/
+storage_struct/
 logs/
+
+# Visual audit artifacts
+verify-gallery.html
+verify-screenshots/
+
+# Container clone artifacts (host data mounted by dev/dokuwiki-local/docker-compose.yml)
+dev/dokuwiki-local/bitnami/
+
+# Secrets — NEVER commit
+.secrets/
+
+# pytest cache
+.pytest_cache/
 
 # Python / venv
 __pycache__/

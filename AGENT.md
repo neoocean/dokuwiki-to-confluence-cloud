@@ -48,6 +48,10 @@ python run.py report-publish
 | `dev/dokuwiki-local/docker-compose.yml` | 로컬 DokuWiki 테스트 컨테이너 |
 | `tests/test_*.py` | pytest 회귀 (현재 84 통과) |
 | `.secrets/confluence.env` | 자격증명 (커밋 금지) |
+| `.env.example` | 환경 변수 템플릿 (배포 시 .secrets/ 로 복사 후 편집) |
+| `DEPLOY.md` | 다른 머신에 배포할 때의 번들 구성 + 설치 절차 |
+| `AGENT.md` (본 파일) | 사람/AI 진입점 |
+| `CLAUDE.md` | Claude Code 자동 로드 컨텍스트 |
 
 ---
 
@@ -90,7 +94,7 @@ discover  →  render  →  convert  →  upload  →  rewrite-links
 
 ### Perforce 정책 (2026-05-17 확정)
 - **디폴트 체인지리스트 금지**. 항상 번호 매긴 CL + 상세 description
-- 제출 후 GitHub 미러 (`neoocean/dokuwiki-to-confluence-cloud`) 푸시
+- 제출 후 GitHub 미러 (저장소별 설정) 푸시
 - 깃 커밋 본문 끝에 `P4 CL <N>` 한 줄 (디포 경로 prefix 없이)
 
 ```sh
