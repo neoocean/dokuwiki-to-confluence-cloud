@@ -7499,7 +7499,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="DokuWiki -> Confluence Cloud migration (scenarios in docs/scenarios.md)",
     )
     p.add_argument("--db", default=DEFAULT_DB_PATH, help=f"SQLite state path (default: {DEFAULT_DB_PATH})")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    # required=False — 인자 없이 실행하면 main() 이 도움말 출력
+    sub = p.add_subparsers(dest="cmd", required=False)
 
     sp_discover = sub.add_parser("discover", help="페이지 트리 발견 (S1)")
     sp_discover.add_argument(
@@ -7887,7 +7888,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Iterable[str] | None = None) -> int:
-    args = build_parser().parse_args(list(argv) if argv is not None else None)
+    parser = build_parser()
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    if not getattr(args, "cmd", None):
+        # 인자 없이 실행 → 도움말 출력 후 종료 (exit code 0)
+        parser.print_help()
+        return 0
     return args.func(args)
 
 
