@@ -381,6 +381,14 @@ Confluence 키 도착 후 라이브 업로드를 안전하게 수행하는 단�
 
 ## 12. 다음 단계
 
-- `upload --dry-run` 으로 트리 / stub / 첨부 예상치 출력 확인.
-- Confluence 공간/루트 페이지 결정 → 실제 업로드 → `rewrite-links` 로 placeholder 해결.
-- 새 플러그인이 추가되면 `docs/plugin-validation.md` §6 절차로 재검증.
+본 인스턴스의 라이브 마이그레이션은 **Day 1-4 모두 완료** (2026-05-19).
+누적 결과는 [`docs/migration-result.md`](migration-result.md) 참고.
+새 작업 후보:
+
+- 6개월 후 Atlassian Database API 의 컬럼/row 공개 여부 재 probe
+  (`python run.py struct-upload --probe`). 공개되면 [`struct-migration.md`](struct-migration.md) §3.1
+  의 native 풀 마이그레이션 경로 활성화.
+- 새 플러그인이 DokuWiki 에 추가되면 [`plugin-validation.md`](plugin-validation.md) §6 절차로 재검증
+  + 변환기에 매핑 룰 추가.
+- 다른 DokuWiki 인스턴스에 본 도구를 적용하려면 `python run.py wizard`
+  실행만 하면 14 단계가 차례로 안내 (`docs/runbook.md §0`).

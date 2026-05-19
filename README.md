@@ -7,6 +7,10 @@ DokuWiki 의 `?do=export_xhtmlbody` 출력을 받아 Confluence storage
 format 으로 변환, 네임스페이스 트리를 그대로 페이지 계층에 매핑하고
 미디어/첨부를 함께 업로드한다.
 
+> **AI 에이전트/사람 모두 처음 진입할 때**: [AGENT.md](AGENT.md) 를 먼저
+> 읽을 것 (1분 빠른 안내 + 핵심 파일 + 운영 관례 + 본 인스턴스 상태).
+> Claude Code 자동 로드 컨텍스트는 [CLAUDE.md](CLAUDE.md).
+
 ## 상태
 
 **라이브 마이그레이션 + 후속 정리 완료 (2026-05-18 / 19)**:

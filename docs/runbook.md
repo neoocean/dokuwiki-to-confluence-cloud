@@ -196,7 +196,7 @@ python run.py struct-upload --mode native                             # 빈 Data
 python run.py struct-embed-on-bound-pages                             # bound 페이지에 "관련 struct 데이터" 패널
 python run.py struct-status                                           # 진행 요약
 
-# 사용자 시각 검수 (docs/visual-audit.md Phase 1 + Phase 2)
+# 사용자 시각 검수 (docs/visual-audit.md Phase 1 + 2 + 3)
 python run.py verify build --sample 200                               # 상위 200, 기본 (의존성 없음)
 python run.py verify build --sample 200 \
     --with-confluence-view --with-attachment-check                    # 권장: 실 본문 + 첨부 점검
