@@ -7,6 +7,40 @@
 [`scenarios.md`](scenarios.md) 의 풀 dry-run 으로 이미 끝나 있다고
 가정한다.
 
+## 0-A. 데이터만 가지고 시작하기 — `python run.py dev up`
+
+원본 DokuWiki 인스턴스 없이 *데이터 디렉터리만* 가지고 있어도 재현 환경을
+즉시 구축 가능. `dev up` 이 src 를 자동 감지해서 분기:
+
+| 감지 | 동작 |
+|------|------|
+| **full install** (`doku.php` + `lib/` + `inc/`) | 기존 동작 — APFS clonefile 로 복제 후 ACL off 패치 |
+| **data-only** (`pages/` + `media/` 만 있음) | DokuWiki stable tarball (`download.dokuwiki.org`) 자동 다운로드 → 압축 풀기 → 데이터 / `conf/` overlay → 누락 플러그인 자동 감지·설치 → ACL off → 컨테이너 기동 |
+
+플러그인 자동 감지 (3 소스):
+1. `conf/plugins.local.php` 의 `$plugins['name'] = 1`
+2. `data/meta/struct.sqlite3` 존재 → struct 플러그인
+3. `data/pages/**/*.txt` 의 `~~MACRO~~` 패턴 → MACRO_TO_PLUGIN 매핑
+
+자동 설치 (10여 개의 인기 플러그인 tarball URL 매핑 내장):
+- wrap, struct, todo, discussion, blog, include, pagelist, tag, tagging, sqlite, …
+- DokuWiki core 번들 (info, config, acl, …) 는 `bundled` 로 표시 + 추가 다운로드 skip
+- 매핑에 없는 플러그인은 `unknown` 으로 표시 — 컨테이너 기동 후 `admin?do=admin&page=extension` 에서 수동 설치
+
+```sh
+# data-only 케이스 — DokuWiki core 부재
+python run.py dev up --src ~/backup/wiki-data-only
+
+# full install 케이스
+python run.py dev up --src /Users/neoocean/p4/playground/docker/dokuwiki/data
+
+# 강제 bootstrap (full install 이어도 core 새로 받음)
+python run.py dev up --src /path --bootstrap
+
+# 기존 클론에 누락 플러그인만 추가 설치
+python run.py dev install-plugins
+```
+
 ## 0. 한 줄 실행 — `python run.py wizard`
 
 본 런북의 모든 단계를 *대화형으로* 차례로 진행해주는 wizard. 중단(Ctrl+C)

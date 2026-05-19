@@ -24,6 +24,19 @@ format 으로 변환, 네임스페이스 트리를 그대로 페이지 계층에
 
 자세한 결과는 [`docs/migration-result.md`](docs/migration-result.md).
 
+## 도쿠위키 없이 데이터만으로 시작 — `python run.py dev up`
+
+원본 DokuWiki 인스턴스 없이 백업한 `data/` (pages + media + meta + conf) 만
+가지고도 재현 환경 구축 가능. `dev up` 이 자동으로:
+
+1. src 에 `doku.php`+`lib/` 가 있는지 검사 (full install) — 있으면 클론
+2. 없으면 DokuWiki stable tarball 자동 다운로드 + 데이터 overlay
+3. `conf/plugins.local.php` / `meta/struct.sqlite3` / `~~MACRO~~` 로 사용 플러그인 자동 감지
+4. 누락된 플러그인을 공식 release tarball 로 자동 설치 (wrap/struct/todo/discussion/blog/include/pagelist/tag/sqlite 등)
+5. ACL off 패치 후 컨테이너 기동
+
+자세한 절차는 [`docs/runbook.md`](docs/runbook.md) §0-A.
+
 ## 한 줄 실행 — `python run.py wizard`
 
 대화형 step-by-step CLI. 모든 마이그레이션 단계(prereq → dev-up → discover →

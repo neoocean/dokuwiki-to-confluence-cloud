@@ -5240,6 +5240,48 @@ DEV_DEFAULT_SRC = Path("/Users/neoocean/p4/playground/docker/dokuwiki/data")
 DEV_BASE_URL = "http://127.0.0.1:18080"
 DEV_HEALTH_PROBE = "/doku.php?id=wiki:syntax&do=export_xhtmlbody"
 DEV_HEALTH_TIMEOUT = 30
+DOKU_STABLE_TGZ = "https://download.dokuwiki.org/src/dokuwiki/dokuwiki-stable.tgz"
+
+# 도쿠위키 데이터만 가진 경우 자동으로 받아 설치할 외부 플러그인 매핑.
+# (정식 release tarball — DokuWiki 의 extension manager 가 가리키는 표준 URL).
+# 미지원 플러그인은 사용자가 수동 설치 (admin → extensions). 본 맵은 자주 쓰이는 것만.
+PLUGIN_DOWNLOADS: dict[str, str | None] = {
+    # name → archive URL (tar.gz). None = DokuWiki core 번들 (별도 설치 불필요).
+    "wrap":       "https://github.com/selfthinker/dokuwiki_plugin_wrap/archive/refs/heads/master.tar.gz",
+    "struct":     "https://github.com/cosmocode/dokuwiki-plugin-struct/archive/refs/heads/main.tar.gz",
+    "todo":       "https://github.com/dokufreaks/plugin-todo/archive/refs/heads/master.tar.gz",
+    "discussion": "https://github.com/dokufreaks/plugin-discussion/archive/refs/heads/master.tar.gz",
+    "blog":       "https://github.com/dokufreaks/plugin-blog/archive/refs/heads/master.tar.gz",
+    "include":    "https://github.com/dokufreaks/plugin-include/archive/refs/heads/master.tar.gz",
+    "pagelist":   "https://github.com/dokufreaks/plugin-pagelist/archive/refs/heads/master.tar.gz",
+    "tag":        "https://github.com/dokufreaks/plugin-tag/archive/refs/heads/master.tar.gz",
+    "tagging":    "https://github.com/cosmocode/dokuwiki-plugin-tagging/archive/refs/heads/main.tar.gz",
+    "sqlite":     "https://github.com/cosmocode/dokuwiki-plugin-sqlite/archive/refs/heads/master.tar.gz",
+    "logviewer":  None,   # bundled
+    "info":       None,   # bundled
+    "popularity": None,   # bundled
+    "revert":     None,   # bundled
+    "config":     None,   # bundled
+    "extension":  None,   # bundled
+    "acl":        None,   # bundled
+    "usermanager": None,  # bundled
+    "styling":    None,   # bundled
+    "authplain":  None,   # bundled
+    "authad":     None,   # bundled
+    "authldap":   None,   # bundled
+    "authpdo":    None,   # bundled
+    "safefnrecode": None, # bundled
+    "upgrade":    None,   # bundled
+    "admin":      None,   # bundled
+}
+
+# 페이지 본문 ~~MACRO~~ → 플러그인 매핑 (자동 감지용)
+MACRO_TO_PLUGIN: dict[str, str] = {
+    "DISCUSSION": "discussion",
+    "INFO":       "info",
+    "BOX":        "box",
+    "TODO":       "todo",
+}
 
 
 def _project_root() -> Path:
@@ -5255,6 +5297,158 @@ def _dev_clone_source(src: Path, dst: Path) -> int:
         return 0
     log("cp -cR 실패 (APFS 외 파일시스템 가능성). cp -R 로 재시도 — 디스크 사용량이 원본 크기만큼 증가합니다.")
     return subprocess.call(["cp", "-R", str(src), str(dst)])
+
+
+def _dev_is_full_install(src: Path) -> bool:
+    """src 가 DokuWiki 애플리케이션(=doku.php / lib/) 까지 갖춘 full install 인지."""
+    return (src / "doku.php").is_file() and (src / "lib").is_dir() and (src / "inc").is_dir()
+
+
+def _dev_data_root(src: Path) -> Path | None:
+    """src 안에서 DokuWiki 의 *데이터* 루트 (pages/, media/ 의 부모) 를 찾는다.
+
+    - case A: src 가 full install → return src/data
+    - case B: src 가 data root → return src
+    - case C: src/data 가 데이터 → return src/data
+    """
+    if (src / "pages").is_dir() and (src / "media").is_dir():
+        return src
+    cand = src / "data"
+    if (cand / "pages").is_dir() and (cand / "media").is_dir():
+        return cand
+    return None
+
+
+def _dev_bootstrap_download_core(tgz_path: Path) -> int:
+    """DokuWiki stable tarball 다운로드 (없을 때만)."""
+    if tgz_path.is_file() and tgz_path.stat().st_size > 1_000_000:
+        log(f"  DokuWiki core 캐시 재사용: {tgz_path}")
+        return 0
+    tgz_path.parent.mkdir(parents=True, exist_ok=True)
+    log(f"  DokuWiki core 다운로드: {DOKU_STABLE_TGZ}")
+    rc = subprocess.call(["curl", "-fsSL", "-o", str(tgz_path), DOKU_STABLE_TGZ])
+    return rc
+
+
+def _dev_bootstrap_extract(tgz_path: Path, dst: Path) -> int:
+    dst.mkdir(parents=True, exist_ok=True)
+    log(f"  core 압축 풀기 → {dst}")
+    return subprocess.call(
+        ["tar", "-xzf", str(tgz_path), "-C", str(dst), "--strip-components=1"]
+    )
+
+
+def _dev_overlay_user_data(data_root: Path, conf_root: Path | None, dst: Path) -> None:
+    """data_root 와 conf_root 의 내용을 dst (DokuWiki core 가 풀린 곳) 에 overlay."""
+    overlays = ("pages", "media", "media_attic", "attic", "meta", "media_meta", "index", "users")
+    for sub in overlays:
+        s = data_root / sub
+        if not s.is_dir():
+            continue
+        d = dst / "data" / sub
+        log(f"  데이터 overlay: {sub} ({sum(1 for _ in s.rglob('*'))} 항목)")
+        if d.exists():
+            shutil.rmtree(d)
+        shutil.copytree(s, d, copy_function=shutil.copy2)
+    if conf_root and conf_root.is_dir():
+        log(f"  conf overlay: {conf_root}")
+        (dst / "conf").mkdir(exist_ok=True)
+        for f in conf_root.iterdir():
+            if f.is_file() and not f.name.endswith((".dist", ".bak")):
+                try:
+                    shutil.copy2(f, dst / "conf" / f.name)
+                except OSError as e:
+                    log(f"    overlay 스킵 {f.name}: {e}")
+
+
+def _dev_detect_plugins(src: Path) -> dict[str, str]:
+    """플러그인 감지 — 이름 → reason 매핑."""
+    detected: dict[str, str] = {}
+    data_root = _dev_data_root(src) or src
+    conf_root = src / "conf" if (src / "conf").is_dir() else data_root.parent / "conf" if (data_root.parent / "conf").is_dir() else None
+    # 1) conf/plugins.local.php 의 $plugins['name']=1
+    if conf_root:
+        pl = conf_root / "plugins.local.php"
+        if pl.is_file():
+            import re as _re
+            for name, val in _re.findall(
+                r"\$plugins\['([^']+)'\]\s*=\s*(\d+)",
+                pl.read_text(encoding="utf-8", errors="replace"),
+            ):
+                if val == "1":
+                    detected[name] = "plugins.local.php"
+    # 2) src/lib/plugins 또는 src/data/lib/plugins 에 *존재* 하는 디렉터리
+    for cand in (src / "lib" / "plugins", data_root.parent / "lib" / "plugins"):
+        if cand.is_dir():
+            for sub in cand.iterdir():
+                if sub.is_dir() and not sub.name.startswith("."):
+                    detected.setdefault(sub.name, "lib/plugins/")
+            break
+    # 3) data/meta/struct.sqlite3 → struct
+    if (data_root / "meta" / "struct.sqlite3").is_file():
+        detected.setdefault("struct", "meta/struct.sqlite3")
+    # 4) 페이지 본문 ~~MACRO~~ → 매크로별 플러그인
+    pages_dir = data_root / "pages"
+    if pages_dir.is_dir():
+        import re as _re
+        macros_seen: set[str] = set()
+        cnt = 0
+        for txt in pages_dir.rglob("*.txt"):
+            try:
+                content = txt.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            macros_seen.update(_re.findall(r"~~([A-Z][A-Z0-9_:]+)~~", content))
+            cnt += 1
+            if cnt > 2000:
+                break
+        for m in macros_seen:
+            if m in MACRO_TO_PLUGIN:
+                detected.setdefault(MACRO_TO_PLUGIN[m], f"~~{m}~~ 매크로")
+    return detected
+
+
+def _dev_install_plugins(dokuwiki_root: Path, plugins: list[str]) -> dict:
+    """누락된 플러그인을 PLUGIN_DOWNLOADS 매핑으로 받아 설치.
+    이미 lib/plugins/<name> 이 있으면 skip. 매핑에 없으면 unknown."""
+    import tempfile as _tf
+    plugins_dir = dokuwiki_root / "lib" / "plugins"
+    plugins_dir.mkdir(parents=True, exist_ok=True)
+    result: dict[str, list[str]] = {"installed": [], "already": [], "bundled": [], "unknown": [], "failed": []}
+    for name in sorted(set(plugins)):
+        plugin_dir = plugins_dir / name
+        if plugin_dir.is_dir():
+            result["already"].append(name)
+            continue
+        if name in PLUGIN_DOWNLOADS and PLUGIN_DOWNLOADS[name] is None:
+            result["bundled"].append(name)
+            continue
+        url = PLUGIN_DOWNLOADS.get(name)
+        if not url:
+            result["unknown"].append(name)
+            continue
+        tmp = Path(_tf.mkdtemp(prefix="dwc-plugin-"))
+        try:
+            tgz = tmp / "p.tar.gz"
+            rc = subprocess.call(["curl", "-fsSL", "-o", str(tgz), url])
+            if rc != 0:
+                result["failed"].append(f"{name} (curl rc={rc})")
+                continue
+            ex = tmp / "ex"
+            ex.mkdir()
+            rc = subprocess.call(["tar", "-xzf", str(tgz), "-C", str(ex)])
+            if rc != 0:
+                result["failed"].append(f"{name} (tar rc={rc})")
+                continue
+            subs = [p for p in ex.iterdir() if p.is_dir()]
+            if not subs:
+                result["failed"].append(f"{name} (압축 내부 디렉터리 없음)")
+                continue
+            shutil.move(str(subs[0]), str(plugin_dir))
+            result["installed"].append(name)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    return result
 
 
 def _dev_patch_acl_off(clone_root: Path) -> None:
@@ -5317,12 +5511,57 @@ def cmd_dev(args: argparse.Namespace) -> int:
         if not src.is_dir():
             log(f"호스트 DokuWiki 데이터 디렉터리가 없습니다: {src}")
             return 2
+
+        full_install = _dev_is_full_install(src)
+        if getattr(args, "bootstrap", False):
+            full_install = False  # 강제 bootstrap
+
         if not DEV_CLONE_DST.exists():
-            if _dev_clone_source(src, DEV_CLONE_DST) != 0:
-                log("데이터 복제 실패")
-                return 1
+            if full_install:
+                log("감지: full DokuWiki install (doku.php + lib/ + inc/). APFS clonefile 로 복제.")
+                if _dev_clone_source(src, DEV_CLONE_DST) != 0:
+                    log("데이터 복제 실패")
+                    return 1
+            else:
+                log("감지: data-only — DokuWiki core 자동 다운로드 + 데이터 overlay + 플러그인 자동 설치.")
+                tgz = Path("/tmp/dwc_doku_stable.tgz")
+                if _dev_bootstrap_download_core(tgz) != 0:
+                    log("DokuWiki core 다운로드 실패")
+                    return 1
+                if _dev_bootstrap_extract(tgz, DEV_CLONE_DST) != 0:
+                    log("DokuWiki core 압축 풀기 실패")
+                    return 1
+                data_root = _dev_data_root(src)
+                if not data_root:
+                    log(f"DokuWiki 데이터 구조 인식 실패 (pages/ media/ 부재): {src}")
+                    return 1
+                conf_root = src / "conf" if (src / "conf").is_dir() else (
+                    data_root.parent / "conf" if (data_root.parent / "conf").is_dir() else None
+                )
+                _dev_overlay_user_data(data_root, conf_root, DEV_CLONE_DST)
+                # 플러그인 자동 감지 + 설치
+                detected = _dev_detect_plugins(src)
+                if detected:
+                    log(f"감지된 플러그인 {len(detected)}: " + ", ".join(sorted(detected)))
+                    install_res = _dev_install_plugins(DEV_CLONE_DST, list(detected))
+                    for kind, names in install_res.items():
+                        if names:
+                            log(f"  {kind} ({len(names)}): {', '.join(names)}")
+                    if install_res["unknown"]:
+                        log("  → unknown 은 컨테이너 기동 후 admin → 확장기능 에서 수동 설치 가능")
+                else:
+                    log("  플러그인 자동 감지 0건 (core 만 사용)")
         else:
-            log(f"기존 복제본 재사용: {DEV_CLONE_DST}")
+            log(f"기존 복제본 재사용: {DEV_CLONE_DST} (재 bootstrap 하려면 dev down --purge 후 dev up)")
+            if getattr(args, "install_plugins", False):
+                # 사용자가 추가 감지/설치 강제
+                detected = _dev_detect_plugins(src)
+                if detected:
+                    log(f"플러그인 감지 {len(detected)}: " + ", ".join(sorted(detected)))
+                    install_res = _dev_install_plugins(DEV_CLONE_DST, list(detected))
+                    for kind, names in install_res.items():
+                        if names:
+                            log(f"  {kind} ({len(names)}): {', '.join(names)}")
         _dev_patch_acl_off(DEV_CLONE_DST)
 
         log("docker compose up -d")
@@ -5335,6 +5574,22 @@ def cmd_dev(args: argparse.Namespace) -> int:
             return 1
         log(f"준비 완료: {DEV_BASE_URL}")
         log("  예) python run.py render --base-url " + DEV_BASE_URL + " --only wiki:syntax")
+        return 0
+
+    if args.action == "install-plugins":
+        if not DEV_CLONE_DST.exists():
+            log("dev up 먼저 실행해 클론이 만들어진 상태여야 합니다.")
+            return 2
+        src = Path(args.src).expanduser().resolve() if args.src else DEV_DEFAULT_SRC
+        detected = _dev_detect_plugins(src if src.is_dir() else DEV_CLONE_DST)
+        if not detected:
+            log("플러그인 0건 감지.")
+            return 0
+        log(f"감지된 플러그인 {len(detected)}: " + ", ".join(sorted(detected)))
+        install_res = _dev_install_plugins(DEV_CLONE_DST, list(detected))
+        for kind, names in install_res.items():
+            if names:
+                log(f"  {kind} ({len(names)}): {', '.join(names)}")
         return 0
 
     if args.action == "down":
@@ -7564,11 +7819,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dev_sub = sp_dev.add_subparsers(dest="action", required=True)
 
-    sp_dev_up = dev_sub.add_parser("up", help="컨테이너 기동 (필요시 APFS clonefile 복제)")
+    sp_dev_up = dev_sub.add_parser("up", help="컨테이너 기동 — full install 자동 감지 또는 data-only bootstrap")
     sp_dev_up.add_argument(
         "--src",
         default=env_default("DOKUWIKI_SRC"),
-        help=f"복제할 원본 DokuWiki 데이터 디렉터리 (기본: {DEV_DEFAULT_SRC})",
+        help=f"DokuWiki 데이터 / full install 디렉터리 (기본: {DEV_DEFAULT_SRC}). "
+        "lib/+doku.php 가 있으면 full install 로 인식해 통째로 복제, 없으면 data-only 로 보고 "
+        "DokuWiki core 자동 다운로드 + 데이터 overlay + 플러그인 자동 설치.",
+    )
+    sp_dev_up.add_argument(
+        "--bootstrap", action="store_true",
+        help="full install 처럼 보여도 강제로 data-only bootstrap (core 새로 받음)",
+    )
+    sp_dev_up.add_argument(
+        "--install-plugins", action="store_true",
+        help="기존 클론이 있을 때도 누락된 플러그인을 추가 설치",
     )
     sp_dev_up.set_defaults(func=cmd_dev)
 
@@ -7579,6 +7844,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"종료 후 복제본 {DEV_CLONE_DST} 도 삭제",
     )
     sp_dev_down.set_defaults(func=cmd_dev)
+
+    sp_dev_install = dev_sub.add_parser(
+        "install-plugins",
+        help="기존 클론에 플러그인 (자동 감지) 설치/재설치",
+    )
+    sp_dev_install.add_argument(
+        "--src", default=env_default("DOKUWIKI_SRC"),
+        help="감지에 쓸 데이터 디렉터리 (기본: 클론 자체에서 감지)",
+    )
+    sp_dev_install.set_defaults(func=cmd_dev)
 
     sp_wiz = sub.add_parser(
         "wizard",
