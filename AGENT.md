@@ -187,6 +187,8 @@ git push
 
 ## 더 읽을 거리
 
+- wizard 사용 시나리오 (Happy path / 중단·재개 / 실패 복구 / 부분
+  재실행 / 자동화 8 케이스): [`docs/wizard-walkthrough.md`](docs/wizard-walkthrough.md)
 - 본 프로젝트의 *왜* / *어떻게* / *함정*: [`docs/MEMORY.md`](docs/MEMORY.md)
 - 단계별 라이브 절차: [`docs/runbook.md`](docs/runbook.md)
 - 설계 + 새 엣지 케이스 발견 절차: [`docs/scenarios.md`](docs/scenarios.md)

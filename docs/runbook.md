@@ -60,6 +60,9 @@ python run.py wizard --continue-on-error # 단계 실패해도 다음으로 (기
 upload → rewrite-links → history → struct → audit → verify → report →
 report-publish.
 
+> 실제 단계별 콘솔 출력 / 사용 시나리오 (Happy path / 중단·재개 / 실패
+> 복구 / 부분 재실행 / 자동화) walkthrough 는 [`wizard-walkthrough.md`](wizard-walkthrough.md).
+
 `history` / `struct` 는 옵션 단계 (대상 데이터 없으면 skip 가능).
 plugin-audit 는 잔존 매크로 (`~~MACRO~~`) 를 표시 + 사용자가 "render 결과가
 만족스럽나요?" 에 no 답하면 `render` 를 pending 으로 reset 해 플러그인
