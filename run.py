@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -1072,6 +1073,18 @@ def _convert_html_to_storage(
     # DokuWiki 의 EDIT{...} section-edit 메타 코멘트 등 모든 HTML 코멘트 제거
     for c in soup.find_all(string=lambda s: isinstance(s, Comment)):
         c.extract()
+
+    # 미설치/비활성 플러그인이 처리하지 못해 plain text 로 새어나온 `~~MACRO~~`
+    # 토큰 제거. dokuwiki 가 인식하면 HTML 로 변환되므로 raw 에 남았다는 것은
+    # 동작하지 않은 매크로. 단 code/pre/td/th/kbd 안의 것은 *문서 내용* (syntax
+    # 데모, 표 데이터) 일 가능성이 높으므로 보존.
+    _doku_macro_residue = re.compile(r"~~[A-Za-z][A-Za-z0-9_:]*~~")
+    _doku_macro_preserve_parents = ("code", "pre", "td", "th", "kbd")
+    for s in list(soup.find_all(string=_doku_macro_residue)):
+        if s.find_parent(_doku_macro_preserve_parents):
+            continue
+        new_text = _doku_macro_residue.sub("", str(s))
+        s.replace_with(new_text)
 
     # 2) 제목 후보 (첫 h1, 없으면 첫 h2)
     title = None

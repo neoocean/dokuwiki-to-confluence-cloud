@@ -27,6 +27,40 @@ def _convert(html: str) -> str:
     return storage
 
 
+def test_doku_macro_residue_stripped_in_paragraph() -> None:
+    """미설치 플러그인의 ~~MACRO~~ 가 단독 문단에 남아있으면 strip."""
+    html = '<p>~~DISCUSSION~~</p>'
+    out = _convert(html)
+    assert "~~DISCUSSION~~" not in out
+    # 빈 문단으로 남거나 자동 정리되거나 — 어느 쪽이든 매크로 텍스트는 사라짐
+
+
+def test_doku_macro_residue_preserved_in_code() -> None:
+    """code/pre 안의 ~~MACRO~~ 는 *문서 내용* — 보존."""
+    html = '<p>예: <code>~~NOTOC~~</code> 매크로</p>'
+    out = _convert(html)
+    assert "~~NOTOC~~" in out
+
+
+def test_doku_macro_residue_preserved_in_table_cell() -> None:
+    """표 셀의 ~~MACRO~~ 는 데이터 — 보존."""
+    html = (
+        '<table><tr>'
+        '<td>~~NOTOC~~</td><td>TOC 생성을 막는다</td>'
+        '</tr></table>'
+    )
+    out = _convert(html)
+    assert "~~NOTOC~~" in out
+
+
+def test_doku_macro_residue_mixed_text() -> None:
+    """문단 안 inline 매크로는 strip 하되 주변 텍스트는 보존."""
+    html = '<p>앞 ~~INFO:syntaxplugins~~ 뒤</p>'
+    out = _convert(html)
+    assert "~~INFO:syntaxplugins~~" not in out
+    assert "앞" in out and "뒤" in out
+
+
 def test_internal_link_via_data_wiki_id() -> None:
     """userewrite 켜진 path-style 링크: data-wiki-id 가 1순위."""
     html = '<p>see <a href="/playground/playground" class="wikilink1" data-wiki-id="playground:playground">play</a>.</p>'
