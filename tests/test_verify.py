@@ -287,3 +287,98 @@ def test_import_rejects_non_array(tmp_path: Path) -> None:
     p.write_text('{"doku_id": "a", "decision": "OK"}', encoding="utf-8")
     rc = run.cmd_verify_import(_Args(db=str(db_path), path=str(p)))
     assert rc == 1
+
+
+# ---------- Phase 2: 시각 지표 / iframe / NG 분류 / 첨부 ----------
+
+def test_compute_metrics_image_table(tmp_path: Path) -> None:
+    """양측에 같은 카운트가 있으면 metric-ok 분류, 다르면 metric-bad."""
+    conn = _make_db()
+    raw_html = (
+        '<div><h2>x</h2><img src="/_media/a.png">'
+        '<img src="/_media/b.png"></div>'
+    )
+    storage_xml = (
+        '<ac:image><ri:attachment ri:filename="a.png"/></ac:image>'
+        '<ac:image><ri:attachment ri:filename="b.png"/></ac:image>'
+        '<h2>x</h2>'
+    )
+    m = run._verify_compute_metrics("d", conn, raw_html, storage_xml, None)
+    rows = {row[0]: row for row in m["rows"]}
+    label, d, s, c, ok = rows["이미지"]
+    assert d == 2 and s == 2 and ok
+
+
+def test_compute_metrics_mismatch() -> None:
+    """raw 에는 표 1개, storage 에는 0개 → metric-bad."""
+    conn = _make_db()
+    m = run._verify_compute_metrics(
+        "d", conn,
+        '<table><tr><td>x</td></tr></table>',
+        '<p>x</p>',
+        None,
+    )
+    rows = {row[0]: row for row in m["rows"]}
+    _, d, s, _c, ok = rows["표"]
+    assert d == 1 and s == 0 and not ok
+
+
+def test_render_iframe_doc_escaping() -> None:
+    """iframe srcdoc 안에 들어가는 HTML 은 CSS + body 로 포장."""
+    out = run._verify_render_iframe_doc('<p>hello "world"</p>')
+    assert "<style>" in out
+    assert '<p>hello "world"</p>' in out
+    assert "<body>" in out
+
+
+def test_render_metrics_row_filters_zero_rows() -> None:
+    """양측 0 인 항목은 미니 테이블에서 생략."""
+    metrics = {
+        "rows": [
+            ("이미지", 0, 0, -1, True),       # 생략
+            ("표", 2, 2, -1, True),           # 표시 (OK)
+            ("h2", 3, 4, -1, False),          # 표시 (BAD)
+        ],
+    }
+    out = run._verify_render_metrics_row(metrics)
+    assert "이미지" not in out
+    assert "표: 2" in out
+    assert "h2: 3≠4" in out
+    assert "metric-bad" in out
+    assert "metric-ok" in out
+
+
+def test_import_preserves_ng_tag(tmp_path: Path) -> None:
+    """Phase 2 의 NG 분류 라디오 — JSON 의 ng_tag 가 state.db 에 들어가야."""
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    run.db_init(conn)
+    run._ensure_verify_schema(conn)
+    _insert_page(conn, "a", content_hash="H")
+    conn.close()
+
+    p = tmp_path / "d.json"
+    p.write_text(
+        json.dumps([{
+            "doku_id": "a", "decision": "NG", "ng_tag": "table",
+            "notes": "표 행 깨짐",
+        }]),
+        encoding="utf-8",
+    )
+    assert run.cmd_verify_import(_Args(db=str(db_path), path=str(p))) == 0
+
+    conn = sqlite3.connect(str(db_path))
+    row = conn.execute(
+        "SELECT decision, ng_tag, notes FROM verify_decisions WHERE doku_id='a'"
+    ).fetchone()
+    conn.close()
+    assert row == ("NG", "table", "표 행 깨짐")
+
+
+def test_check_attachments_returns_zero_for_empty() -> None:
+    """페이지에 첨부가 0건이면 (0, 0) 반환 (HTTP 호출 없음)."""
+    conn = _make_db()
+    _insert_page(conn, "lonely")
+    # session=None, base="" — 호출 안 되어야
+    ok, total = run._verify_check_attachments(conn, None, "", "lonely")
+    assert (ok, total) == (0, 0)

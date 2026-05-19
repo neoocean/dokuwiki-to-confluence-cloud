@@ -140,7 +140,7 @@ docs/
 | **struct 데이터 → Confluence 페이지** | ✅ snapshot 모드 라이브 (4 schema, 1,213 rows) | `docs/struct-migration.md` (properties/native 모드는 stub) |
 | **과거 리비전 이전 (~37k)** | ✅ 50% 라이브 (18,729 rev) — 큰 페이지의 뒤쪽 rev 는 본문 한도로 영구 거부 | `docs/history-migration.md` + `docs/migration-result.md` Day 3 |
 | **공간 비-마이그레이션 페이지 정리** | ✅ 1,465 휴지통 (30일 회복) | `docs/migration-result.md §2.5` |
-| **시각 검수 자동화** | ✅ Phase 1 구현 (DOM 큐 + JSON decisions); Phase 2 (Playwright 스크린샷) 는 옵션으로 보관 | `docs/visual-audit.md` |
+| **시각 검수 자동화** | ✅ Phase 1 (DOM 큐 + JSON decisions) + Phase 2 (자동 시각 지표 / iframe 격리 / NG 분류 / 첨부 점검 / Playwright + AI vision 옵션) | `docs/visual-audit.md` |
 
 ## 개발
 

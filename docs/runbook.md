@@ -134,12 +134,22 @@ python run.py struct-upload --probe                                   # Database
 python run.py struct-convert --mode snapshot                          # 또는 properties / native
 python run.py struct-upload                                           # 라이브
 
-# 사용자 시각 검수 (docs/visual-audit.md Phase 1)
-python run.py verify build --sample 200                               # 상위 200 페이지 갤러리
-python run.py verify build --with-confluence-view                     # Confluence 실제 렌더도 받기
-# 검수자가 verify-gallery.html 열고 OK/NG/DEFER 결정 → JSON 다운로드
+# 사용자 시각 검수 (docs/visual-audit.md Phase 1 + Phase 2)
+python run.py verify build --sample 200                               # 상위 200, 기본 (의존성 없음)
+python run.py verify build --sample 200 \
+    --with-confluence-view --with-attachment-check                    # 권장: 실 본문 + 첨부 점검
+# (옵션) Playwright 스크린샷 + phash 유사도
+pip install playwright imagehash pillow && playwright install chromium
+python run.py dev up
+python run.py verify build --sample 50 --with-confluence-view \
+    --with-attachment-check --with-screenshots \
+    --dokuwiki-base-url http://127.0.0.1:18080
+# (옵션) AI vision 자동 비교
+export ANTHROPIC_API_KEY=...
+python run.py verify build --sample 50 --with-screenshots --with-vision
+# 검수자가 verify-gallery.html 열고 OK/NG/DEFER (키보드 1/2/3) + 사유 분류 → JSON 다운로드
 python run.py verify import verify_decisions.json                      # state.db 반영
-python run.py verify status -v                                         # NG/stale 페이지 목록
+python run.py verify status -v                                         # NG/stale + 사유 분포
 ```
 
 ## 9. 롤백 / 실패 대응

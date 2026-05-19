@@ -220,26 +220,64 @@ python run.py verify build --resume     # source_hash 바뀐 페이지는 STALE 
 
 ## 6. 단계적 적용
 
-### Phase 1 (즉시 가능) — A 만
+### Phase 1 (적용 완료, CL 53119) — A 기본
 
-- 의존성: 기존 + 표준 라이브러리 + (Confluence body-format=view 가져오기는 기존 v2 클라이언트로 가능)
-- `verify build` 서브커맨드 + 정적 HTML 갤러리
-- 검수자가 HTML 의 form 결과를 `verify_decisions.json` 으로 export → `verify import` 로 state.db 반영
-- 예상 작업: ~500 줄
+- `verify build / import / status` 서브커맨드 + 정적 HTML 갤러리
+- 우선순위 큐 (매크로/oversized/history/struct/image/body-size 가중치)
+- state.db `verify_decisions` 테이블 (doku_id, decision, notes, reviewer, source_hash, visual_score, flags)
+- JSON 다운로드 → `verify import` 로 반영, `verify status -v` 로 NG/stale 점검
 
-### Phase 2 — B 추가
+### Phase 2 (적용 완료, CL 53123) — 시각 비교 강화 + 옵션 의존성
 
-- 의존성: `pip install playwright imagehash pillow` + `playwright install chromium`
-- `--with-screenshots` 플래그로 활성화
-- dokuwiki 는 dev 컨테이너 살아있는 동안만 사용 가능 → 미리 스크린샷 캐시
-- Confluence 스크린샷은 토큰으로 인증된 페이지 view URL 호출
-- 예상 작업: ~300 줄
+기존 Phase 1 카드에 다음을 추가/교체:
 
-### Phase 3 (선택) — 검수자 협업
+| 기능 | 의존성 | 디폴트 | 효과 |
+|------|--------|--------|------|
+| **자동 시각 지표** | 없음 | on | dokuwiki raw / 우리 storage / (옵션) Confluence view 양측의 이미지·표·리스트·매크로 카운트 비교. 차이를 한 줄 미니 테이블에 빨강/초록 칩으로 |
+| **iframe 격리** | 없음 | on | 좌·우 영역을 `<iframe srcdoc>` 로 분리 + 자체 reset/typography CSS 인라인. dokuwiki/Confluence CSS 충돌 제거. wrap 콜아웃·Confluence info-macro 시각화 |
+| **`--body-format export_view`** | 자격증명 | 옵션 | Confluence view 대신 정식 export 렌더 받기 |
+| **NG 분류 라디오** | 없음 | on | 카드 footer 에 사유 select: 텍스트/표/이미지/매크로/첨부/링크/기타. JSON `ng_tag` 필드 + state.db `ng_tag` 컬럼. `verify status` 가 분포 표시 |
+| **`--with-attachment-check`** | 자격증명 | 옵션 | 페이지의 모든 첨부에 Confluence v2 GET → 카드에 "첨부 119/119" |
+| **`--with-screenshots`** | playwright + imagehash + pillow | 옵션 | 양측 풀 렌더 PNG + perceptual hash. 카드 헤더에 "유사도 0.84", `<details>` 안에 양측 PNG side-by-side |
+| **`--with-vision`** | + anthropic SDK + ANTHROPIC_API_KEY | 옵션 | Claude vision 으로 두 스크린샷 자동 비교 → 점수 + 누락 영역. 카드 상단에 띠로 |
+| **키보드 단축키** | 없음 | on | 1=OK, 2=NG, 3=DEFER. 검수 속도 향상 |
 
-- 정적 HTML 대신 가벼운 Flask `verify serve` 로 다중 검수자가 같은 큐를 공유
-- 충돌 방지: page 별 lock + reviewer 필드
-- 예상 작업: ~200 줄
+Phase 1 갤러리 출력 크기: 페이지당 ~1.3MB (raw 인라인) → Phase 2 도 비슷
+(iframe srcdoc escape 가 효율적, 4.3MB / 3 페이지). 200 페이지 큐 ≈
+~280MB HTML 한 장 — 브라우저가 처리 가능.
+
+운영 절차 (Phase 2):
+
+```sh
+# 1) 자격증명 (확장 옵션 사용 시)
+set -a; source .secrets/confluence.env; set +a
+
+# 2) 갤러리 — 기본 (의존성 없음)
+python run.py verify build --sample 200
+
+# 3) 갤러리 — Confluence 실제 본문 + 첨부 확인 (자격증명 필요, 권장)
+python run.py verify build --sample 200 \
+    --with-confluence-view --with-attachment-check
+
+# 4) (옵션) 스크린샷 — Playwright 설치 + dev 컨테이너 up
+pip install playwright imagehash pillow && playwright install chromium
+python run.py dev up
+python run.py verify build --sample 50 \
+    --with-confluence-view --with-attachment-check --with-screenshots \
+    --dokuwiki-base-url http://127.0.0.1:18080
+
+# 5) (옵션) AI vision — Claude API
+export ANTHROPIC_API_KEY=...
+python run.py verify build --sample 50 \
+    --with-confluence-view --with-attachment-check \
+    --with-screenshots --with-vision
+```
+
+### Phase 3 (선택, 미적용) — 검수자 협업
+
+- 정적 HTML 대신 가벼운 Flask `verify serve` — 결정 즉시 state.db 저장
+- 다중 검수자 + 페이지 락 + reviewer 필드
+- 본 1인 작업에는 불필요. 향후 필요 시 추가
 
 ## 7. 운영 절차 (Phase 1 적용 후)
 

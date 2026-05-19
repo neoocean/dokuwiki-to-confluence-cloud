@@ -4585,6 +4585,11 @@ CREATE INDEX IF NOT EXISTS verify_decisions_decision_idx
 
 def _ensure_verify_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(VERIFY_DECISIONS_DDL)
+    # ng_tag 컬럼 (Phase 2 추가) — 기존 DB 에는 없으니 ALTER 시도 후 무시
+    try:
+        conn.execute("ALTER TABLE verify_decisions ADD COLUMN ng_tag TEXT")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
 
 
@@ -4777,18 +4782,375 @@ def _verify_build_queue(
 
 
 def _verify_fetch_confluence_view(
-    session, base: str, page_id: str
+    session, base: str, page_id: str, body_format: str = "view",
 ) -> str | None:
-    """Confluence v2 GET /pages/{id}?body-format=view 의 body.view.value."""
+    """Confluence v2 GET /pages/{id}?body-format=... 의 body.<format>.value.
+    `body_format` 은 view (Confluence UI 렌더) 또는 export_view (정식 export)
+    또는 storage 또는 atlas_doc_format."""
     try:
-        url = f"{base.rstrip('/')}/api/v2/pages/{page_id}?body-format=view"
+        url = f"{base.rstrip('/')}/api/v2/pages/{page_id}?body-format={body_format}"
         resp = _request_with_retry(session, "GET", url, timeout=30)
         if resp is None or resp.status_code != 200:
             return None
         data = resp.json()
-        return ((data.get("body") or {}).get("view") or {}).get("value")
+        return ((data.get("body") or {}).get(body_format) or {}).get("value")
     except Exception:
         return None
+
+
+def _verify_compute_metrics(
+    doku_id: str,
+    conn: sqlite3.Connection,
+    raw_html: str,
+    storage_xml: str,
+    confluence_body: str | None,
+) -> dict:
+    """페이지 한 장에 대한 구조적 지표 — dokuwiki raw / 우리 storage /
+    (있다면) Confluence body 양측 카운트 비교. _structural_features 재사용.
+
+    반환 형식: {
+        'rows': [(label, d, s, c, ok)],  # ok 는 d==s==(c or s) 일 때 True
+        'attachment': None | (ok, total),
+    }
+    """
+    cmp: list[tuple[str, int, int, int, bool]] = []
+    try:
+        d_feats = _structural_features(raw_html or "", is_storage=False)
+    except Exception:
+        d_feats = {}
+    try:
+        s_feats = _structural_features(storage_xml or "", is_storage=True)
+    except Exception:
+        s_feats = {}
+    c_feats: dict[str, int] = {}
+    if confluence_body:
+        try:
+            # body-format=view 응답은 storage 가 아니라 view-HTML 이지만
+            # `_structural_features(is_storage=False)` 가 받아 카운트 가능 —
+            # 단 ac:* 매크로는 이미 풀려있어 macro_* 는 항상 0.
+            c_feats = _structural_features(confluence_body, is_storage=False)
+        except Exception:
+            c_feats = {}
+
+    def row(label: str, key: str, key_c: str | None = None) -> None:
+        d = int(d_feats.get(key, 0))
+        s = int(s_feats.get(key, 0))
+        ck = key_c or key
+        c = int(c_feats.get(ck, 0)) if c_feats else -1
+        # storage 와 dokuwiki 가 같으면 일단 OK. Confluence view 는
+        # 매크로가 풀려 있으므로 image/table/list 정도만 보조 비교.
+        if c < 0:
+            ok = d == s
+        else:
+            ok = (d == s)
+        cmp.append((label, d, s, c, ok))
+
+    row("이미지", "image_total")
+    row("표", "table")
+    row("표 행", "tr")
+    row("표 셀", "td")
+    row("리스트(ul)", "ul")
+    row("리스트(ol)", "ol")
+    row("li", "li")
+    row("h2", "h2")
+    row("h3", "h3")
+    row("코드", "macro_code")
+    row("info", "macro_info")
+    row("tip", "macro_tip")
+    row("note", "macro_note")
+    row("warning", "macro_warning")
+    row("smiley→emoji", "smiley")
+    row("외부링크", "external_link")
+
+    return {"rows": cmp}
+
+
+def _verify_check_attachments(
+    conn: sqlite3.Connection,
+    session,
+    base: str,
+    doku_id: str,
+) -> tuple[int, int]:
+    """페이지의 모든 첨부 (UPLOADED) 에 대해 v2 attachments 메타 GET.
+
+    HEAD 는 Confluence 가 일관 응답하지 않아 download URL 대신 attachment
+    객체 자체를 GET — 가볍고 인증 단순.
+    """
+    rows = conn.execute(
+        "SELECT confluence_attachment_id FROM attachments "
+        " WHERE page_doku_id=? AND status='UPLOADED' "
+        "   AND confluence_attachment_id IS NOT NULL",
+        (doku_id,),
+    ).fetchall()
+    if not rows:
+        return (0, 0)
+    ok = 0
+    for (aid,) in rows:
+        try:
+            url = f"{base.rstrip('/')}/api/v2/attachments/{aid}"
+            resp = _request_with_retry(session, "GET", url, timeout=20)
+            if resp is not None and resp.status_code == 200:
+                ok += 1
+        except Exception:
+            pass
+    return (ok, len(rows))
+
+
+def _verify_capture_screenshots(
+    queue: list[dict],
+    out_dir: Path,
+    dokuwiki_base: str,
+    confluence_base: str,
+    confluence_email: str,
+    confluence_token: str,
+) -> dict[str, dict]:
+    """Playwright + ImageHash 가 설치돼 있을 때만 동작. 양측 페이지를
+    헤드리스 Chromium 으로 풀 렌더 → PNG → phash. 결과는 doku_id → dict.
+
+    의존성이 없으면 빈 dict 반환 + 안내 로그. 외부 네트워크/큰 의존성
+    이므로 디폴트 off.
+    """
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except ImportError:
+        log("Playwright 미설치 — `pip install playwright && "
+            "playwright install chromium` 후 재실행. 스크린샷 건너뜀.")
+        return {}
+    try:
+        import imagehash  # type: ignore
+        from PIL import Image  # type: ignore
+    except ImportError:
+        log("ImageHash/Pillow 미설치 — phash 계산 불가, 스크린샷만 캡쳐.")
+        imagehash = None  # type: ignore
+        Image = None  # type: ignore
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results: dict[str, dict] = {}
+
+    confluence_auth_header = ""
+    if confluence_email and confluence_token:
+        import base64
+        token = base64.b64encode(
+            f"{confluence_email}:{confluence_token}".encode()
+        ).decode()
+        confluence_auth_header = f"Basic {token}"
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        ctx = browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            extra_http_headers=(
+                {"Authorization": confluence_auth_header}
+                if confluence_auth_header else {}
+            ),
+        )
+        page = ctx.new_page()
+        for i, q in enumerate(queue, 1):
+            doku_id = q["doku_id"]
+            page_id = q["confluence_page_id"]
+            d_path = out_dir / f"{doku_id.replace(':','_')}.dwk.png"
+            c_path = out_dir / f"{doku_id.replace(':','_')}.cnf.png"
+            try:
+                if dokuwiki_base:
+                    page.goto(
+                        f"{dokuwiki_base.rstrip('/')}/doku.php?id={doku_id}",
+                        timeout=15000, wait_until="networkidle",
+                    )
+                    page.screenshot(path=str(d_path), full_page=True)
+            except Exception as e:
+                log(f"  [dwk fail] {doku_id}: {e}")
+            try:
+                if confluence_base and page_id:
+                    page.goto(
+                        f"{confluence_base.rstrip('/')}/pages/{page_id}",
+                        timeout=20000, wait_until="networkidle",
+                    )
+                    page.screenshot(path=str(c_path), full_page=True)
+            except Exception as e:
+                log(f"  [cnf fail] {doku_id}: {e}")
+
+            ph_d = ph_c = None
+            similarity = None
+            if imagehash and Image and d_path.is_file() and c_path.is_file():
+                try:
+                    ph_d = imagehash.phash(Image.open(d_path))
+                    ph_c = imagehash.phash(Image.open(c_path))
+                    hamming = ph_d - ph_c
+                    # phash 는 64bit → similarity = 1 - hamming/64
+                    similarity = round(1.0 - hamming / 64.0, 3)
+                except Exception:
+                    pass
+
+            results[doku_id] = {
+                "dokuwiki_png": str(d_path) if d_path.is_file() else None,
+                "confluence_png": str(c_path) if c_path.is_file() else None,
+                "phash_dokuwiki": str(ph_d) if ph_d else None,
+                "phash_confluence": str(ph_c) if ph_c else None,
+                "similarity": similarity,
+            }
+            if i % 10 == 0:
+                log(f"  screenshot {i}/{len(queue)}")
+        browser.close()
+
+    return results
+
+
+def _verify_ai_compare(
+    queue: list[dict],
+    screenshots: dict[str, dict],
+    anthropic_api_key: str,
+) -> dict[str, dict]:
+    """Claude vision 으로 두 스크린샷 자동 비교. 디폴트 off. 페이지당 API
+    호출 1회. 결과: doku_id → {score, description}."""
+    if not anthropic_api_key:
+        log("--with-vision 사용 시 ANTHROPIC_API_KEY 필요. 건너뜀.")
+        return {}
+    try:
+        import anthropic  # type: ignore
+    except ImportError:
+        log("anthropic SDK 미설치 — `pip install anthropic` 후 재실행.")
+        return {}
+    try:
+        import base64
+    except ImportError:
+        return {}
+
+    client = anthropic.Anthropic(api_key=anthropic_api_key)
+    results: dict[str, dict] = {}
+    prompt = (
+        "두 스크린샷은 동일 문서의 dokuwiki(왼쪽) 와 Confluence(오른쪽) "
+        "마이그레이션 결과입니다. 같은 내용을 같은 모양으로 표시하는지 "
+        "평가하세요. 응답은 JSON 한 줄: "
+        '{"score": 0-100, "summary": "주요 차이 한 문장", "missing": ["..."]}. '
+        "score 는 100=거의 동일, 0=완전 다름. 표/이미지/매크로 박스를 우선 보세요."
+    )
+    for i, q in enumerate(queue, 1):
+        doku_id = q["doku_id"]
+        sh = screenshots.get(doku_id, {})
+        d_png = sh.get("dokuwiki_png")
+        c_png = sh.get("confluence_png")
+        if not (d_png and c_png and Path(d_png).is_file() and Path(c_png).is_file()):
+            continue
+        try:
+            d_b = base64.b64encode(Path(d_png).read_bytes()).decode()
+            c_b = base64.b64encode(Path(c_png).read_bytes()).decode()
+            resp = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=300,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image", "source": {
+                            "type": "base64", "media_type": "image/png",
+                            "data": d_b,
+                        }},
+                        {"type": "image", "source": {
+                            "type": "base64", "media_type": "image/png",
+                            "data": c_b,
+                        }},
+                    ],
+                }],
+            )
+            text = resp.content[0].text.strip() if resp.content else ""
+            import json as _json
+            import re as _re
+            m = _re.search(r"\{.*\}", text, _re.DOTALL)
+            if m:
+                parsed = _json.loads(m.group(0))
+                results[doku_id] = {
+                    "score": parsed.get("score"),
+                    "summary": parsed.get("summary", ""),
+                    "missing": parsed.get("missing", []),
+                }
+        except Exception as e:
+            log(f"  [vision fail] {doku_id}: {e}")
+        if i % 10 == 0:
+            log(f"  vision {i}/{len(queue)}")
+    return results
+
+
+# 양측 iframe 안에 인라인할 기본 CSS — dokuwiki/Confluence 모두에서
+# 표·매크로·코드가 *읽을 수 있게* 보이도록 최소화한 reset + typography.
+_VERIFY_IFRAME_BASE_CSS = """
+html, body { margin: 0; padding: .8em; font: 14px/1.6 -apple-system, sans-serif;
+             color: #1d1d1f; word-wrap: break-word; }
+h1 { font-size: 1.4em; margin: .5em 0 .3em; }
+h2 { font-size: 1.2em; margin: .8em 0 .3em; }
+h3 { font-size: 1.05em; margin: .6em 0 .3em; }
+p { margin: .4em 0; }
+table { border-collapse: collapse; margin: .5em 0; }
+th, td { border: 1px solid #d2d2d7; padding: .25em .6em; vertical-align: top; }
+th { background: #f5f5f7; font-weight: 600; }
+pre, code { font-family: ui-monospace, Menlo, monospace; font-size: .9em;
+           background: #f5f5f7; }
+pre { padding: .6em .8em; border-radius: 6px; overflow: auto;
+      border: 1px solid #e5e5ea; }
+code { padding: 1px 4px; border-radius: 3px; }
+img { max-width: 100%; height: auto; }
+ul, ol { padding-left: 1.5em; }
+blockquote { border-left: 3px solid #d2d2d7; margin: .4em 0;
+             padding: .2em .8em; color: #6e6e73; }
+a { color: #007aff; text-decoration: none; }
+a:hover { text-decoration: underline; }
+hr { border: 0; border-top: 1px solid #e5e5ea; }
+/* dokuwiki wrap 의미 클래스 (좌측 영역) */
+.wrap_info, .wrap_help { background: #e8f3ff; border-left: 4px solid #007aff;
+                         padding: .5em .8em; margin: .4em 0; }
+.wrap_tip { background: #ecf8ec; border-left: 4px solid #34c759;
+            padding: .5em .8em; margin: .4em 0; }
+.wrap_important, .wrap_note { background: #fff5e6;
+                              border-left: 4px solid #ff9500;
+                              padding: .5em .8em; margin: .4em 0; }
+.wrap_alert, .wrap_warning, .wrap_danger { background: #fde8e6;
+                                           border-left: 4px solid #ff3b30;
+                                           padding: .5em .8em; margin: .4em 0; }
+.wrap_box, .wrap_round { background: #fafafa; border: 1px solid #d2d2d7;
+                         padding: .5em .8em; margin: .4em 0;
+                         border-radius: 6px; }
+/* Confluence body-format=view 의 매크로 placeholder */
+.conf-macro, .confluence-information-macro { background: #f0f6ff;
+                                             border-left: 4px solid #007aff;
+                                             padding: .5em .8em; margin: .4em 0; }
+.confluence-information-macro-tip { border-color: #34c759; background: #ecf8ec; }
+.confluence-information-macro-note { border-color: #ff9500; background: #fff5e6; }
+.confluence-information-macro-warning { border-color: #ff3b30; background: #fde8e6; }
+/* dokuwiki 가 빠뜨린 매크로 잔존 (변환기 strip 후엔 안 보임) */
+"""
+
+
+def _verify_render_iframe_doc(body_html: str) -> str:
+    """좌·우 영역에 들어갈 iframe srcdoc 본문 — 양측 CSS 충돌 격리."""
+    return (
+        f"<!doctype html><html><head><meta charset='utf-8'>"
+        f"<style>{_VERIFY_IFRAME_BASE_CSS}</style></head>"
+        f"<body>{body_html}</body></html>"
+    )
+
+
+def _verify_render_metrics_row(metrics: dict) -> str:
+    """양측 카운트 비교 미니 테이블 (헤더 영역)."""
+    import html as _h
+    rows = metrics.get("rows", [])
+    if not rows:
+        return ""
+    # 변화 없는 항목은 압축 표시. 차이 있는 것만 강조.
+    cells = []
+    for label, d, s, c, ok in rows:
+        if d == 0 and s == 0 and (c <= 0):
+            continue
+        c_disp = "—" if c < 0 else str(c)
+        cls = "metric-ok" if ok else "metric-bad"
+        cells.append(
+            f'<span class="metric {cls}" title="dokuwiki={d} storage={s} '
+            f'view={c_disp}">{_h.escape(label)}: {d}'
+            + (f"≠{s}" if d != s else "")
+            + (f"/v{c_disp}" if c >= 0 else "")
+            + "</span>"
+        )
+    if not cells:
+        return ""
+    return '<div class="metrics">' + "".join(cells) + "</div>"
 
 
 def _verify_render_html(
@@ -4796,11 +5158,20 @@ def _verify_render_html(
     confluence_bodies: dict[str, str | None],
     base_view_url: str | None,
     reviewer: str,
+    metrics_map: dict[str, dict] | None = None,
+    attachment_map: dict[str, tuple[int, int]] | None = None,
+    screenshot_map: dict[str, dict] | None = None,
+    vision_map: dict[str, dict] | None = None,
 ) -> str:
-    """우선순위 큐를 받아 단일 정적 HTML 갤러리 생성."""
+    """우선순위 큐를 받아 단일 정적 HTML 갤러리 생성. iframe 격리 + 자동
+    지표 + 첨부 점검 + (옵션) 스크린샷 + (옵션) AI vision 점수."""
     import html as _h
     import json as _json
 
+    metrics_map = metrics_map or {}
+    attachment_map = attachment_map or {}
+    screenshot_map = screenshot_map or {}
+    vision_map = vision_map or {}
     total = len(queue)
 
     cards: list[str] = []
@@ -4831,19 +5202,68 @@ def _verify_render_html(
             if (base_view_url and page_id) else ""
         )
 
-        right_pane = (
-            f'<div class="body confluence-view">{confluence_body}</div>'
-            if confluence_body
-            else (
-                '<div class="body storage-fallback"><em>Confluence body 조회 실패 '
-                f'또는 자격증명 없음 — 우리 storage XML 추정 렌더:</em>'
-                f'<div>{storage_xml}</div></div>'
+        # iframe 격리 — 좌측: dokuwiki raw, 우측: Confluence body 또는 storage
+        left_src = _verify_render_iframe_doc(raw_html or "<p><em>raw 없음</em></p>")
+        if confluence_body:
+            right_src = _verify_render_iframe_doc(confluence_body)
+            right_label = "Confluence 실제 렌더"
+        else:
+            right_src = _verify_render_iframe_doc(storage_xml or "<p><em>storage 없음</em></p>")
+            right_label = "우리 storage XML (fallback)"
+
+        # 지표 / 첨부 / 스크린샷 / vision
+        metrics_html = _verify_render_metrics_row(metrics_map.get(doku_id, {}))
+        att = attachment_map.get(doku_id)
+        att_html = ""
+        if att and att[1] > 0:
+            ok, total_a = att
+            cls = "metric-ok" if ok == total_a else "metric-bad"
+            att_html = (
+                f'<span class="metric {cls}" title="Confluence v2 attachments GET">'
+                f'첨부 {ok}/{total_a}</span>'
             )
-        )
-        right_label = (
-            "Confluence 실제 렌더 (body-format=view)"
-            if confluence_body else "우리 storage XML (fallback)"
-        )
+
+        sh = screenshot_map.get(doku_id, {})
+        sim_html = ""
+        if sh.get("similarity") is not None:
+            sim = sh["similarity"]
+            cls = "metric-ok" if sim >= 0.85 else ("metric-warn" if sim >= 0.6 else "metric-bad")
+            sim_html = (
+                f'<span class="metric {cls}" title="perceptual hash">'
+                f'유사도 {sim}</span>'
+            )
+
+        screenshots_html = ""
+        if sh.get("dokuwiki_png") or sh.get("confluence_png"):
+            d_png = sh.get("dokuwiki_png") or ""
+            c_png = sh.get("confluence_png") or ""
+            screenshots_html = (
+                f'<details class="screenshots"><summary>스크린샷 비교</summary>'
+                f'<div class="shots">'
+                + (f'<a href="{_h.escape(d_png)}" target="_blank">'
+                   f'<img src="{_h.escape(d_png)}" alt="dokuwiki"></a>' if d_png else '')
+                + (f'<a href="{_h.escape(c_png)}" target="_blank">'
+                   f'<img src="{_h.escape(c_png)}" alt="confluence"></a>' if c_png else '')
+                + '</div></details>'
+            )
+
+        vision = vision_map.get(doku_id)
+        vision_html = ""
+        if vision:
+            v_score = vision.get("score")
+            v_sum = vision.get("summary", "")
+            v_miss = vision.get("missing") or []
+            cls = (
+                "metric-ok" if (v_score or 0) >= 85
+                else ("metric-warn" if (v_score or 0) >= 60 else "metric-bad")
+            )
+            miss_str = ", ".join(str(m) for m in v_miss[:3])
+            vision_html = (
+                f'<div class="vision {cls}">'
+                f'<strong>AI: {v_score}</strong> — {_h.escape(v_sum)}'
+                + (f' <span class="vision-miss">누락: {_h.escape(miss_str)}</span>' if miss_str else '')
+                + '</div>'
+            )
 
         cards.append(f"""
 <section class="card" id="card-{idx}" data-doku="{_h.escape(doku_id)}">
@@ -4855,20 +5275,33 @@ def _verify_render_html(
     <span class="flags">{_h.escape(flags)}</span>
     {f'<a class="link" href="{_h.escape(deeplink)}" target="_blank">Confluence 열기 →</a>' if deeplink else ''}
   </header>
+  <div class="meta-row">{metrics_html}{att_html}{sim_html}</div>
+  {vision_html}
   <div class="grid">
     <div class="col raw">
-      <h3>DokuWiki raw</h3>
-      <div class="body">{raw_html}</div>
+      <h3>DokuWiki raw (export_xhtmlbody)</h3>
+      <iframe class="body" sandbox="allow-same-origin" srcdoc="{_h.escape(left_src, quote=True)}"></iframe>
     </div>
     <div class="col conf">
       <h3>{right_label}</h3>
-      {right_pane}
+      <iframe class="body" sandbox="allow-same-origin" srcdoc="{_h.escape(right_src, quote=True)}"></iframe>
     </div>
   </div>
+  {screenshots_html}
   <footer>
     <label><input type="radio" name="d-{idx}" value="OK"> OK</label>
     <label><input type="radio" name="d-{idx}" value="NG"> NG</label>
     <label><input type="radio" name="d-{idx}" value="DEFER"> 보류</label>
+    <select class="ng-tag">
+      <option value="">사유 분류 (NG/보류 시)</option>
+      <option value="text">텍스트 누락/오류</option>
+      <option value="table">표 깨짐</option>
+      <option value="image">이미지/위치</option>
+      <option value="macro">매크로 스타일</option>
+      <option value="attachment">첨부</option>
+      <option value="link">링크</option>
+      <option value="other">기타</option>
+    </select>
     <input type="text" class="notes" placeholder="메모 (선택)" maxlength="500">
   </footer>
 </section>""")
@@ -4889,10 +5322,12 @@ function gatherDecisions() {
     const checked = card.querySelector('input[type=radio]:checked');
     if (!checked) return;
     const notes = card.querySelector('input.notes').value || '';
+    const tag = card.querySelector('select.ng-tag').value || '';
     out.push({
       doku_id: QUEUE[i].doku_id,
       decision: checked.value,
       notes: notes,
+      ng_tag: tag,
       source_hash: QUEUE[i].content_hash,
       reviewer: REVIEWER,
       reviewed_at: new Date().toISOString(),
@@ -4907,9 +5342,17 @@ function updateBadge() {
   const ng = decisions.filter(d => d.decision === 'NG').length;
   const df = decisions.filter(d => d.decision === 'DEFER').length;
   const reviewed = decisions.length;
+  // NG 분류 분포
+  const tagCounts = {};
+  decisions.filter(d => d.decision !== 'OK' && d.ng_tag).forEach(d => {
+    tagCounts[d.ng_tag] = (tagCounts[d.ng_tag] || 0) + 1;
+  });
+  const tagStr = Object.entries(tagCounts)
+    .sort((a,b) => b[1]-a[1])
+    .map(([k,v]) => k + ':' + v).join(' ');
   document.getElementById('progress').textContent =
     reviewed + ' / ' + QUEUE.length + ' reviewed (OK ' + ok +
-    ' / NG ' + ng + ' / DEFER ' + df + ')';
+    ' / NG ' + ng + ' / DEFER ' + df + (tagStr ? ' · ' + tagStr : '') + ')';
 }
 
 document.addEventListener('change', updateBadge);
@@ -4925,6 +5368,19 @@ document.getElementById('download').addEventListener('click', () => {
   a.download = 'verify_decisions.json';
   a.click();
   URL.revokeObjectURL(url);
+});
+
+// 키보드 단축키: 카드 안에서 1=OK, 2=NG, 3=DEFER, Enter=다음
+document.addEventListener('keydown', (e) => {
+  if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT')) return;
+  const focused = document.activeElement && document.activeElement.closest('section.card');
+  const card = focused || document.querySelector('section.card');
+  if (!card) return;
+  const map = {'1':'OK','2':'NG','3':'DEFER'};
+  if (map[e.key]) {
+    const r = card.querySelector('input[type=radio][value="'+map[e.key]+'"]');
+    if (r) { r.checked = true; updateBadge(); }
+  }
 });
 
 updateBadge();
@@ -4954,14 +5410,35 @@ updateBadge();
   .flags { color: #007aff; font-size: .85em; }
   a.link { margin-left: auto; color: #007aff; text-decoration: none; }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1em; }
-  .col { background: #fafafa; padding: .8em; border-radius: 6px;
-         max-height: 60vh; overflow: auto; }
+  .col { background: #fafafa; padding: .8em; border-radius: 6px; }
   .col h3 { margin-top: 0; font-size: .85em; color: #6e6e73; }
-  .body { font-size: .9em; line-height: 1.5; }
-  footer { margin-top: .8em; display: flex; gap: 1em; align-items: center; }
+  iframe.body { width: 100%; height: 60vh; border: 1px solid #e5e5ea;
+                border-radius: 4px; background: #fff; }
+  .meta-row { display: flex; gap: .4em; flex-wrap: wrap; margin: .4em 0 .6em; }
+  .metrics { display: flex; gap: .3em; flex-wrap: wrap; }
+  .metric { font-size: .78em; padding: .15em .5em; border-radius: 10px;
+            background: #f0f0f3; color: #1d1d1f; }
+  .metric.metric-ok   { background: #e6f4ea; color: #137333; }
+  .metric.metric-warn { background: #fef3e0; color: #b06000; }
+  .metric.metric-bad  { background: #fde8e6; color: #c5221f; }
+  .vision { font-size: .9em; padding: .5em .8em; border-radius: 6px;
+            margin: .4em 0; }
+  .vision.metric-ok   { background: #e6f4ea; }
+  .vision.metric-warn { background: #fef3e0; }
+  .vision.metric-bad  { background: #fde8e6; }
+  .vision-miss { color: #6e6e73; font-size: .85em; }
+  .screenshots { margin-top: .6em; }
+  .screenshots summary { cursor: pointer; color: #6e6e73; font-size: .85em; }
+  .shots { display: grid; grid-template-columns: 1fr 1fr; gap: .8em;
+           margin-top: .5em; }
+  .shots img { width: 100%; border: 1px solid #d2d2d7; border-radius: 4px; }
+  footer { margin-top: .8em; display: flex; gap: .8em; align-items: center;
+           flex-wrap: wrap; }
   footer label { font-size: .9em; }
   footer .notes { flex: 1; padding: .3em .5em; border: 1px solid #d2d2d7;
-                  border-radius: 4px; }
+                  border-radius: 4px; min-width: 12em; }
+  footer .ng-tag { padding: .3em .4em; border: 1px solid #d2d2d7;
+                   border-radius: 4px; font-size: .85em; }
   ac\\:structured-macro { display: block; border-left: 4px solid #007aff;
                            background: #f0f6ff; padding: .5em .8em; margin: .4em 0; }
   ac\\:structured-macro[ac\\:name="info"] { border-color: #007aff; background: #e8f3ff; }
@@ -5006,29 +5483,101 @@ def cmd_verify_build(args: argparse.Namespace) -> int:
 
     confluence_bodies: dict[str, str | None] = {}
     base_view_url: str | None = None
-    if args.with_confluence_view:
+    session = None
+    if args.with_confluence_view or args.with_attachment_check:
         if not args.email or not args.api_token:
-            log("--with-confluence-view 는 자격증명 필요. "
-                "fallback 으로 storage XML 표시.")
+            log("--with-confluence-view / --with-attachment-check 는 자격증명 필요.")
         else:
             session = _confluence_session(args)
             if session is None:
-                log("Confluence 세션 생성 실패. storage XML fallback.")
-            else:
-                base = args.base_url.rstrip("/")
-                base_view_url = base
-                log(f"Confluence body-format=view fetch 시작 ({len(queue)} 페이지)")
-                for i, q in enumerate(queue, 1):
-                    page_id = q["confluence_page_id"]
-                    if not page_id:
-                        continue
-                    body = _verify_fetch_confluence_view(session, base, page_id)
-                    confluence_bodies[q["doku_id"]] = body
-                    if i % 20 == 0:
-                        log(f"  fetched {i}/{len(queue)}")
+                log("Confluence 세션 생성 실패.")
+
+    if args.with_confluence_view and session is not None:
+        base = args.base_url.rstrip("/")
+        base_view_url = base
+        log(f"Confluence body-format={args.body_format} fetch 시작 "
+            f"({len(queue)} 페이지)")
+        for i, q in enumerate(queue, 1):
+            page_id = q["confluence_page_id"]
+            if not page_id:
+                continue
+            body = _verify_fetch_confluence_view(
+                session, base, page_id, body_format=args.body_format,
+            )
+            confluence_bodies[q["doku_id"]] = body
+            if i % 20 == 0:
+                log(f"  fetched {i}/{len(queue)}")
+
+    # 시각 지표 자동 계산 — raw / storage / (옵션) view 양측
+    metrics_map: dict[str, dict] = {}
+    log("structural metrics 계산 중...")
+    for q in queue:
+        doku_id = q["doku_id"]
+        raw_html = ""
+        storage_xml = ""
+        raw_path = q.get("raw_xhtml_path") or ""
+        storage_path = q.get("storage_path") or ""
+        if raw_path and Path(raw_path).is_file():
+            try:
+                raw_html = Path(raw_path).read_text(encoding="utf-8")
+            except OSError:
+                pass
+        if storage_path and Path(storage_path).is_file():
+            try:
+                storage_xml = Path(storage_path).read_text(encoding="utf-8")
+            except OSError:
+                pass
+        metrics_map[doku_id] = _verify_compute_metrics(
+            doku_id, conn, raw_html, storage_xml,
+            confluence_bodies.get(doku_id),
+        )
+
+    # 첨부 HEAD 점검 (옵션)
+    attachment_map: dict[str, tuple[int, int]] = {}
+    if args.with_attachment_check and session is not None:
+        base = args.base_url.rstrip("/")
+        log(f"첨부 자동 점검 시작 ({len(queue)} 페이지)")
+        for i, q in enumerate(queue, 1):
+            attachment_map[q["doku_id"]] = _verify_check_attachments(
+                conn, session, base, q["doku_id"]
+            )
+            if i % 20 == 0:
+                log(f"  attachment check {i}/{len(queue)}")
+
+    # Playwright 스크린샷 + phash (옵션)
+    screenshot_map: dict[str, dict] = {}
+    if args.with_screenshots:
+        out_dir = Path(args.output).parent if args.output else Path(".")
+        shots_dir = out_dir / "verify-screenshots"
+        log(f"Playwright 스크린샷 시작 → {shots_dir} ({len(queue)} 페이지)")
+        screenshot_map = _verify_capture_screenshots(
+            queue, shots_dir,
+            dokuwiki_base=args.dokuwiki_base_url or env_default("DOKUWIKI_BASE_URL"),
+            confluence_base=args.base_url,
+            confluence_email=args.email or "",
+            confluence_token=args.api_token or "",
+        )
+
+    # AI vision 비교 (옵션, 스크린샷 필수)
+    vision_map: dict[str, dict] = {}
+    if args.with_vision:
+        if not screenshot_map:
+            log("--with-vision 은 --with-screenshots 와 함께 사용. 건너뜀.")
+        else:
+            log(f"AI vision 비교 시작 ({len(queue)} 페이지)")
+            vision_map = _verify_ai_compare(
+                queue, screenshot_map,
+                anthropic_api_key=env_default("ANTHROPIC_API_KEY"),
+            )
 
     reviewer = args.reviewer or args.email or "anonymous"
-    html = _verify_render_html(queue, confluence_bodies, base_view_url, reviewer)
+    html = _verify_render_html(
+        queue, confluence_bodies, base_view_url, reviewer,
+        metrics_map=metrics_map,
+        attachment_map=attachment_map,
+        screenshot_map=screenshot_map,
+        vision_map=vision_map,
+    )
 
     out_path = Path(args.output) if args.output else Path("verify-gallery.html")
     out_path.write_text(html, encoding="utf-8")
@@ -5078,8 +5627,8 @@ def cmd_verify_import(args: argparse.Namespace) -> int:
         conn.execute(
             "INSERT OR REPLACE INTO verify_decisions "
             "(doku_id, decision, notes, reviewer, reviewed_at, "
-            " source_hash, visual_score, flags) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " source_hash, visual_score, flags, ng_tag) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 doku_id,
                 decision,
@@ -5089,6 +5638,7 @@ def cmd_verify_import(args: argparse.Namespace) -> int:
                 item.get("source_hash") or "",
                 item.get("visual_score"),
                 item.get("flags") or "",
+                item.get("ng_tag") or "",
             ),
         )
         if existing:
@@ -5136,6 +5686,20 @@ def cmd_verify_status(args: argparse.Namespace) -> int:
         pct = (n / uploaded_total * 100) if uploaded_total else 0
         print(f"  {k:6s}             {n:5d}  ({pct:.1f}% of uploaded)")
     print(f"  stale (변환 후 미재검수): {stale}")
+
+    # NG/DEFER 사유 분포
+    try:
+        tag_rows = conn.execute(
+            "SELECT COALESCE(ng_tag,''), COUNT(*) FROM verify_decisions "
+            " WHERE decision IN ('NG','DEFER') AND COALESCE(ng_tag,'') <> '' "
+            " GROUP BY ng_tag ORDER BY COUNT(*) DESC"
+        ).fetchall()
+        if tag_rows:
+            print("\nNG/DEFER 사유 분포:")
+            for tag, n in tag_rows:
+                print(f"  {tag:12s} {n}")
+    except sqlite3.OperationalError:
+        pass
 
     if args.verbose:
         ng_rows = conn.execute(
@@ -5443,6 +6007,30 @@ def build_parser() -> argparse.ArgumentParser:
     sp_verify_build.add_argument(
         "--with-confluence-view", action="store_true",
         help="Confluence body-format=view 도 fetch (자격증명 필요)",
+    )
+    sp_verify_build.add_argument(
+        "--body-format", default="view",
+        choices=("view", "export_view", "storage", "atlas_doc_format"),
+        help="--with-confluence-view 사용 시 body 포맷 (default view)",
+    )
+    sp_verify_build.add_argument(
+        "--with-attachment-check", action="store_true",
+        help="페이지의 모든 첨부에 v2 GET → 200 확인 (자격증명 필요)",
+    )
+    sp_verify_build.add_argument(
+        "--with-screenshots", action="store_true",
+        help="Playwright 로 양측 풀 렌더 PNG + phash 유사도 계산 "
+             "(playwright + imagehash + pillow 필요)",
+    )
+    sp_verify_build.add_argument(
+        "--with-vision", action="store_true",
+        help="AI vision (Claude) 으로 스크린샷 자동 비교. "
+             "--with-screenshots 와 ANTHROPIC_API_KEY 필요",
+    )
+    sp_verify_build.add_argument(
+        "--dokuwiki-base-url",
+        default=env_default("DOKUWIKI_BASE_URL"),
+        help="--with-screenshots 사용 시 dokuwiki HTTP base",
     )
     sp_verify_build.add_argument(
         "--base-url",
