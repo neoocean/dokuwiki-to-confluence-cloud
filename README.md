@@ -18,7 +18,7 @@ format 으로 변환, 네임스페이스 트리를 그대로 페이지 계층에
 | 내부 링크 resolved | 5,180 / unresolved 1,317 (평문 격하) |
 | audit 통과율 | 64% 명백 OK + 36% 분류기 한계 (실손실 0) |
 | 변환기 버그 fix | 9종 (라이브 + 후속 audit 발견) |
-| struct schema 라이브 | 4 / 5 (1,213 rows; snapshot mode) |
+| struct schema 라이브 | 4 / 5 — 1,213 row 자식 페이지 + 4 인덱스 페이지 + 4 빈 Confluence Database 객체 (native 모드, Day 4) |
 | 공간 정리 | 1,465 비-마이그레이션 페이지 휴지통 (30일 회복 가능) |
 | **history 리비전 보존** | **18,729 / 37,279 (50%)** — 큰 페이지의 후반 rev 는 Confluence 본문 한도 초과로 영구 거부 |
 
@@ -108,7 +108,7 @@ python run.py dev down --purge
 | 사후 처리 | `rewrite-oversized` | 100MB+ 첨부 → note 매크로 박스 (B 모드) |
 |  | `rewrite-oversized-pages` | 본문 거부 페이지 → skeleton + storage zip 첨부 (C 모드) |
 | history (37k 리비전) | `history-discover` / `history-render` / `history-convert` / `history-upload` / `history-status` | attic 인덱싱 → ?rev= 캐시 → storage XML + 헤더 박스 → 시간순 PUT replay |
-| struct (1,213 row) | `struct-discover` / `struct-convert` / `struct-upload` / `struct-status` | sqlite 인덱싱 → snapshot/properties/native 변환 → 라이브 |
+| struct (1,213 row) | `struct-discover` / `struct-convert` / `struct-upload` / `struct-embed-on-bound-pages` / `struct-status` | sqlite 인덱싱 → snapshot/properties/native 변환 → 라이브 (Database 쉘 + 인덱스 + row 페이지 + bound 페이지 패널) |
 | 시각 검수 | `verify build` / `verify import` / `verify status` | 우선순위 큐 + DOM side-by-side HTML 갤러리 + decisions JSON import (`docs/visual-audit.md`) |
 
 ## 문서 구조
@@ -127,7 +127,7 @@ docs/
   oversized-pages.md       — 본문 너무 큰 페이지 6모드 (C 적용됨)
   history-migration.md     — 과거 리비전 이전 (B+A+F 채택, 구현 완료, 진행 중)
   struct-migration.md      — struct 스키마 → Confluence (snapshot 라이브 적용)
-  visual-audit.md          — 사용자 시각 검수 자동화 (Phase 1 = DOM 큐, 구현 완료)
+  visual-audit.md          — 사용자 시각 검수 자동화 (Phase 1 + 2 + 3 = DOM 큐 / 자동 신호 / 비전 사전 거름, 구현 완료)
   MEMORY.md                — 미래 세션이 먼저 읽을 컨텍스트 인덱스
 ```
 
@@ -137,10 +137,10 @@ docs/
 |------|------|------|
 | **OVERSIZED 첨부 → note 박스** | ✅ B 모드 적용 (9건, 5 페이지 v↑) | `docs/oversized-attachments.md` |
 | **큰 본문 페이지 → skeleton + zip** | ✅ C 모드 적용 (1건, 119 자식 첨부 회복) | `docs/oversized-pages.md` |
-| **struct 데이터 → Confluence 페이지** | ✅ snapshot 모드 라이브 (4 schema, 1,213 rows) | `docs/struct-migration.md` (properties/native 모드는 stub) |
+| **struct 데이터 → Confluence 페이지/Database** | ✅ native 모드 라이브 (4 schema, 1,213 row 자식 페이지 + 4 빈 Database 쉘 + bound 페이지 임베드) | `docs/struct-migration.md` + `docs/migration-result.md` Day 4 |
 | **과거 리비전 이전 (~37k)** | ✅ 50% 라이브 (18,729 rev) — 큰 페이지의 뒤쪽 rev 는 본문 한도로 영구 거부 | `docs/history-migration.md` + `docs/migration-result.md` Day 3 |
 | **공간 비-마이그레이션 페이지 정리** | ✅ 1,465 휴지통 (30일 회복) | `docs/migration-result.md §2.5` |
-| **시각 검수 자동화** | ✅ Phase 1 (DOM 큐 + JSON decisions) + Phase 2 (자동 시각 지표 / iframe 격리 / NG 분류 / 첨부 점검 / Playwright + AI vision 옵션) | `docs/visual-audit.md` |
+| **시각 검수 자동화** | ✅ Phase 1 + 2 + 3 — DOM 큐 / iframe 격리 / NG 분류 / 첨부 점검 / Playwright + AI vision 옵션 + 비전 호출 전 자동 사전 거름 5개 신호 (문장 정렬 / artifact / 코드블록 / 헤딩 LCS / 링크해소) | `docs/visual-audit.md` |
 
 ## 개발
 
@@ -176,7 +176,7 @@ python run.py audit --full         # 결과 검증
 |------|------|
 | 큰 페이지의 history 후반 rev (~18,503 잔존) | 영구 — Confluence 본문 한도 초과. 추가 시도 시 *같은 위치* fail. zip 첨부 보존이 옵션 |
 | `p:start` 649 rev 0 처리 | 별도 진단 후 처리 |
-| struct properties / native 모드 | snapshot 만 라이브 적용. 본 인스턴스는 추가 필요 없음 |
+| struct Database 컬럼/row API | Confluence Cloud v2 가 `POST /api/v2/databases/{id}/{columns|rows|...}` 를 공개하지 않아 *데이터*는 Page Properties 매크로로, *Database 객체* 는 빈 쉘로만 존재 (id 는 state.db 에 저장됨 — 추후 API 가용 시 자동 채움) |
 | 휴지통 1,465 페이지 영구 삭제 | 30일 자동 또는 사용자 즉시 purge 결정 |
 | API 토큰 revoke | 마이그레이션 종료 시 |
 

@@ -5,6 +5,88 @@ day 의 §0 표. 과거 로그는 그대로 보존.
 
 ---
 
+# Day 4 — 2026-05-19 (struct → native+properties 라이브 적용)
+
+snapshot 페이지 4개로만 있던 struct 데이터를 *Confluence 측에서도
+"데이터베이스처럼" 동작* 하는 형태로 재구성. 각 schema 당:
+
+1. **빈 Confluence Database 객체** (dwc-struct-{tbl}) 를 공간 루트에 생성
+   → `struct_schemas.confluence_db_id` 저장. (API 한계로 컬럼/row 입력
+   불가 — 추후 API 가용 시 자동 채움 코드 경로 준비됨.)
+2. **인덱스 페이지** 본문을 교체 — 기존 snapshot 페이지 4개의 page id 를
+   재사용. 본문: schema 메타 + Confluence Database 객체 webui 링크 + 컬럼
+   table + Page Properties Report (cql `label = "dokuwiki-struct-{tbl}"`).
+3. **row 별 자식 페이지** 1,213개 — `details` 매크로 본문 + 라벨
+   `dokuwiki-struct-{tbl}`. 셀은 컬럼 타입별로 렌더 (Wiki→ri:page,
+   Media→ri:attachment/ac:image, Url→`<a>`, Date→`<time>`, Decimal/Text→text).
+4. **bound 페이지 임베드** — brevet_event(col23 Wiki)/brevet_course(col2
+   doku_id)/brevet_uri_cppage(col1 doku_id) 의 bound 페이지 본문 끝에
+   "관련 struct 데이터" 패널 추가. 마커 `<!-- struct-embed:start -->` 기준
+   idempotent 교체.
+
+## §0 struct 트랙 종료 통계 (Day 4)
+
+| 단계 | 결과 |
+|------|------|
+| `struct-upload --probe` | Database 생성 200 OK / 컬럼·row endpoint 7개 모두 500 → native A 모드는 *쉘만* |
+| `struct-convert --mode native --reconvert` | 4 schema, 1,213 row XML 재생성 (~1초) |
+| `struct-upload --mode native` 라이브 | 4 schema × Database (4 빈 쉘) + 4 인덱스 PUT + **1,213 row POST + 1,213 label, 0 실패** (~25분, ~50 row/min) |
+| `struct-upload --mode native --index-only` (URL 보정 재돌림) | 4 인덱스 PUT (8초) |
+| `struct-embed-on-bound-pages` 라이브 | **208 bound page PUT** + 5 unresolved skip (DokuWiki 페이지 미존재) — `<h2>관련 struct 데이터</h2>` sentinel 로 idempotent 보장 |
+
+## §1 데이터 모델
+
+```
+공간 루트
+├─ dokuwiki struct: brevet_course (page, 인덱스, 기존 snapshot id 재사용)
+│   ├─ brevet_course: 출발  (row 페이지 ×744, 라벨 dokuwiki-struct-brevet_course)
+│   ├─ brevet_course: 일죽
+│   └─ …
+├─ dokuwiki struct: brevet_event  (×106)
+├─ dokuwiki struct: brevet_place  (×98)
+├─ dokuwiki struct: brevet_uri_cppage  (×265)
+└─ dwc-struct-{tbl}  (빈 Database 객체 ×4, sibling — webui 페이지로 표시)
+```
+
+bound 페이지 (`b:2019-s200d-1`, `b:2019-s200i-1`, …) 본문 끝에 `관련
+struct 데이터` 섹션이 들어가 — brevet_event row 링크 + brevet_course
+체크포인트 링크 + Page Properties Report (CQL 라벨 매칭) 가 함께 표시.
+
+## §2 API 한계 발견 (struct-migration.md §3.1 갱신됨)
+
+`struct-upload --probe` 결과 — Confluence Cloud v2 REST 의 Database API 는
+**create/get/delete 의 3가지만 공개**. 컬럼 정의나 row 입력 endpoint 가
+존재하지 않는다 (시도한 7개 모두 500). storage format 의 `<ri:database>`
+임베드도 거부. 따라서 *데이터*는 Page Properties 매크로 조합으로 들어가고
+*Database 객체*는 그 자체로 빈 쉘로만 존재. Atlassian 이 후속 API 추가
+시 동일 코드 경로 (mode=native) 가 그대로 풀 native 마이그레이션을 수행
+가능 — `confluence_db_id` 가 schema 별로 이미 채워져 있음.
+
+## §3 코드 적용 (CL 53122+)
+
+| 컴포넌트 | 변경 |
+|----------|------|
+| `_struct_render_cell` | DokuWiki class → storage XML cell (Wiki/Media/Url/Date/Decimal/Text/Dropdown) |
+| `_struct_resolve_page` / `_struct_resolve_attachment` | 메인 파이프라인의 pages / attachments 테이블에서 lookup, 기본명 suffix 폴백 |
+| `_struct_row_to_details_macro` | 단일 row → `<ac:structured-macro ac:name="details">` 본문 |
+| `_struct_row_title` | 첫 Text 또는 name='code/name/title' 우선, fallback `{tbl}#{pid}` |
+| `_struct_build_index_xml` | 인덱스 페이지 본문 — Database 안내 박스 + 컬럼 table + Page Properties Report |
+| `cmd_struct_convert` | snapshot/properties/native 3모드 + `--reconvert` |
+| `cmd_struct_upload` | `--mode {auto,native,properties,snapshot}` + `--no-native-shell` + `--only-tbl` + `--probe-keep` |
+| `cmd_struct_embed_on_bound_pages` | bound 페이지에 "관련 struct 데이터" 패널 |
+| `tests/test_struct.py` | 27 케이스 (struct 18 + visual-audit Phase 3 자동 신호 9) |
+
+## §4 outstanding
+
+| 항목 | 상태 | 다음 |
+|------|------|------|
+| Atlassian Database API 컬럼/row | 미지원 | 6개월 간격 재probe |
+| brevet_place page binding | 부재 (장소명 free text) | 별도 마스터 페이지 1개로 묶음 — Day 5 후보 |
+| 컬럼 label 부재 (struct config 의 `label.<lang>` 비어있음) | colN 로 표시 중 | manual 라벨 매핑 JSON 추가 가능 |
+| struct row 의 multi-row 빈 cell 표시 (brevet_uri_cppage 일부) | 빈 row 그대로 | 빈 row strip 옵션 후보 |
+
+---
+
 # Day 3 — 2026-05-19 새벽 (history 트랙 라이브 실행)
 
 history-render → history-convert → history-upload 본격 실행. 5 라운드의

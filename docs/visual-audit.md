@@ -273,7 +273,38 @@ python run.py verify build --sample 50 \
     --with-screenshots --with-vision
 ```
 
-### Phase 3 (선택, 미적용) — 검수자 협업
+### Phase 3 (적용 완료) — 비전 호출 전 추가 자동 신호
+
+비전(--with-vision) 을 호출하기 전 *스크립트만으로* NG 후보를 더 정확히
+거를 5개 신호 추가. `_verify_compute_metrics` 와 `_diff_page` 양쪽에서
+계산되어 검수 카드 두 번째 메트릭 줄 (`.metrics-auto`) 에 표시.
+
+| 신호 | 헬퍼 | 측정 |
+|------|------|------|
+| 문장 정렬 ratio | `_sentence_align` | difflib SequenceMatcher 로 양측 문장 시퀀스 정렬 → ratio + 누락/추가 카운트 + 손실 예 3개 |
+| artifact 보존 | `_compare_artifacts` | `\d+(?:[\-/.:]\d+)+` (전화/일정/IP/버전) + URL + 이메일 집합 diff |
+| 코드블록 해시 일치 | `_compare_code_blocks` | dokuwiki `<pre class=code>` ↔ Confluence `<ac:macro code>` 본문 md5 set 비교 |
+| 헤딩 시퀀스 LCS | `_compare_heading_seq` | h1-h6 의 (level, text) 시퀀스 difflib → ratio + 누락 헤딩 예 |
+| 링크 해소율 | `_link_resolution_rate` | Confluence storage 의 `ri:page` resolved vs `dwc-link:` placeholder 비율 |
+
+임계값 → `auto_ng` 자동 추정 태그 채움 (사용자가 라디오로 confirm/override):
+
+```
+sentence_ratio < 0.7 (d_sentences≥5)            → 텍스트
+artifact missing ≥ 2 (어느 종류든)              → 텍스트
+code_blocks.missing ≥ 1                         → 매크로
+heading lcs_ratio < 0.7 (d_headings≥3)          → 텍스트
+link_resolution.placeholder ≥ 3                 → 링크
+```
+
+`_diff_page` (audit 커맨드) 도 같은 신호를 측정해 status 를 격상:
+SENTENCE_DIVERGED / ARTIFACT_LOSS / CODE_DIVERGED / HEADING_DIVERGED.
+
+**효과**: 비전 호출 단가/대기를 줄이고, 비전 없이도 정밀한 NG 후보 선별
+가능 (`--with-vision` 은 잔여 모호 케이스에만 사용). 18 케이스 테스트
+추가 (sentence/artifact/code/heading/link 5개 헬퍼).
+
+### Phase 4 (선택, 미적용) — 검수자 협업
 
 - 정적 HTML 대신 가벼운 Flask `verify serve` — 결정 즉시 state.db 저장
 - 다중 검수자 + 페이지 락 + reviewer 필드

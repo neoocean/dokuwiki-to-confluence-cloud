@@ -3116,28 +3116,165 @@ def cmd_struct_discover(args: argparse.Namespace) -> int:
     return 0
 
 
-def _struct_row_to_storage_table(conn, sid: int, payload: dict) -> str:
-    """단일 struct row 를 본문에 박을 storage XML 표로. snapshot/properties 모드 공용."""
-    cols = conn.execute(
-        "SELECT colref, name, dokuwiki_class FROM struct_columns "
-        "WHERE sid=? AND enabled=1 OR sid=? ORDER BY sort",
-        (sid, sid),
+_WIKI_LINK_RE = re.compile(r"^\[\[\s*([^\|\]]+?)\s*(?:\|\s*(.*?)\s*)?\]\]$")
+
+
+def _struct_resolve_page(conn, locator: str):
+    """DokuWiki page id (or [[id|label]]) → (confluence_page_id, title)."""
+    if not locator:
+        return None
+    m = _WIKI_LINK_RE.match(locator.strip())
+    if m:
+        target = m.group(1).lstrip(":")
+    else:
+        target = locator.lstrip(":")
+    row = conn.execute(
+        "SELECT confluence_page_id, title FROM pages "
+        "WHERE doku_id=? AND confluence_page_id IS NOT NULL",
+        (target,),
+    ).fetchone()
+    if row:
+        return row
+    base = target.rsplit(":", 1)[-1]
+    rows = conn.execute(
+        "SELECT confluence_page_id, title FROM pages "
+        "WHERE doku_id LIKE ? AND confluence_page_id IS NOT NULL",
+        (f"%:{base}",),
     ).fetchall()
+    if len(rows) == 1:
+        return rows[0]
+    return None
+
+
+def _struct_resolve_attachment(conn, locator: str):
+    """media_id → (confluence_attachment_id, confluence_page_id, filename)."""
+    if not locator:
+        return None
+    target = locator.lstrip(":")
+    row = conn.execute(
+        "SELECT confluence_attachment_id, confluence_page_id, media_id FROM attachments "
+        "WHERE media_id=? AND confluence_attachment_id IS NOT NULL",
+        (target,),
+    ).fetchone()
+    if row:
+        return row
+    base = target.rsplit(":", 1)[-1]
+    rows = conn.execute(
+        "SELECT confluence_attachment_id, confluence_page_id, media_id FROM attachments "
+        "WHERE media_id LIKE ? AND confluence_attachment_id IS NOT NULL",
+        (f"%:{base}",),
+    ).fetchall()
+    if len(rows) == 1:
+        return rows[0]
+    return None
+
+
+_IMAGE_EXT_RE = re.compile(r"\.(png|jpe?g|gif|webp|svg)$", re.IGNORECASE)
+
+
+def _struct_render_cell(conn, cls: str, value, *, multi_join: str = ", ") -> str:
+    """단일 셀 (값+클래스)을 Confluence storage XML 의 cell 내용으로 렌더링.
+
+    cls 가 Wiki/Media/Url/Date 면 ri 토큰 / 링크 / time 으로,
+    Text/Decimal/Dropdown 은 escape 된 텍스트.
+    multi 값은 같은 셀에 누적.
+    """
+    import html as _h
+    if value is None or value == "":
+        return ""
+    if isinstance(value, list):
+        return multi_join.join(
+            _struct_render_cell(conn, cls, v, multi_join=multi_join) for v in value if v not in (None, "")
+        )
+    sval = str(value)
+    if cls == "Url":
+        url = _h.escape(sval, quote=True)
+        return f'<a href="{url}">{_h.escape(sval)}</a>'
+    if cls == "Date":
+        return f'<time datetime="{_h.escape(sval, quote=True)}">{_h.escape(sval)}</time>'
+    if cls == "Wiki":
+        m = _WIKI_LINK_RE.match(sval.strip())
+        if m:
+            target = m.group(1).lstrip(":")
+            label = m.group(2) or target
+            resolved = _struct_resolve_page(conn, target)
+            if resolved:
+                _cp, title = resolved
+                return (
+                    f'<ac:link><ri:page ri:content-title="{_h.escape(title or "", quote=True)}"/>'
+                    f'<ac:plain-text-link-body><![CDATA[{label}]]></ac:plain-text-link-body>'
+                    f'</ac:link>'
+                )
+            return f'<span class="dwc-unresolved-page" data-doku-id="{_h.escape(target, quote=True)}">{_h.escape(label)}</span>'
+        return f'<p>{_h.escape(sval)}</p>'
+    if cls == "Media":
+        resolved = _struct_resolve_attachment(conn, sval)
+        if resolved:
+            _ca, _cp, media_id = resolved
+            fname = media_id.rsplit(":", 1)[-1]
+            if _IMAGE_EXT_RE.search(fname):
+                return f'<ac:image><ri:attachment ri:filename="{_h.escape(fname, quote=True)}"/></ac:image>'
+            return (
+                f'<ac:link>'
+                f'<ri:attachment ri:filename="{_h.escape(fname, quote=True)}"/>'
+                f'<ac:plain-text-link-body><![CDATA[{fname}]]></ac:plain-text-link-body>'
+                f'</ac:link>'
+            )
+        return f'<span class="dwc-unresolved-media" data-media-id="{_h.escape(sval, quote=True)}">{_h.escape(sval)}</span>'
+    # Text / Decimal / Dropdown / Lookup / User / 기타
+    return _h.escape(sval).replace("\n", "<br/>")
+
+
+def _struct_row_to_details_macro(conn, sid: int, payload: dict, columns) -> str:
+    """단일 struct row → Page Properties (details) 매크로 본문.
+
+    columns 는 [(colref, name, cls)] 정렬된 리스트.
+    """
     import html as _h
     rows_html = []
-    for colref, name, cls in cols:
+    for colref, name, cls in columns:
         val = payload.get(str(colref))
-        if val is None:
-            display = ""
-        elif isinstance(val, list):
-            display = ", ".join(str(v) for v in val)
-        else:
-            display = str(val)
+        cell = _struct_render_cell(conn, cls, val)
         rows_html.append(
-            f"<tr><th>{_h.escape(name or f'col{colref}')}</th>"
-            f"<td>{_h.escape(display)}</td></tr>"
+            f'<tr><th>{_h.escape(name or f"col{colref}")}</th><td>{cell}</td></tr>'
         )
-    return f"<table>{''.join(rows_html)}</table>"
+    return (
+        "<ac:structured-macro ac:name=\"details\">"
+        "<ac:rich-text-body>"
+        f"<table>{''.join(rows_html)}</table>"
+        "</ac:rich-text-body>"
+        "</ac:structured-macro>"
+    )
+
+
+def _struct_row_title(payload: dict, columns, tbl: str, pid: int) -> str:
+    """행의 표시 제목을 결정. 첫 Text 컬럼 또는 name='code/name/title' 우선.
+
+    fallback: "{tbl}#{pid}".
+    """
+    # 1) 이름이 'code', 'name', 'title' 인 컬럼 우선
+    preferred_names = ("code", "name", "title", "이름", "코드", "제목")
+    for colref, name, cls in columns:
+        if name and name.lower() in preferred_names:
+            v = payload.get(str(colref))
+            if v and not isinstance(v, list):
+                return f"{tbl}: {v}"
+    # 2) 첫 Text/Decimal 컬럼의 값
+    for colref, name, cls in columns:
+        if cls in ("Text", "Decimal"):
+            v = payload.get(str(colref))
+            if v and not isinstance(v, list) and len(str(v)) <= 80:
+                return f"{tbl}: {v}"
+    return f"{tbl}#{pid}"
+
+
+# Back-compat shim for older callers (snapshot mode).
+def _struct_row_to_storage_table(conn, sid: int, payload: dict) -> str:
+    cols = conn.execute(
+        "SELECT colref, name, dokuwiki_class FROM struct_columns WHERE sid=? ORDER BY sort",
+        (sid,),
+    ).fetchall()
+    return _struct_row_to_details_macro(conn, sid, payload, cols)
 
 
 def cmd_struct_convert(args: argparse.Namespace) -> int:
@@ -3154,10 +3291,16 @@ def cmd_struct_convert(args: argparse.Namespace) -> int:
     out_dir.mkdir(exist_ok=True)
     mode = args.mode
 
-    schemas = conn.execute(
-        "SELECT sid, tbl, row_count, status FROM struct_schemas "
-        "WHERE status NOT IN ('SKIPPED', 'UPLOADED') ORDER BY tbl"
-    ).fetchall()
+    if args.reconvert:
+        schemas = conn.execute(
+            "SELECT sid, tbl, row_count, status FROM struct_schemas "
+            "WHERE status != 'SKIPPED' ORDER BY tbl"
+        ).fetchall()
+    else:
+        schemas = conn.execute(
+            "SELECT sid, tbl, row_count, status FROM struct_schemas "
+            "WHERE status NOT IN ('SKIPPED', 'UPLOADED') ORDER BY tbl"
+        ).fetchall()
     if not schemas:
         log("struct-convert 대상 schema 없음.")
         return 0
@@ -3172,30 +3315,27 @@ def cmd_struct_convert(args: argparse.Namespace) -> int:
         log(f"=== {tbl} (sid={sid}, {row_count} rows, mode={mode}) ===")
         rows = conn.execute(
             "SELECT pid, bound_doku_id, payload_json FROM struct_rows "
-            "WHERE sid=? AND status='DISCOVERED' ORDER BY pid",
+            "WHERE sid=? ORDER BY pid",
             (sid,),
         ).fetchall()
         if not rows:
             continue
 
         cols = conn.execute(
-            "SELECT colref, name FROM struct_columns WHERE sid=? ORDER BY sort",
+            "SELECT colref, name, dokuwiki_class FROM struct_columns WHERE sid=? ORDER BY sort",
             (sid,),
         ).fetchall()
-        col_headers = [_h.escape(name or f"col{cr}") for cr, name in cols]
+        col_headers = [_h.escape(name or f"col{cr}") for cr, name, _cls in cols]
 
         if mode == "snapshot":
-            # 한 페이지에 모든 row 를 표로
             header_row = "<tr>" + "".join(f"<th>{h}</th>" for h in col_headers) + "</tr>"
             body_rows = []
             for pid, bound, payload_json in rows:
                 payload = _json.loads(payload_json)
                 cells = []
-                for colref, _name in cols:
-                    val = payload.get(str(colref), "")
-                    if isinstance(val, list):
-                        val = ", ".join(str(v) for v in val)
-                    cells.append(f"<td>{_h.escape(str(val))}</td>")
+                for colref, _name, cls in cols:
+                    val = payload.get(str(colref))
+                    cells.append(f"<td>{_struct_render_cell(conn, cls, val)}</td>")
                 body_rows.append("<tr>" + "".join(cells) + "</tr>")
             body = (
                 f'<h1>{_h.escape(tbl)} ({row_count} rows)</h1>'
@@ -3205,46 +3345,38 @@ def cmd_struct_convert(args: argparse.Namespace) -> int:
             out = out_dir / f"{tbl}.snapshot.xml"
             out.write_text(body, encoding="utf-8")
             conn.execute(
-                "UPDATE struct_schemas SET chosen_mode='snapshot', snapshot_page_id=NULL, status='DEFINED' WHERE sid=?",
+                "UPDATE struct_schemas SET chosen_mode='snapshot', status=CASE WHEN status='UPLOADED' THEN 'UPLOADED' ELSE 'DEFINED' END WHERE sid=?",
                 (sid,),
             )
             log(f"  snapshot storage → {out}")
             converted += 1
-        elif mode == "properties":
-            # 각 row 마다 별도 storage 파일 + index 페이지 storage
+        elif mode in ("properties", "native"):
             for pid, bound, payload_json in rows:
                 payload = _json.loads(payload_json)
-                pp = _struct_row_to_storage_table(conn, sid, payload)
-                pp_macro = (
-                    "<ac:structured-macro ac:name='details'>"
-                    "<ac:rich-text-body>" + pp + "</ac:rich-text-body>"
-                    "</ac:structured-macro>"
-                )
+                details = _struct_row_to_details_macro(conn, sid, payload, cols)
                 out = out_dir / f"{tbl}.row.{pid}.xml"
-                out.write_text(pp_macro, encoding="utf-8")
-            # index 페이지: Page Properties Report
-            index = (
-                f"<h1>{_h.escape(tbl)} index</h1>"
-                "<ac:structured-macro ac:name='detailssummary'>"
-                f"<ac:parameter ac:name='cql'>label = \"dokuwiki-struct-{tbl}\"</ac:parameter>"
-                "</ac:structured-macro>"
+                out.write_text(details, encoding="utf-8")
+            db_id_row = conn.execute(
+                "SELECT confluence_db_id FROM struct_schemas WHERE sid=?", (sid,)
+            ).fetchone()
+            db_id = db_id_row[0] if db_id_row else None
+            (out_dir / f"{tbl}.index.xml").write_text(
+                _struct_build_index_xml(
+                    tbl, sid, mode, cols, row_count, db_id,
+                    db_get_meta(conn, "confluence_base_url") or "",
+                    db_get_meta(conn, "confluence_space_key") or "",
+                ),
+                encoding="utf-8",
             )
-            (out_dir / f"{tbl}.index.xml").write_text(index, encoding="utf-8")
             conn.execute(
-                "UPDATE struct_schemas SET chosen_mode='properties', status='DEFINED' WHERE sid=?",
-                (sid,),
+                "UPDATE struct_schemas SET chosen_mode=?, status=CASE WHEN status='UPLOADED' THEN 'UPLOADED' ELSE 'DEFINED' END WHERE sid=?",
+                (mode, sid),
             )
-            log(f"  properties storage → {len(rows)} row 페이지 + 1 index")
+            log(f"  {mode} storage → {len(rows)} row + 1 index")
             converted += len(rows)
-        elif mode == "native":
-            log(f"  native: Database API probe 필요 — struct-upload 단계에서.")
-            conn.execute(
-                "UPDATE struct_schemas SET chosen_mode='native', status='DEFINED' WHERE sid=?",
-                (sid,),
-            )
 
     conn.commit()
-    log(f"struct-convert 완료: schemas 처리됨")
+    log(f"struct-convert 완료: rows={converted}, schemas 처리됨")
     conn.close()
     return 0
 
@@ -3275,59 +3407,509 @@ def cmd_struct_upload(args: argparse.Namespace) -> int:
         return 1
 
     if args.probe:
-        # 빈 Database 1개 만들고 컬럼 추가 가능한지 시도
+        # 빈 Database 생성 후 컬럼/row 입력이 가능한 endpoint 가 있는지 체계적으로 탐색.
         log("=== Confluence Database API probe ===")
         resp = _request_with_retry(
             session, "POST", f"{base}/api/v2/databases",
-            json={"spaceId": space_id, "title": "dwc-probe"},
+            json={"spaceId": space_id, "title": "dwc-probe", "parentId": args.root_page_id},
         )
         log(f"  POST /api/v2/databases → {resp.status_code if resp else 'no resp'}")
-        if resp and resp.status_code < 400:
-            db_id = resp.json().get("id")
-            log(f"  생성된 db: {db_id}")
-            log("  추가 column/row API 는 별도 — 본 probe 는 endpoint 가용성만 확인.")
+        if not resp or resp.status_code >= 400:
+            log(f"    body: {(resp.text if resp else '')[:300]}")
+            log("=== probe 종료 (Database 생성 자체 실패) ===")
+            return 1
+        db_obj = resp.json()
+        db_id = db_obj.get("id")
+        log(f"  생성된 db: id={db_id} title={db_obj.get('title')}")
+
+        # 후보 endpoint 들 (Atlassian 가 비공개로 운영 중인 경로 포함)
+        column_probes = [
+            ("POST", f"/api/v2/databases/{db_id}/columns", {"title": "txt", "type": "text"}),
+            ("POST", f"/api/v2/databases/{db_id}/fields",  {"title": "txt", "type": "text"}),
+            ("POST", f"/api/v2/databases/{db_id}/schema",  {"columns": [{"title": "txt", "type": "text"}]}),
+            ("PATCH", f"/api/v2/databases/{db_id}",        {"columns": [{"title": "txt", "type": "text"}]}),
+            ("PUT", f"/api/v2/databases/{db_id}",          {"title": "dwc-probe", "columns": [{"title": "txt", "type": "text"}]}),
+        ]
+        row_probes = [
+            ("POST", f"/api/v2/databases/{db_id}/rows",      {"values": {"txt": "x"}}),
+            ("POST", f"/api/v2/databases/{db_id}/entries",   {"values": {"txt": "x"}}),
+            ("POST", f"/api/v2/databases/{db_id}/items",     {"values": {"txt": "x"}}),
+            ("POST", f"/api/v2/databases/{db_id}/records",   {"values": {"txt": "x"}}),
+        ]
+        get_probes = [
+            f"/api/v2/databases/{db_id}/columns",
+            f"/api/v2/databases/{db_id}/fields",
+            f"/api/v2/databases/{db_id}/rows",
+            f"/api/v2/databases/{db_id}/entries",
+            f"/api/v2/databases/{db_id}?include-properties=true",
+        ]
+        any_ok = False
+        log("  -- column endpoints --")
+        for method, path, payload in column_probes:
+            r = _request_with_retry(session, method, f"{base}{path}", json=payload)
+            log(f"    {method:5} {path} → {r.status_code if r else 'no resp'}")
+            if r and r.status_code < 400:
+                any_ok = True
+                log(f"      body[:200]={(r.text or '')[:200]}")
+        log("  -- row endpoints --")
+        for method, path, payload in row_probes:
+            r = _request_with_retry(session, method, f"{base}{path}", json=payload)
+            log(f"    {method:5} {path} → {r.status_code if r else 'no resp'}")
+            if r and r.status_code < 400:
+                any_ok = True
+                log(f"      body[:200]={(r.text or '')[:200]}")
+        log("  -- GET probes --")
+        for path in get_probes:
+            r = _request_with_retry(session, "GET", f"{base}{path}")
+            log(f"    GET   {path} → {r.status_code if r else 'no resp'}")
+            if r and r.status_code < 400:
+                log(f"      body[:200]={(r.text or '')[:200]}")
+
+        log(f"  probe 결과: 컬럼/row 입력 endpoint {'발견됨' if any_ok else '없음'}.")
+        # cleanup
+        if not args.probe_keep:
+            r = _request_with_retry(session, "DELETE", f"{base}/api/v2/databases/{db_id}")
+            log(f"  cleanup DELETE → {r.status_code if r else 'no resp'} (db_id={db_id})")
+        else:
+            log(f"  probe-keep: db_id={db_id} 유지")
         log("=== probe 종료 ===")
-        return 0
+        return 0 if any_ok else 3
 
     out_dir = Path("storage_struct")
-    schemas = conn.execute(
-        "SELECT sid, tbl, chosen_mode FROM struct_schemas WHERE status='DEFINED' ORDER BY tbl"
-    ).fetchall()
 
-    pushed = failed = 0
+    # auto: 각 schema 의 chosen_mode 따름. 모드 explicit 이면 그걸로 덮어쓰기.
+    if args.mode == "auto":
+        sql = (
+            "SELECT sid, tbl, COALESCE(chosen_mode,'snapshot') FROM struct_schemas "
+            "WHERE status IN ('DEFINED','UPLOADED') ORDER BY tbl"
+        )
+        schemas = conn.execute(sql).fetchall()
+    else:
+        sql = "SELECT sid, tbl, ? FROM struct_schemas WHERE status IN ('DEFINED','UPLOADED') ORDER BY tbl"
+        schemas = [(sid, tbl, args.mode) for sid, tbl, _ in conn.execute(sql, (args.mode,)).fetchall()]
+    if args.only_tbl:
+        schemas = [s for s in schemas if s[1] == args.only_tbl]
+    if args.limit:
+        schemas = schemas[: args.limit]
+    if not schemas:
+        log("업로드 대상 schema 없음.")
+        conn.close()
+        return 0
+
+    pushed = failed = row_pushed = row_failed = 0
     for sid, tbl, mode in schemas:
-        log(f"=== {tbl} (mode={mode}) ===")
+        log(f"=== {tbl} (mode={mode}, sid={sid}) ===")
+
         if mode == "snapshot":
             sp = out_dir / f"{tbl}.snapshot.xml"
             if not sp.is_file():
+                log(f"  storage 파일 없음: {sp}")
                 continue
-            payload = {
-                "spaceId": space_id,
-                "parentId": args.root_page_id,
-                "title": f"dokuwiki struct: {tbl}",
-                "body": {"representation": "storage", "value": sp.read_text(encoding="utf-8")},
-            }
-            resp = _request_with_retry(session, "POST", f"{base}/api/v2/pages", json=payload)
-            if resp is None or resp.status_code >= 400:
-                # title 충돌 disambig
-                if resp is not None and resp.status_code == 400 and "title" in (resp.text or "").lower():
-                    payload["title"] = f"{payload['title']} ({sid})"
-                    resp = _request_with_retry(session, "POST", f"{base}/api/v2/pages", json=payload)
-            if resp is None or resp.status_code >= 400:
-                log(f"  [FAIL] {tbl}: {resp.status_code if resp else 'no resp'}")
+            page_id = conn.execute(
+                "SELECT snapshot_page_id FROM struct_schemas WHERE sid=?", (sid,)
+            ).fetchone()[0]
+            if page_id:
+                ok = _struct_put_page(
+                    session, base, page_id,
+                    title=f"dokuwiki struct: {tbl}",
+                    storage=sp.read_text(encoding="utf-8"),
+                )
+                if not ok:
+                    log(f"  [FAIL] PUT {tbl}")
+                    failed += 1
+                    continue
+                log(f"  [SNAPSHOT] {tbl} → page {page_id} (updated)")
+            else:
+                page_id = _struct_post_page(
+                    session, base, space_id, args.root_page_id,
+                    title=f"dokuwiki struct: {tbl}",
+                    storage=sp.read_text(encoding="utf-8"),
+                    sid=sid,
+                )
+                if not page_id:
+                    log(f"  [FAIL] POST {tbl}")
+                    failed += 1
+                    continue
+                conn.execute(
+                    "UPDATE struct_schemas SET snapshot_page_id=?, status='UPLOADED', last_checked_at=? WHERE sid=?",
+                    (str(page_id), now_iso(), sid),
+                )
+                conn.commit()
+                log(f"  [SNAPSHOT] {tbl} → page {page_id} (created)")
+            pushed += 1
+            continue
+
+        # properties / native: index page + row child pages
+        index_sp = out_dir / f"{tbl}.index.xml"
+        if not index_sp.is_file():
+            log(f"  index storage 파일 없음: {index_sp}. struct-convert 먼저 실행.")
+            failed += 1
+            continue
+
+        # native: 빈 Confluence Database 객체를 spaceに 생성 (없을 때만)
+        db_id_row = conn.execute(
+            "SELECT confluence_db_id FROM struct_schemas WHERE sid=?", (sid,)
+        ).fetchone()
+        existing_db_id = db_id_row[0] if db_id_row else None
+        if mode == "native" and not existing_db_id and not args.no_native_shell:
+            r = _request_with_retry(
+                session, "POST", f"{base}/api/v2/databases",
+                json={"spaceId": space_id, "parentId": args.root_page_id, "title": f"dwc-struct-{tbl}"},
+            )
+            if r and r.status_code < 400:
+                new_db_id = r.json().get("id")
+                conn.execute(
+                    "UPDATE struct_schemas SET confluence_db_id=? WHERE sid=?",
+                    (str(new_db_id), sid),
+                )
+                conn.commit()
+                existing_db_id = new_db_id
+                log(f"  [NATIVE] Database 쉘 생성 → id={new_db_id}")
+                # rebuild index storage with the new db_id embed
+                _struct_rewrite_index(conn, sid, tbl, mode, out_dir, args.base_url, args.space_key)
+                index_sp = out_dir / f"{tbl}.index.xml"
+            else:
+                log(f"  [WARN] Database 쉘 생성 실패 → fallback properties only")
+
+        # 1) index 페이지 — snapshot_page_id 재사용 (있으면 그것을 부모 페이지로)
+        idx_existing = conn.execute(
+            "SELECT properties_index_page_id, snapshot_page_id FROM struct_schemas WHERE sid=?",
+            (sid,),
+        ).fetchone()
+        idx_page_id = idx_existing[0] or idx_existing[1]
+        idx_storage = index_sp.read_text(encoding="utf-8")
+        idx_title = f"dokuwiki struct: {tbl}"
+        if idx_page_id:
+            ok = _struct_put_page(session, base, idx_page_id, title=idx_title, storage=idx_storage)
+            if not ok:
+                log(f"  [FAIL] index PUT {tbl}")
                 failed += 1
                 continue
-            page_id = resp.json()["id"]
-            conn.execute(
-                "UPDATE struct_schemas SET snapshot_page_id=?, status='UPLOADED', last_checked_at=? WHERE sid=?",
-                (str(page_id), now_iso(), sid),
-            )
-            conn.commit()
-            log(f"  [SNAPSHOT] {tbl} → page {page_id}")
-            pushed += 1
+            log(f"  index updated → page {idx_page_id}")
         else:
-            log(f"  mode={mode} upload 미구현 — TODO. struct-migration.md §5 참고.")
-    log(f"struct-upload 완료: pushed={pushed} failed={failed}")
+            idx_page_id = _struct_post_page(
+                session, base, space_id, args.root_page_id,
+                title=idx_title, storage=idx_storage, sid=sid,
+            )
+            if not idx_page_id:
+                log(f"  [FAIL] index POST {tbl}")
+                failed += 1
+                continue
+            log(f"  index created → page {idx_page_id}")
+        conn.execute(
+            "UPDATE struct_schemas SET properties_index_page_id=?, snapshot_page_id=COALESCE(snapshot_page_id, ?), chosen_mode=?, status='UPLOADED', last_checked_at=? WHERE sid=?",
+            (str(idx_page_id), str(idx_page_id), mode, now_iso(), sid),
+        )
+        conn.commit()
+
+        if args.index_only:
+            pushed += 1
+            log(f"  --index-only: row 페이지 갱신 skip")
+            continue
+
+        # 2) 자식 row 페이지 업로드
+        row_sql = "SELECT pid, payload_json, confluence_page_id FROM struct_rows WHERE sid=? ORDER BY pid"
+        row_params = (sid,)
+        if args.row_limit:
+            row_sql += f" LIMIT {int(args.row_limit)}"
+        rows = conn.execute(row_sql, row_params).fetchall()
+        cols = conn.execute(
+            "SELECT colref, name, dokuwiki_class FROM struct_columns WHERE sid=? ORDER BY sort",
+            (sid,),
+        ).fetchall()
+        import json as _json
+        for pid, payload_json, existing_row_page in rows:
+            row_sp = out_dir / f"{tbl}.row.{pid}.xml"
+            if not row_sp.is_file():
+                continue
+            payload = _json.loads(payload_json)
+            title = _struct_row_title(payload, cols, tbl, pid)
+            storage = row_sp.read_text(encoding="utf-8")
+            if existing_row_page:
+                ok = _struct_put_page(session, base, existing_row_page, title=title, storage=storage)
+                if not ok:
+                    conn.execute(
+                        "UPDATE struct_rows SET status='FAILED', last_error='PUT row' WHERE sid=? AND pid=?",
+                        (sid, pid),
+                    )
+                    row_failed += 1
+                    continue
+                row_page_id = existing_row_page
+            else:
+                row_page_id = _struct_post_page(
+                    session, base, space_id, idx_page_id,
+                    title=title, storage=storage, sid=sid, pid=pid,
+                )
+                if not row_page_id:
+                    conn.execute(
+                        "UPDATE struct_rows SET status='FAILED', last_error='POST row' WHERE sid=? AND pid=?",
+                        (sid, pid),
+                    )
+                    row_failed += 1
+                    continue
+                conn.execute(
+                    "UPDATE struct_rows SET confluence_page_id=?, status='UPLOADED' WHERE sid=? AND pid=?",
+                    (str(row_page_id), sid, pid),
+                )
+                conn.commit()
+            _apply_page_labels(session, base, str(row_page_id), [f"dokuwiki-struct-{tbl}"])
+            row_pushed += 1
+            if row_pushed % 50 == 0:
+                log(f"  ... rows pushed={row_pushed}")
+        pushed += 1
+        conn.commit()
+        log(f"  완료: {tbl} index={idx_page_id} rows={len(rows)} (실패={row_failed})")
+
+    log(f"struct-upload 완료: schemas pushed={pushed} failed={failed} / rows pushed={row_pushed} failed={row_failed}")
+    conn.close()
+    return 0 if failed == 0 and row_failed == 0 else 1
+
+
+def _struct_put_page(session, base, page_id: str, *, title: str, storage: str) -> bool:
+    """기존 페이지를 PUT 으로 갱신 (idempotent). version 자동 증가."""
+    cur_ver = _get_page_version(session, base, page_id)
+    if cur_ver is None:
+        return False
+    payload = {
+        "id": str(page_id),
+        "status": "current",
+        "title": title,
+        "body": {"representation": "storage", "value": storage},
+        "version": {"number": cur_ver + 1},
+    }
+    r = _request_with_retry(session, "PUT", f"{base}/api/v2/pages/{page_id}", json=payload)
+    return bool(r and r.status_code < 400)
+
+
+def _struct_post_page(session, base, space_id: str, parent_id: str, *, title: str, storage: str, sid: int, pid: int | None = None):
+    """새 페이지 POST. title 충돌 시 자동 disambiguate."""
+    payload = {
+        "spaceId": space_id,
+        "parentId": parent_id,
+        "title": title,
+        "body": {"representation": "storage", "value": storage},
+    }
+    r = _request_with_retry(session, "POST", f"{base}/api/v2/pages", json=payload)
+    if r is None or r.status_code >= 400:
+        if r is not None and r.status_code == 400 and "title" in (r.text or "").lower():
+            disambig = f"{title} ({pid})" if pid is not None else f"{title} ({sid})"
+            payload["title"] = disambig
+            r = _request_with_retry(session, "POST", f"{base}/api/v2/pages", json=payload)
+    if r is None or r.status_code >= 400:
+        log(f"    POST page 실패: {r.status_code if r else 'no resp'} body={(r.text if r else '')[:200]}")
+        return None
+    return r.json().get("id")
+
+
+def _struct_build_index_xml(
+    tbl: str, sid: int, mode: str, cols, row_count: int, db_id: str | None,
+    base_url: str, space_key: str = "",
+) -> str:
+    """index 페이지의 storage XML 빌드. db_id 가 있으면 Database webui 링크 + 안내 박스 포함."""
+    import html as _h
+    embed = ""
+    if db_id and base_url:
+        if space_key:
+            href = f"{base_url.rstrip('/')}/spaces/{space_key}/database/{db_id}"
+        else:
+            href = f"{base_url.rstrip('/')}/database/{db_id}"
+        embed = (
+            "<ac:structured-macro ac:name=\"info\"><ac:rich-text-body>"
+            f"<p><strong>Confluence Database</strong>: 이 schema 의 빈 Confluence Database 객체가 같은 공간에 있습니다 "
+            f'(<a href="{href}">dwc-struct-{_h.escape(tbl)}</a>, id={_h.escape(db_id)}). '
+            "Atlassian 의 Confluence Cloud Database API 가 컬럼/row 입력을 지원하면 자동 동기화될 예정. "
+            "현재 데이터는 아래 Page Properties Report 로 표시.</p>"
+            "</ac:rich-text-body></ac:structured-macro>"
+        )
+    col_info = "".join(
+        f"<tr><td>col{cr}</td><td>{_h.escape(nm or '')}</td><td>{cls}</td></tr>"
+        for cr, nm, cls in cols
+    )
+    return (
+        f"<h1>{_h.escape(tbl)}</h1>"
+        f"<p>DokuWiki struct schema → Confluence (mode={mode}). sid={sid}, "
+        f"columns={len(cols)}, rows={row_count}.</p>"
+        f"{embed}"
+        "<h2>Columns</h2>"
+        f"<table><tr><th>colref</th><th>label</th><th>dokuwiki class</th></tr>{col_info}</table>"
+        "<h2>Rows</h2>"
+        "<ac:structured-macro ac:name=\"detailssummary\">"
+        f"<ac:parameter ac:name=\"cql\">label = \"dokuwiki-struct-{tbl}\"</ac:parameter>"
+        "</ac:structured-macro>"
+    )
+
+
+def _struct_rewrite_index(conn, sid: int, tbl: str, mode: str, out_dir: Path, base_url: str = "", space_key: str = ""):
+    cols = conn.execute(
+        "SELECT colref, name, dokuwiki_class FROM struct_columns WHERE sid=? ORDER BY sort",
+        (sid,),
+    ).fetchall()
+    row = conn.execute(
+        "SELECT confluence_db_id, row_count FROM struct_schemas WHERE sid=?", (sid,)
+    ).fetchone()
+    db_id = row[0] if row else None
+    row_count = row[1] if row else 0
+    bu = base_url or db_get_meta(conn, "confluence_base_url") or ""
+    sk = space_key or db_get_meta(conn, "confluence_space_key") or ""
+    (out_dir / f"{tbl}.index.xml").write_text(
+        _struct_build_index_xml(tbl, sid, mode, cols, row_count, db_id, bu, sk),
+        encoding="utf-8",
+    )
+
+
+# 패널의 시작을 알리는 h2 텍스트. Confluence storage 가 HTML 코멘트 마커를
+# strip 하므로 본문에 *실제로 보이는* h2 heading 을 sentinel 로 사용.
+# 패널은 항상 본문 끝에 부착되므로 별도 end marker 불필요 — 시작점부터 EOF 까지가 panel.
+_STRUCT_EMBED_HEADER = "<h2>관련 struct 데이터</h2>"
+
+# DokuWiki struct schema → "row 의 어느 컬럼이 페이지 binding 인지" 매핑.
+# (colref, kind):  kind='wiki' → [[id|label]] 파싱, 'doku_id' → 값이 그대로 doku page id.
+# 본 인스턴스 측정으로 결정 (struct-migration.md §2.3).
+STRUCT_BINDINGS: dict[str, tuple[int, str]] = {
+    "brevet_event":      (23, "wiki"),     # col23: [[:b:2019-s200d-1|동탄 200k]]
+    "brevet_course":     (2,  "doku_id"),  # col2: '2019-s200d-1'  (event id)
+    "brevet_uri_cppage": (1,  "doku_id"),  # col1: '2019-s200d-1'
+    # brevet_place: 자체 page binding 없음 (장소명만 있음) — skip
+}
+
+
+def _struct_binding_target(payload: dict, colref: int, kind: str) -> str | None:
+    v = payload.get(str(colref))
+    if not v or isinstance(v, list):
+        return None
+    s = str(v).strip()
+    if kind == "wiki":
+        m = _WIKI_LINK_RE.match(s)
+        if m:
+            return m.group(1).lstrip(":")
+        return None
+    # doku_id
+    return s.lstrip(":") or None
+
+
+def cmd_struct_embed_on_bound_pages(args: argparse.Namespace) -> int:
+    """각 bound page 의 본문 끝에 'Related struct data' 패널 (해당 row 페이지 목록 + Page Properties Report).
+
+    마커 (<!-- struct-embed:start --> … <!-- struct-embed:end -->) 사이를 교체해 idempotent.
+    """
+    if not args.email or not args.api_token:
+        log("자격증명 필요.")
+        return 2
+    conn = db_connect(args.db)
+    session = _confluence_session(args)
+    if session is None:
+        return 2
+    base = args.base_url.rstrip("/")
+
+    # bound_page (doku_id) → [(tbl, pid, row_page_id, row_title)]
+    import json as _json
+    import html as _h
+    bucket: dict[str, list[tuple[str, int, str, str]]] = {}
+    schema_titles: dict[str, set[str]] = {}
+    for tbl, (col, kind) in STRUCT_BINDINGS.items():
+        sid_row = conn.execute("SELECT sid FROM struct_schemas WHERE tbl=?", (tbl,)).fetchone()
+        if not sid_row:
+            continue
+        sid = sid_row[0]
+        cols = conn.execute(
+            "SELECT colref, name, dokuwiki_class FROM struct_columns WHERE sid=? ORDER BY sort",
+            (sid,),
+        ).fetchall()
+        for pid, payload_json, row_page_id in conn.execute(
+            "SELECT pid, payload_json, confluence_page_id FROM struct_rows "
+            "WHERE sid=? AND status='UPLOADED' AND confluence_page_id IS NOT NULL ORDER BY pid",
+            (sid,),
+        ).fetchall():
+            payload = _json.loads(payload_json)
+            target = _struct_binding_target(payload, col, kind)
+            if not target:
+                continue
+            title = _struct_row_title(payload, cols, tbl, pid)
+            bucket.setdefault(target, []).append((tbl, pid, row_page_id, title))
+            schema_titles.setdefault(target, set()).add(tbl)
+
+    if args.only_doku:
+        bucket = {k: v for k, v in bucket.items() if k == args.only_doku}
+    if not bucket:
+        log("bound page 없음 — STRUCT_BINDINGS 와 데이터 확인.")
+        return 0
+    log(f"대상 bound page: {len(bucket)}개")
+
+    pushed = failed = unresolved = 0
+    for doku_id, rows in sorted(bucket.items()):
+        resolved = _struct_resolve_page(conn, doku_id)
+        if not resolved:
+            log(f"  [SKIP] {doku_id} → Confluence 미존재")
+            unresolved += 1
+            continue
+        page_id, title = resolved
+
+        # current storage body 가져오기
+        r = _request_with_retry(
+            session, "GET", f"{base}/api/v2/pages/{page_id}", params={"body-format": "storage"}
+        )
+        if r is None or r.status_code >= 400:
+            log(f"  [SKIP] {doku_id} GET 실패")
+            failed += 1
+            continue
+        js = r.json()
+        cur_body = (js.get("body") or {}).get("storage", {}).get("value", "") or ""
+        cur_ver = js.get("version", {}).get("number", 1)
+
+        # 임베드 panel 빌드
+        per_schema_items: dict[str, list[str]] = {}
+        for tbl, pid, rpid, rtitle in rows:
+            per_schema_items.setdefault(tbl, []).append(
+                f'<li><ac:link><ri:page ri:content-title="{_h.escape(rtitle, quote=True)}"/>'
+                f'<ac:plain-text-link-body><![CDATA[{rtitle}]]></ac:plain-text-link-body></ac:link></li>'
+            )
+        schema_sections = []
+        for tbl, items in per_schema_items.items():
+            idx_id = conn.execute(
+                "SELECT COALESCE(properties_index_page_id, snapshot_page_id) FROM struct_schemas WHERE tbl=?",
+                (tbl,),
+            ).fetchone()
+            idx_link = ""
+            if idx_id and idx_id[0]:
+                idx_link = (
+                    f' (<ac:link><ri:page ri:content-title="dokuwiki struct: {_h.escape(tbl, quote=True)}"/>'
+                    f'<ac:plain-text-link-body><![CDATA[전체 인덱스]]></ac:plain-text-link-body></ac:link>)'
+                )
+            schema_sections.append(
+                f"<h3>{_h.escape(tbl)} ({len(items)}){idx_link}</h3><ul>{''.join(items)}</ul>"
+            )
+        panel = (
+            f"{_STRUCT_EMBED_HEADER}"
+            "<p>DokuWiki struct plugin 으로 관리되던 데이터가 별도 Confluence 페이지로 마이그레이션되었습니다.</p>"
+            f"{''.join(schema_sections)}"
+        )
+
+        # 기존 panel 이 있으면 (h2 sentinel) 그 위치부터 본문 끝까지 잘라내고 panel 으로 교체.
+        # panel 은 본문 끝에 항상 append 되므로 별도 end marker 불필요.
+        start = cur_body.find(_STRUCT_EMBED_HEADER)
+        if start >= 0:
+            new_body = cur_body[:start] + panel
+        else:
+            new_body = cur_body + panel
+
+        # PUT
+        payload = {
+            "id": str(page_id),
+            "status": "current",
+            "title": title,
+            "body": {"representation": "storage", "value": new_body},
+            "version": {"number": cur_ver + 1},
+        }
+        r = _request_with_retry(session, "PUT", f"{base}/api/v2/pages/{page_id}", json=payload)
+        if r is None or r.status_code >= 400:
+            log(f"  [FAIL] {doku_id}: {r.status_code if r else 'no resp'}")
+            failed += 1
+            continue
+        pushed += 1
+        if pushed % 20 == 0:
+            log(f"  ... bound pages pushed={pushed}")
+
+    log(f"struct-embed 완료: pushed={pushed} failed={failed} unresolved={unresolved}")
     conn.close()
     return 0 if failed == 0 else 1
 
@@ -3335,10 +3917,12 @@ def cmd_struct_upload(args: argparse.Namespace) -> int:
 def cmd_struct_status(args: argparse.Namespace) -> int:
     conn = db_connect(args.db)
     print("==== struct_schemas ====")
-    for sid, tbl, rc, cc, mode, status in conn.execute(
-        "SELECT sid, tbl, row_count, column_count, COALESCE(chosen_mode,'-'), status FROM struct_schemas ORDER BY tbl"
+    for sid, tbl, rc, cc, mode, status, db_id, idx_id in conn.execute(
+        "SELECT sid, tbl, row_count, column_count, COALESCE(chosen_mode,'-'), status, "
+        "COALESCE(confluence_db_id,'-'), COALESCE(properties_index_page_id, snapshot_page_id, '-') "
+        "FROM struct_schemas ORDER BY tbl"
     ).fetchall():
-        print(f"  sid={sid:3} tbl={tbl:25} cols={cc:2} rows={rc:5} mode={mode:8} status={status}")
+        print(f"  sid={sid:3} tbl={tbl:25} cols={cc:2} rows={rc:5} mode={mode:10} status={status:9} db={db_id:>11} idx={idx_id}")
     print()
     print("==== struct_rows status 분포 ====")
     rows = conn.execute(
@@ -3925,6 +4509,180 @@ def _structural_features(html_or_xml: str, is_storage: bool) -> dict[str, int]:
     return f
 
 
+def _split_sentences(text: str) -> list[str]:
+    """문장 단위 분리. 한·영 mixed 를 위해 . ! ? … 줄바꿈 + 한국어 종결 어미 휴리스틱.
+
+    완벽한 분리가 아니어도 양측에 *동일하게 적용* 하면 difflib 가 정렬을 잘 함.
+    """
+    import re as _re
+    # 줄바꿈을 보존하면서 구두점 뒤에 줄바꿈 삽입
+    s = _re.sub(r"([.!?…])\s+", r"\1\n", text)
+    s = _re.sub(r"([다요죠지요네까나]\.\s+|[다요죠].\s+)", r"\1\n", s)
+    sents = [t.strip() for t in s.split("\n") if t.strip()]
+    return [t for t in sents if len(t) >= 4]  # 4글자 미만은 노이즈
+
+
+def _sentence_align(dokuwiki_text: str, confluence_text: str) -> dict:
+    """양측 문장 시퀀스를 difflib 로 정렬. ratio + 누락/추가 카운트 + 첫 손실 문장 3개."""
+    import difflib
+    d = _split_sentences(dokuwiki_text)
+    c = _split_sentences(confluence_text)
+    if not d and not c:
+        return {"sentence_ratio": 1.0, "d_sentences": 0, "c_sentences": 0,
+                "missing": 0, "added": 0, "examples_missing": []}
+    sm = difflib.SequenceMatcher(a=d, b=c, autojunk=False)
+    ratio = sm.ratio()
+    missing = added = 0
+    examples_missing: list[str] = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag in ("delete", "replace"):
+            missing += i2 - i1
+            for s in d[i1:i2][:3 - len(examples_missing)]:
+                if len(examples_missing) < 3:
+                    examples_missing.append(s[:120])
+        if tag in ("insert", "replace"):
+            added += j2 - j1
+    return {
+        "sentence_ratio": round(ratio, 3),
+        "d_sentences": len(d),
+        "c_sentences": len(c),
+        "missing": missing,
+        "added": added,
+        "examples_missing": examples_missing,
+    }
+
+
+_ARTIFACT_RES = [
+    ("number_seq", re.compile(r"\b\d+(?:[\-/.:]\d+){1,}\b")),     # 전화/IP/날짜/버전
+    ("url", re.compile(r"https?://[^\s<>\"']+")),
+    ("email", re.compile(r"\b[\w.+-]+@[\w.-]+\.\w+\b")),
+]
+
+
+def _extract_artifacts(text: str) -> dict[str, set[str]]:
+    """텍스트에서 누락 검출에 민감한 토큰 (전화/날짜/URL/이메일) 집합 추출."""
+    out: dict[str, set[str]] = {}
+    for kind, regex in _ARTIFACT_RES:
+        out[kind] = set(regex.findall(text))
+    return out
+
+
+def _compare_artifacts(d_text: str, c_text: str) -> dict:
+    """artifact set diff. 누락된 항목 카운트 + 샘플 3개."""
+    d_a = _extract_artifacts(d_text)
+    c_a = _extract_artifacts(c_text)
+    out: dict = {}
+    for kind in d_a:
+        missing = sorted(d_a[kind] - c_a[kind])
+        added = sorted(c_a[kind] - d_a[kind])
+        out[kind] = {
+            "d_count": len(d_a[kind]),
+            "c_count": len(c_a[kind]),
+            "missing": len(missing),
+            "added": len(added),
+            "examples_missing": missing[:3],
+        }
+    return out
+
+
+def _extract_code_blocks(html_or_xml: str, is_storage: bool) -> list[str]:
+    """양측에서 코드블록 텍스트 추출 → 비교용 정규화 (whitespace squash)."""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html_or_xml, "html.parser")
+    blocks: list[str] = []
+    if is_storage:
+        for m in soup.find_all("ac:structured-macro"):
+            if m.get("ac:name") == "code":
+                body = m.find("ac:plain-text-body")
+                if body:
+                    blocks.append(body.get_text())
+    else:
+        for pre in soup.find_all("pre"):
+            classes = pre.get("class") or []
+            if any(c in ("code", "file") for c in classes):
+                blocks.append(pre.get_text())
+    import re as _re
+    return [_re.sub(r"\s+", " ", b).strip() for b in blocks if b.strip()]
+
+
+def _compare_code_blocks(d_html: str, c_storage: str) -> dict:
+    d_blocks = _extract_code_blocks(d_html, is_storage=False)
+    c_blocks = _extract_code_blocks(c_storage, is_storage=True)
+    d_hashes = {hashlib.md5(b.encode("utf-8")).hexdigest()[:12] for b in d_blocks}
+    c_hashes = {hashlib.md5(b.encode("utf-8")).hexdigest()[:12] for b in c_blocks}
+    return {
+        "d_code_blocks": len(d_blocks),
+        "c_code_blocks": len(c_blocks),
+        "matched": len(d_hashes & c_hashes),
+        "missing": len(d_hashes - c_hashes),
+        "added": len(c_hashes - d_hashes),
+    }
+
+
+def _link_resolution_rate(storage_xml: str) -> dict:
+    """Confluence storage 의 page link 해소율 — placeholder vs ri:page 비율."""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(storage_xml, "html.parser")
+    resolved = sum(1 for a in soup.find_all("ac:link") if a.find("ri:page"))
+    placeholder = sum(
+        1 for a in soup.find_all("a")
+        if str(a.get("href", "")).startswith("dwc-link:")
+    )
+    total = resolved + placeholder
+    return {
+        "resolved": resolved,
+        "placeholder": placeholder,
+        "rate": round(resolved / total, 3) if total else 1.0,
+    }
+
+
+def _extract_heading_seq(html_or_xml: str) -> list[tuple[int, str]]:
+    """헤딩 (level, text) 시퀀스 추출 — 텍스트는 normalize."""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html_or_xml, "html.parser")
+    out: list[tuple[int, str]] = []
+    for h in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
+        try:
+            lv = int(h.name[1:])
+        except ValueError:
+            continue
+        txt = " ".join(h.get_text(" ", strip=True).split())[:80]
+        if txt:
+            out.append((lv, txt))
+    return out
+
+
+def _compare_heading_seq(d_html: str, c_body: str) -> dict:
+    """LCS 기반 헤딩 시퀀스 비교. 누락/추가 카운트 + ratio."""
+    import difflib
+    d_seq = _extract_heading_seq(d_html)
+    c_seq = _extract_heading_seq(c_body)
+    if not d_seq and not c_seq:
+        return {"d_headings": 0, "c_headings": 0, "lcs_ratio": 1.0,
+                "missing": 0, "added": 0, "examples_missing": []}
+    d_keys = [f"{lv}:{t}" for lv, t in d_seq]
+    c_keys = [f"{lv}:{t}" for lv, t in c_seq]
+    sm = difflib.SequenceMatcher(a=d_keys, b=c_keys, autojunk=False)
+    missing = added = 0
+    examples_missing: list[str] = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag in ("delete", "replace"):
+            missing += i2 - i1
+            for k in d_keys[i1:i2][:3 - len(examples_missing)]:
+                if len(examples_missing) < 3:
+                    examples_missing.append(k)
+        if tag in ("insert", "replace"):
+            added += j2 - j1
+    return {
+        "d_headings": len(d_seq),
+        "c_headings": len(c_seq),
+        "lcs_ratio": round(sm.ratio(), 3),
+        "missing": missing,
+        "added": added,
+        "examples_missing": examples_missing,
+    }
+
+
 def _compare_features(d_feats: dict, c_feats: dict) -> tuple[list[dict], bool]:
     """카테고리별 카운트 차이 → mismatch list + has_critical_diff 반환.
 
@@ -4053,6 +4811,13 @@ def _diff_page(conn, session, base_url, doku_id, body_format="storage"):
     c_feats = _structural_features(confluence_body, is_storage=(body_format == "storage"))
     mismatches, has_crit = _compare_features(d_feats, c_feats)
 
+    # 자동 신호 (스크립트만으로 NG 후보 탐지) — vision 호출 전 사전 검수
+    sentence = _sentence_align(dokuwiki_text, confluence_text)
+    artifacts = _compare_artifacts(dokuwiki_text, confluence_text)
+    codes = _compare_code_blocks(d_raw, confluence_body)
+    headings = _compare_heading_seq(d_raw, confluence_body)
+    link_rate = _link_resolution_rate(confluence_body) if body_format == "storage" else {}
+
     judgement = "OK"
     notes = []
     if len_ratio < 0.5:
@@ -4073,6 +4838,26 @@ def _diff_page(conn, session, base_url, doku_id, body_format="storage"):
     if not dokuwiki_text:
         judgement = "EMPTY_DOKU"
 
+    # 자동 신호 기반 추가 NG 격상
+    if sentence["sentence_ratio"] < 0.7 and sentence["d_sentences"] >= 5:
+        judgement = "SENTENCE_DIVERGED" if judgement == "OK" else judgement
+        notes.append(f"sentence ratio {sentence['sentence_ratio']:.2f} (-{sentence['missing']})")
+    art_missing_total = sum(a["missing"] for a in artifacts.values())
+    if art_missing_total >= 3:
+        notes.append(f"artifact missing {art_missing_total}")
+        if judgement == "OK":
+            judgement = "ARTIFACT_LOSS"
+    if codes["missing"] >= 1 and codes["d_code_blocks"] > 0:
+        notes.append(f"code blocks missing {codes['missing']}/{codes['d_code_blocks']}")
+        if judgement == "OK":
+            judgement = "CODE_DIVERGED"
+    if headings["d_headings"] >= 3 and headings["lcs_ratio"] < 0.7:
+        notes.append(f"heading lcs {headings['lcs_ratio']:.2f}")
+        if judgement == "OK":
+            judgement = "HEADING_DIVERGED"
+    if link_rate and link_rate.get("placeholder", 0) >= 3:
+        notes.append(f"unresolved page links {link_rate['placeholder']}")
+
     return {
         "status": judgement,
         "doku_id": doku_id,
@@ -4083,6 +4868,11 @@ def _diff_page(conn, session, base_url, doku_id, body_format="storage"):
         "len_ratio": round(len_ratio, 3),
         "token_overlap": round(overlap, 3),
         "mismatches": mismatches,
+        "sentence": sentence,
+        "artifacts": artifacts,
+        "code_blocks": codes,
+        "headings": headings,
+        "link_resolution": link_rate,
         "notes": "; ".join(notes),
     }
 
@@ -4862,7 +5652,49 @@ def _verify_compute_metrics(
     row("smiley→emoji", "smiley")
     row("외부링크", "external_link")
 
-    return {"rows": cmp}
+    # 자동 신호 — verify 카드에서 vision 없이 NG 분류
+    auto: dict = {}
+    try:
+        d_text = _extract_visible_text(raw_html or "")
+        c_text = _extract_visible_text(confluence_body or "")
+        auto["sentence"] = _sentence_align(d_text, c_text)
+        auto["artifacts"] = _compare_artifacts(d_text, c_text)
+    except Exception:
+        auto["sentence"] = {}
+        auto["artifacts"] = {}
+    try:
+        auto["code_blocks"] = _compare_code_blocks(raw_html or "", storage_xml or "")
+    except Exception:
+        auto["code_blocks"] = {}
+    try:
+        auto["headings"] = _compare_heading_seq(raw_html or "", confluence_body or storage_xml or "")
+    except Exception:
+        auto["headings"] = {}
+    try:
+        auto["link_resolution"] = _link_resolution_rate(storage_xml or "")
+    except Exception:
+        auto["link_resolution"] = {}
+
+    # auto-NG 추정 태그 (사용자가 라디오로 확인 가능)
+    auto_ng = None
+    sent = auto.get("sentence") or {}
+    if sent.get("sentence_ratio", 1.0) < 0.7 and sent.get("d_sentences", 0) >= 5:
+        auto_ng = "텍스트"
+    arts = auto.get("artifacts") or {}
+    if any(a.get("missing", 0) >= 2 for a in arts.values()):
+        auto_ng = auto_ng or "텍스트"
+    cb = auto.get("code_blocks") or {}
+    if cb.get("missing", 0) >= 1:
+        auto_ng = "매크로"  # 코드 매크로 손실
+    hd = auto.get("headings") or {}
+    if hd.get("d_headings", 0) >= 3 and hd.get("lcs_ratio", 1.0) < 0.7:
+        auto_ng = auto_ng or "텍스트"
+    lr = auto.get("link_resolution") or {}
+    if lr.get("placeholder", 0) >= 3:
+        auto_ng = auto_ng or "링크"
+    auto["auto_ng"] = auto_ng
+
+    return {"rows": cmp, "auto": auto}
 
 
 def _verify_check_attachments(
@@ -5129,12 +5961,9 @@ def _verify_render_iframe_doc(body_html: str) -> str:
 
 
 def _verify_render_metrics_row(metrics: dict) -> str:
-    """양측 카운트 비교 미니 테이블 (헤더 영역)."""
+    """양측 카운트 비교 미니 테이블 + 자동 신호 (sentence/artifact/code/heading/link)."""
     import html as _h
     rows = metrics.get("rows", [])
-    if not rows:
-        return ""
-    # 변화 없는 항목은 압축 표시. 차이 있는 것만 강조.
     cells = []
     for label, d, s, c, ok in rows:
         if d == 0 and s == 0 and (c <= 0):
@@ -5148,9 +5977,83 @@ def _verify_render_metrics_row(metrics: dict) -> str:
             + (f"/v{c_disp}" if c >= 0 else "")
             + "</span>"
         )
-    if not cells:
-        return ""
-    return '<div class="metrics">' + "".join(cells) + "</div>"
+
+    auto = metrics.get("auto", {}) or {}
+    auto_cells = []
+    sent = auto.get("sentence") or {}
+    if sent.get("d_sentences"):
+        r = sent.get("sentence_ratio", 1.0)
+        cls = "metric-ok" if r >= 0.85 else ("metric-warn" if r >= 0.7 else "metric-bad")
+        title = (
+            f"문장 {sent['d_sentences']}→{sent['c_sentences']}, "
+            f"누락 {sent['missing']}, 추가 {sent['added']}"
+        )
+        if sent.get("examples_missing"):
+            title += " | 손실 예: " + " | ".join(sent["examples_missing"])
+        auto_cells.append(
+            f'<span class="metric {cls}" title="{_h.escape(title, quote=True)}">'
+            f'문장 {r:.2f}</span>'
+        )
+
+    arts = auto.get("artifacts") or {}
+    total_missing = sum(a.get("missing", 0) for a in arts.values())
+    if total_missing > 0 or any(a.get("d_count", 0) for a in arts.values()):
+        parts = []
+        for kind, a in arts.items():
+            if a.get("d_count", 0) == 0 and a.get("c_count", 0) == 0:
+                continue
+            parts.append(f"{kind}:{a.get('d_count',0)}→{a.get('c_count',0)} (-{a.get('missing',0)})")
+        title = "; ".join(parts)
+        cls = "metric-bad" if total_missing >= 3 else ("metric-warn" if total_missing > 0 else "metric-ok")
+        auto_cells.append(
+            f'<span class="metric {cls}" title="{_h.escape(title, quote=True)}">'
+            f'artifact -{total_missing}</span>'
+        )
+
+    cb = auto.get("code_blocks") or {}
+    if cb.get("d_code_blocks") or cb.get("c_code_blocks"):
+        m = cb.get("missing", 0)
+        cls = "metric-ok" if m == 0 else "metric-bad"
+        cb_title = f"d={cb.get('d_code_blocks', 0)} c={cb.get('c_code_blocks', 0)} matched={cb.get('matched', 0)}"
+        auto_cells.append(
+            f'<span class="metric {cls}" title="{cb_title}">'
+            f"코드 {cb.get('matched', 0)}/{cb.get('d_code_blocks', 0)}</span>"
+        )
+
+    hd = auto.get("headings") or {}
+    if hd.get("d_headings", 0) >= 2:
+        r = hd.get("lcs_ratio", 1.0)
+        cls = "metric-ok" if r >= 0.85 else ("metric-warn" if r >= 0.7 else "metric-bad")
+        title = f"d_headings={hd['d_headings']} c_headings={hd['c_headings']} 누락={hd['missing']}"
+        if hd.get("examples_missing"):
+            title += " | " + " | ".join(hd["examples_missing"])
+        auto_cells.append(
+            f'<span class="metric {cls}" title="{_h.escape(title, quote=True)}">'
+            f'헤딩 LCS {r:.2f}</span>'
+        )
+
+    lr = auto.get("link_resolution") or {}
+    if lr.get("placeholder", 0) > 0 or lr.get("resolved", 0) > 0:
+        rate = lr.get("rate", 1.0)
+        cls = "metric-ok" if rate >= 0.95 else ("metric-warn" if rate >= 0.8 else "metric-bad")
+        lr_title = f"resolved={lr.get('resolved', 0)} placeholder={lr.get('placeholder', 0)}"
+        auto_cells.append(
+            f'<span class="metric {cls}" title="{lr_title}">'
+            f'링크해소 {rate:.2f}</span>'
+        )
+
+    auto_ng = auto.get("auto_ng")
+    if auto_ng:
+        auto_cells.append(
+            f'<span class="metric metric-bad" title="자동 추정 NG 사유">자동 NG: {_h.escape(auto_ng)}</span>'
+        )
+
+    parts_html = []
+    if cells:
+        parts_html.append('<div class="metrics">' + "".join(cells) + "</div>")
+    if auto_cells:
+        parts_html.append('<div class="metrics metrics-auto">' + "".join(auto_cells) + "</div>")
+    return "".join(parts_html)
 
 
 def _verify_render_html(
@@ -5883,12 +6786,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp_sd.add_argument("--struct-db", help="명시적 struct.sqlite3 경로 (기본: <dokuwiki_src>/meta/struct.sqlite3)")
     sp_sd.set_defaults(func=cmd_struct_discover)
 
-    sp_sc = sub.add_parser("struct-convert", help="struct rows → storage XML (snapshot/properties)")
+    sp_sc = sub.add_parser("struct-convert", help="struct rows → storage XML (snapshot/properties/native)")
     sp_sc.add_argument(
         "--mode", default="snapshot",
         choices=("snapshot", "properties", "native"),
-        help="변환 모드 (snapshot=1 페이지에 큰 표; properties=row 당 자식 페이지; native=Database API)",
+        help="변환 모드 (snapshot=1 페이지 큰 표; properties=row 당 자식 페이지; native=동일 + Database 쉘 임베드)",
     )
+    sp_sc.add_argument("--reconvert", action="store_true", help="UPLOADED 상태도 다시 변환")
     sp_sc.set_defaults(func=cmd_struct_convert)
 
     sp_su = sub.add_parser("struct-upload", help="struct-convert 결과를 Confluence 에 업로드")
@@ -5901,10 +6805,39 @@ def build_parser() -> argparse.ArgumentParser:
     sp_su.add_argument("--space-key", default=env_default("CONFLUENCE_SPACE_KEY"))
     sp_su.add_argument("--root-page-id", default=env_default("CONFLUENCE_ROOT_PAGE_ID"))
     sp_su.add_argument("--probe", action="store_true", help="Confluence Database API 가용성만 측정")
+    sp_su.add_argument("--probe-keep", action="store_true", help="probe 후 임시 Database 삭제 안 함")
+    sp_su.add_argument(
+        "--mode", default="auto",
+        choices=("auto", "native", "properties", "snapshot"),
+        help="업로드 모드. auto=각 schema 의 chosen_mode 사용. native 시도 후 미지원 컬럼이면 properties 폴백",
+    )
+    sp_su.add_argument(
+        "--fallback", default="auto",
+        choices=("auto", "properties", "snapshot", "fail"),
+        help="native 모드에서 미지원 컬럼/row endpoint 일 때 격하 정책",
+    )
+    sp_su.add_argument("--limit", type=int, help="schema 처음 N개만 처리")
+    sp_su.add_argument("--no-native-shell", action="store_true", help="native 모드에서 Confluence Database 빈 쉘 생성을 생략")
+    sp_su.add_argument("--only-tbl", help="특정 schema tbl 만 처리")
+    sp_su.add_argument("--row-limit", type=int, help="schema 별 row 처음 N개만 처리 (디버깅)")
+    sp_su.add_argument("--index-only", action="store_true", help="인덱스 페이지만 PUT (row 페이지 갱신 skip)")
     sp_su.set_defaults(func=cmd_struct_upload)
 
     sp_ss = sub.add_parser("struct-status", help="struct 진행 상황 요약")
     sp_ss.set_defaults(func=cmd_struct_status)
+
+    sp_se = sub.add_parser(
+        "struct-embed-on-bound-pages",
+        help="struct row 의 bound 페이지에 '관련 struct 데이터' 패널 임베드",
+    )
+    sp_se.add_argument(
+        "--base-url",
+        default=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+    )
+    sp_se.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
+    sp_se.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
+    sp_se.add_argument("--only-doku", help="특정 doku_id 한 페이지만 처리")
+    sp_se.set_defaults(func=cmd_struct_embed_on_bound_pages)
 
     sp_rop = sub.add_parser(
         "rewrite-oversized-pages",

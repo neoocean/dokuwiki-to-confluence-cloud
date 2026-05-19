@@ -128,11 +128,13 @@ python run.py history-render --base-url http://127.0.0.1:18080 --delay 0.05
 python run.py history-convert                                         # storage XML + 헤더 박스
 python run.py history-upload [--users-map users.json] [--limit N]    # 시간순 PUT replay
 
-# struct 데이터 (4 schema / 1,213 row)
+# struct 데이터 (4 schema / 1,213 row → native 모드 적용)
 python run.py struct-discover                                         # sqlite 인덱싱
-python run.py struct-upload --probe                                   # Database API 가용성
-python run.py struct-convert --mode snapshot                          # 또는 properties / native
-python run.py struct-upload                                           # 라이브
+python run.py struct-upload --probe                                   # Database API 가용성 (재시도 가능)
+python run.py struct-convert --mode native --reconvert                # row + 인덱스 storage XML
+python run.py struct-upload --mode native                             # 빈 Database 쉘 + 인덱스 PUT + row 자식 페이지 + 라벨
+python run.py struct-embed-on-bound-pages                             # bound 페이지에 "관련 struct 데이터" 패널
+python run.py struct-status                                           # 진행 요약
 
 # 사용자 시각 검수 (docs/visual-audit.md Phase 1 + Phase 2)
 python run.py verify build --sample 200                               # 상위 200, 기본 (의존성 없음)

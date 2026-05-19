@@ -1,13 +1,24 @@
 # DokuWiki struct → Confluence 데이터베이스 이전 시나리오
 
-**상태 (2026-05-19): snapshot 모드 라이브 적용 완료.** 4 활성 schema
+**상태 (2026-05-19): native 모드 라이브 적용 완료.** 4 활성 schema
 (brevet_course 744 / brevet_event 106 / brevet_place 98 /
-brevet_uri_cppage 265 = 1,213 rows) → 각 1 페이지의 큰 table 형태로
-업로드 (test schema 는 빈 schema 라 SKIPPED). 구현 (CL 52882):
-`cmd_struct_convert --mode {snapshot|properties|native}` +
-`cmd_struct_upload --probe`. snapshot 모드는 end-to-end 동작, properties
-/ native 모드는 stub (본 인스턴스에서 추가 필요 없음).
-`docs/migration-result.md §2.1` 참고.
+brevet_uri_cppage 265 = 1,213 rows) → 각 schema 별로 (a) 빈 Confluence
+Database 객체 1개 (dwc-struct-{tbl}) + (b) 인덱스 페이지 1개 (
+Database 링크 + 컬럼 메타 + Page Properties Report) + (c) row 별 자식
+페이지 + (d) bound 페이지에 "관련 struct 데이터" 패널 임베드. test
+schema 는 빈 schema 라 SKIPPED.
+
+**API 한계 (2026-05-19 probe 결과)**: Confluence Cloud v2 REST API 는
+`POST/GET/DELETE /api/v2/databases` 만 공개 — 컬럼 정의 / row 입력
+endpoint 는 *존재하지 않음*. 따라서 데이터는 Page Properties + Page
+Properties Report 매크로 조합으로 옮기고, 같은 schema 의 빈 Database
+객체를 사이드카로 만들어 인덱스 페이지에서 링크. Atlassian 이
+컬럼/row API 를 추가하면 그때 데이터를 Database 객체로 자동 이관 가능
+(state.db.struct_schemas.confluence_db_id 가 이미 채워져 있음).
+
+구현 (CL 53122+): `cmd_struct_convert --mode {snapshot|properties|native}`,
+`cmd_struct_upload --mode {auto|native|properties|snapshot} --probe`,
+`cmd_struct_embed_on_bound_pages`. `docs/migration-result.md §2.1` 참고.
 
 ---
 
@@ -82,20 +93,31 @@ reference* 가 되어 메인 마이그레이션의 Confluence 페이지를 가�
 
 ## 3. Confluence 측 옵션
 
-### 3.1 A. Confluence Native Database (2024년 도입, 최우선)
+### 3.1 A. Confluence Native Database (2024년 도입, 빈 쉘만 자동화 가능)
 
-Confluence Cloud 가 native database content type 을 지원한다 (atlassian-
-documents-database). 페이지처럼 트리 안에 두는 컨텐츠 객체이고, 컬럼
-타입을 정의하면 그 타입대로 입력/표시/필터/정렬이 된다.
+Confluence Cloud 가 native database content type 을 지원하지만, 2026-05-19
+시점에서 공개 API 는 `POST/GET/DELETE /api/v2/databases` 뿐 — 컬럼 정의/row
+입력 endpoint 가 *공개되어 있지 않다*. `struct-upload --probe` 결과:
 
-- API 진입점: `/wiki/api/v2/databases` (생성/조회), `/wiki/api/v2/databases/{id}/rows` (row 입력)
-- 컬럼 타입: Text, Number, Date, Person, Status, URL, Tag, Confluence Page Link, Database Reference, Files 등 — DokuWiki struct 의 대부분 클래스에 대응.
-- Storage format 에서 임베드: `<ac:link><ri:database ri:database-id="<id>"/></ac:link>` (페이지 본문 안에서 참조 가능).
+```
+POST  /api/v2/databases/{id}/columns  → 500 (6회 backoff 후 timeout)
+POST  /api/v2/databases/{id}/fields   → 500
+POST  /api/v2/databases/{id}/schema   → 500
+PATCH /api/v2/databases/{id}          → 500
+POST  /api/v2/databases/{id}/rows     → 500
+POST  /api/v2/databases/{id}/entries  → 500
+GET   /api/v2/databases/{id}/columns  → 500
+```
 
-**리스크**: 2024-2026 사이 API 가 변동성 있게 진화 중. 실제 마이그레이션
-실행 시점에 (a) 컬럼 정의 API, (b) row 입력 API, (c) Database Reference 가
-프로그래밍적으로 설정 가능한지 *재확인* 필요. 미지원 항목이 있으면 자동
-B 로 폴백.
+Storage format 에서 `<ac:link><ri:database ri:database-id="<id>"/></ac:link>`
+임베드도 거부 (PUT 500). `<ac:structured-macro ac:name="view-database">` 도
+unknown-macro 로 렌더링됨 — 즉 storage 측 데이터베이스 임베드 기능이 없음.
+
+**채택 동작**: native 모드는 *각 schema 별로 빈 Confluence Database 객체를
+같은 공간에 자동 생성* + 인덱스 페이지에 그 webui URL 을 plain `<a>` 로
+링크. 데이터는 B 모드 (Page Properties + Report) 로 옮김.
+`struct_schemas.confluence_db_id` 에 id 가 저장되어, Atlassian 이 컬럼/row
+API 를 추가하면 동일 코드 경로로 자동 전환 가능.
 
 ### 3.2 B. Page Properties + Page Properties Report (전통 매크로, 폴백)
 
