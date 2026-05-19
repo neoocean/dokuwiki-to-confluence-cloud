@@ -109,6 +109,7 @@ python run.py dev down --purge
 |  | `rewrite-oversized-pages` | 본문 거부 페이지 → skeleton + storage zip 첨부 (C 모드) |
 | history (37k 리비전) | `history-discover` / `history-render` / `history-convert` / `history-upload` / `history-status` | attic 인덱싱 → ?rev= 캐시 → storage XML + 헤더 박스 → 시간순 PUT replay |
 | struct (1,213 row) | `struct-discover` / `struct-convert` / `struct-upload` / `struct-status` | sqlite 인덱싱 → snapshot/properties/native 변환 → 라이브 |
+| 시각 검수 | `verify build` / `verify import` / `verify status` | 우선순위 큐 + DOM side-by-side HTML 갤러리 + decisions JSON import (`docs/visual-audit.md`) |
 
 ## 문서 구조
 
@@ -126,6 +127,7 @@ docs/
   oversized-pages.md       — 본문 너무 큰 페이지 6모드 (C 적용됨)
   history-migration.md     — 과거 리비전 이전 (B+A+F 채택, 구현 완료, 진행 중)
   struct-migration.md      — struct 스키마 → Confluence (snapshot 라이브 적용)
+  visual-audit.md          — 사용자 시각 검수 자동화 (Phase 1 = DOM 큐, 구현 완료)
   MEMORY.md                — 미래 세션이 먼저 읽을 컨텍스트 인덱스
 ```
 
@@ -138,6 +140,7 @@ docs/
 | **struct 데이터 → Confluence 페이지** | ✅ snapshot 모드 라이브 (4 schema, 1,213 rows) | `docs/struct-migration.md` (properties/native 모드는 stub) |
 | **과거 리비전 이전 (~37k)** | ✅ 50% 라이브 (18,729 rev) — 큰 페이지의 뒤쪽 rev 는 본문 한도로 영구 거부 | `docs/history-migration.md` + `docs/migration-result.md` Day 3 |
 | **공간 비-마이그레이션 페이지 정리** | ✅ 1,465 휴지통 (30일 회복) | `docs/migration-result.md §2.5` |
+| **시각 검수 자동화** | ✅ Phase 1 구현 (DOM 큐 + JSON decisions); Phase 2 (Playwright 스크린샷) 는 옵션으로 보관 | `docs/visual-audit.md` |
 
 ## 개발
 

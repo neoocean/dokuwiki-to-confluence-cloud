@@ -361,6 +361,16 @@ UPLOADED / 10,613 첨부 / 5,180 링크 resolved), audit 3회 진행, 그
 과정에서 발견된 4 변환기 버그 + fix, outstanding 항목 (큰 일지 페이지
 1건, OVERSIZED 9건). 향후 재실행/유지보수 시 우선 참고.
 
+## 10d. 사용자 시각 검수 자동화 (별도 트랙)
+
+라이브 업로드 결과를 *사람 눈으로* 확인하는 작업을 자동화/반자동화하는
+시나리오는 [`docs/visual-audit.md`](visual-audit.md). DOM 기반
+side-by-side 검수 큐 (A) + 헤드리스 스크린샷 (B) 의 하이브리드 권장,
+`verify build/import/status` 서브커맨드 + `verify_decisions` 테이블,
+state.db 의 `audit`/매크로/wrap/oversized/history 정보로 우선순위 큐
+생성. Phase 1 (A 만) → Phase 2 (B 추가) → Phase 3 (Flask serve) 단계
+적용.
+
 ## 11. 실제 마이그레이션 런북
 
 Confluence 키 도착 후 라이브 업로드를 안전하게 수행하는 단계별 절차와

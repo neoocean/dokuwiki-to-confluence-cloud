@@ -133,6 +133,13 @@ python run.py struct-discover                                         # sqlite �
 python run.py struct-upload --probe                                   # Database API 가용성
 python run.py struct-convert --mode snapshot                          # 또는 properties / native
 python run.py struct-upload                                           # 라이브
+
+# 사용자 시각 검수 (docs/visual-audit.md Phase 1)
+python run.py verify build --sample 200                               # 상위 200 페이지 갤러리
+python run.py verify build --with-confluence-view                     # Confluence 실제 렌더도 받기
+# 검수자가 verify-gallery.html 열고 OK/NG/DEFER 결정 → JSON 다운로드
+python run.py verify import verify_decisions.json                      # state.db 반영
+python run.py verify status -v                                         # NG/stale 페이지 목록
 ```
 
 ## 9. 롤백 / 실패 대응

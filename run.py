@@ -4552,6 +4552,607 @@ def cmd_dev(args: argparse.Namespace) -> int:
 
 # ---------- 보조: status ----------
 
+# ---------- verify (시각 검수 큐, docs/visual-audit.md) ----------
+
+VERIFY_DECISIONS_DDL = """
+CREATE TABLE IF NOT EXISTS verify_decisions (
+    doku_id TEXT PRIMARY KEY,
+    decision TEXT NOT NULL,
+    notes TEXT,
+    reviewer TEXT,
+    reviewed_at TEXT,
+    source_hash TEXT,
+    visual_score REAL,
+    flags TEXT
+);
+CREATE INDEX IF NOT EXISTS verify_decisions_decision_idx
+    ON verify_decisions(decision);
+"""
+
+
+def _ensure_verify_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(VERIFY_DECISIONS_DDL)
+    conn.commit()
+
+
+def _verify_macro_counts(storage_xml: str) -> dict[str, int]:
+    """매크로 종류별 개수. 정밀 파싱 대신 substring count.
+    storage XML 1KB 미만 평균 페이지에서 충분히 정확."""
+    if not storage_xml:
+        return {}
+    out: dict[str, int] = {}
+    for name in (
+        "info", "tip", "note", "warning", "panel", "code",
+        "anchor", "details", "detailssummary", "expand",
+    ):
+        out[name] = storage_xml.count(f'ac:name="{name}"')
+    out["image"] = storage_xml.count("<ac:image")
+    out["task_list"] = storage_xml.count("<ac:task-list")
+    out["page_link"] = storage_xml.count("<ri:page")
+    out["attachment_link"] = storage_xml.count("<ri:attachment")
+    return out
+
+
+def _verify_score_page(
+    row: tuple,
+    storage_xml: str,
+    is_oversized_body: bool,
+    has_oversized_attachment: bool,
+    history_ratio: float | None,
+    is_struct_snapshot: bool,
+    random_seed: int,
+) -> tuple[float, list[str]]:
+    """페이지 한 개의 우선순위 점수 + 플래그 라벨 리스트."""
+    macros = _verify_macro_counts(storage_xml)
+    score = 0.0
+    flags: list[str] = []
+
+    macro_callouts = sum(macros.get(n, 0) for n in
+                         ("info", "tip", "note", "warning", "panel"))
+    if macro_callouts >= 5:
+        score += 5
+        flags.append(f"macro:{macro_callouts}")
+    elif macro_callouts >= 1:
+        score += 2
+        flags.append(f"macro:{macro_callouts}")
+
+    if macros.get("image", 0) >= 3:
+        score += 3
+        flags.append(f"image:{macros['image']}")
+    elif macros.get("image", 0) >= 1:
+        score += 1
+        flags.append(f"image:{macros['image']}")
+
+    if is_oversized_body:
+        score += 5
+        flags.append("oversized-body")
+
+    if has_oversized_attachment:
+        score += 5
+        flags.append("oversized-attach")
+
+    if history_ratio is not None and 0.0 < history_ratio < 0.5:
+        score += 3
+        flags.append(f"history:{int(history_ratio*100)}%")
+
+    if is_struct_snapshot:
+        score += 5
+        flags.append("struct-snapshot")
+
+    body_len = len(storage_xml or "")
+    if body_len >= 5000:
+        score += 1
+        flags.append(f"body:{body_len//1024}KB")
+
+    # 안정적 무작위 순서 — 동점일 때 결정적 셔플
+    score += (random_seed % 1000) / 100000.0
+
+    return score, flags
+
+
+def _verify_build_queue(
+    conn: sqlite3.Connection,
+    sample: int,
+    strategy: str,
+    resume: bool,
+) -> list[dict]:
+    """우선순위 큐 생성. 각 항목은 dict(doku_id, title, score, flags, ...)."""
+    import random as _random
+
+    rng = _random.Random(0xD0CC)
+
+    rows = conn.execute(
+        "SELECT doku_id, title, storage_path, raw_xhtml_path, "
+        "       content_hash, confluence_page_id, namespace "
+        "  FROM pages "
+        " WHERE status='UPLOADED' AND confluence_page_id IS NOT NULL "
+        " ORDER BY doku_id"
+    ).fetchall()
+
+    # large_body_fallback / struct snapshot 정보 사전 수집
+    oversized_body_ids = {
+        k.split(":", 1)[1] for (k,) in conn.execute(
+            "SELECT key FROM meta WHERE key LIKE 'large_body_fallback:%'"
+        ).fetchall()
+    }
+    oversized_attach_pages = {
+        d for (d,) in conn.execute(
+            "SELECT DISTINCT page_doku_id FROM attachments "
+            " WHERE status='OVERSIZED'"
+        ).fetchall()
+    }
+    struct_snapshot_ids: set[str] = set()
+    try:
+        struct_snapshot_ids = {
+            d for (d,) in conn.execute(
+                "SELECT bound_doku_id FROM struct_rows "
+                " WHERE bound_doku_id IS NOT NULL"
+            ).fetchall()
+        }
+    except sqlite3.OperationalError:
+        pass
+
+    # history 보존율 (rev 단위)
+    history_ratio: dict[str, float] = {}
+    try:
+        for d, total in conn.execute(
+            "SELECT doku_id, total_revs FROM history_meta"
+        ).fetchall():
+            if not total:
+                continue
+            uploaded = conn.execute(
+                "SELECT COUNT(*) FROM revisions "
+                " WHERE doku_id=? AND status='UPLOADED'",
+                (d,),
+            ).fetchone()[0]
+            history_ratio[d] = uploaded / total
+    except sqlite3.OperationalError:
+        pass
+
+    # 이미 검수된 페이지 (resume 모드)
+    resolved_ok: set[str] = set()
+    if resume:
+        for d, src_hash in conn.execute(
+            "SELECT doku_id, source_hash FROM verify_decisions "
+            " WHERE decision='OK'"
+        ).fetchall():
+            for r in rows:
+                if r[0] == d and (r[4] or "") == (src_hash or ""):
+                    resolved_ok.add(d)
+                    break
+
+    queue: list[dict] = []
+    for doku_id, title, storage_path, raw_path, content_hash, page_id, ns in rows:
+        if resume and doku_id in resolved_ok:
+            continue
+        storage_xml = ""
+        if storage_path and Path(storage_path).is_file():
+            try:
+                storage_xml = Path(storage_path).read_text(encoding="utf-8")
+            except OSError:
+                storage_xml = ""
+        score, flags = _verify_score_page(
+            (doku_id, title, content_hash, page_id, ns),
+            storage_xml,
+            is_oversized_body=(doku_id in oversized_body_ids),
+            has_oversized_attachment=(doku_id in oversized_attach_pages),
+            history_ratio=history_ratio.get(doku_id),
+            is_struct_snapshot=(doku_id in struct_snapshot_ids),
+            random_seed=rng.randint(0, 99999),
+        )
+        queue.append({
+            "doku_id": doku_id,
+            "title": title or doku_id,
+            "namespace": ns or "",
+            "score": round(score, 3),
+            "flags": flags,
+            "content_hash": content_hash or "",
+            "confluence_page_id": page_id or "",
+            "storage_path": storage_path or "",
+            "raw_xhtml_path": raw_path or "",
+        })
+
+    if strategy == "critical-only":
+        queue = [q for q in queue if q["score"] >= 5]
+
+    queue.sort(key=lambda q: q["score"], reverse=True)
+
+    if strategy != "all":
+        queue = queue[: max(sample, 0)]
+
+    return queue
+
+
+def _verify_fetch_confluence_view(
+    session, base: str, page_id: str
+) -> str | None:
+    """Confluence v2 GET /pages/{id}?body-format=view 의 body.view.value."""
+    try:
+        url = f"{base.rstrip('/')}/api/v2/pages/{page_id}?body-format=view"
+        resp = _request_with_retry(session, "GET", url, timeout=30)
+        if resp is None or resp.status_code != 200:
+            return None
+        data = resp.json()
+        return ((data.get("body") or {}).get("view") or {}).get("value")
+    except Exception:
+        return None
+
+
+def _verify_render_html(
+    queue: list[dict],
+    confluence_bodies: dict[str, str | None],
+    base_view_url: str | None,
+    reviewer: str,
+) -> str:
+    """우선순위 큐를 받아 단일 정적 HTML 갤러리 생성."""
+    import html as _h
+    import json as _json
+
+    total = len(queue)
+
+    cards: list[str] = []
+    for idx, q in enumerate(queue, 1):
+        raw_path = q.get("raw_xhtml_path") or ""
+        storage_path = q.get("storage_path") or ""
+        raw_html = ""
+        storage_xml = ""
+        if raw_path and Path(raw_path).is_file():
+            try:
+                raw_html = Path(raw_path).read_text(encoding="utf-8")
+            except OSError:
+                pass
+        if storage_path and Path(storage_path).is_file():
+            try:
+                storage_xml = Path(storage_path).read_text(encoding="utf-8")
+            except OSError:
+                pass
+        confluence_body = confluence_bodies.get(q["doku_id"])
+
+        doku_id = q["doku_id"]
+        page_id = q["confluence_page_id"]
+        flags = ", ".join(q["flags"]) if q["flags"] else "—"
+        score = q["score"]
+        title = q["title"]
+        deeplink = (
+            f"{base_view_url.rstrip('/')}/pages/{page_id}"
+            if (base_view_url and page_id) else ""
+        )
+
+        right_pane = (
+            f'<div class="body confluence-view">{confluence_body}</div>'
+            if confluence_body
+            else (
+                '<div class="body storage-fallback"><em>Confluence body 조회 실패 '
+                f'또는 자격증명 없음 — 우리 storage XML 추정 렌더:</em>'
+                f'<div>{storage_xml}</div></div>'
+            )
+        )
+        right_label = (
+            "Confluence 실제 렌더 (body-format=view)"
+            if confluence_body else "우리 storage XML (fallback)"
+        )
+
+        cards.append(f"""
+<section class="card" id="card-{idx}" data-doku="{_h.escape(doku_id)}">
+  <header>
+    <span class="idx">[{idx} / {total}]</span>
+    <code class="doku-id">{_h.escape(doku_id)}</code>
+    <span class="title">{_h.escape(title)}</span>
+    <span class="score">score {score}</span>
+    <span class="flags">{_h.escape(flags)}</span>
+    {f'<a class="link" href="{_h.escape(deeplink)}" target="_blank">Confluence 열기 →</a>' if deeplink else ''}
+  </header>
+  <div class="grid">
+    <div class="col raw">
+      <h3>DokuWiki raw</h3>
+      <div class="body">{raw_html}</div>
+    </div>
+    <div class="col conf">
+      <h3>{right_label}</h3>
+      {right_pane}
+    </div>
+  </div>
+  <footer>
+    <label><input type="radio" name="d-{idx}" value="OK"> OK</label>
+    <label><input type="radio" name="d-{idx}" value="NG"> NG</label>
+    <label><input type="radio" name="d-{idx}" value="DEFER"> 보류</label>
+    <input type="text" class="notes" placeholder="메모 (선택)" maxlength="500">
+  </footer>
+</section>""")
+
+    queue_json = _json.dumps(
+        [{"doku_id": q["doku_id"], "content_hash": q["content_hash"]} for q in queue],
+        ensure_ascii=False,
+    )
+
+    js = """
+<script>
+const QUEUE = __QUEUE_JSON__;
+const REVIEWER = "__REVIEWER__";
+
+function gatherDecisions() {
+  const out = [];
+  document.querySelectorAll('section.card').forEach((card, i) => {
+    const checked = card.querySelector('input[type=radio]:checked');
+    if (!checked) return;
+    const notes = card.querySelector('input.notes').value || '';
+    out.push({
+      doku_id: QUEUE[i].doku_id,
+      decision: checked.value,
+      notes: notes,
+      source_hash: QUEUE[i].content_hash,
+      reviewer: REVIEWER,
+      reviewed_at: new Date().toISOString(),
+    });
+  });
+  return out;
+}
+
+function updateBadge() {
+  const decisions = gatherDecisions();
+  const ok = decisions.filter(d => d.decision === 'OK').length;
+  const ng = decisions.filter(d => d.decision === 'NG').length;
+  const df = decisions.filter(d => d.decision === 'DEFER').length;
+  const reviewed = decisions.length;
+  document.getElementById('progress').textContent =
+    reviewed + ' / ' + QUEUE.length + ' reviewed (OK ' + ok +
+    ' / NG ' + ng + ' / DEFER ' + df + ')';
+}
+
+document.addEventListener('change', updateBadge);
+document.addEventListener('input', updateBadge);
+
+document.getElementById('download').addEventListener('click', () => {
+  const decisions = gatherDecisions();
+  const blob = new Blob([JSON.stringify(decisions, null, 2)],
+                       {type: 'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'verify_decisions.json';
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+updateBadge();
+</script>
+""".replace("__QUEUE_JSON__", queue_json).replace("__REVIEWER__", reviewer)
+
+    css = """
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+         margin: 0; padding: 0; background: #f5f5f7; color: #1d1d1f; }
+  .topbar { position: sticky; top: 0; background: #fff; padding: .8em 1.2em;
+            border-bottom: 1px solid #d2d2d7; z-index: 10;
+            display: flex; gap: 1em; align-items: center; }
+  .topbar h1 { margin: 0; font-size: 1em; }
+  #progress { font-weight: 600; }
+  #download { padding: .4em 1em; border: 1px solid #007aff; background: #007aff;
+              color: #fff; border-radius: 6px; cursor: pointer; }
+  section.card { background: #fff; margin: 1em; padding: 1em; border-radius: 8px;
+                 box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+  section.card header { display: flex; gap: .8em; align-items: center;
+                        flex-wrap: wrap; margin-bottom: .8em; }
+  .idx { color: #6e6e73; font-size: .85em; min-width: 5em; }
+  .doku-id { background: #f0f0f3; padding: .15em .4em; border-radius: 4px;
+             font-size: .9em; }
+  .title { font-weight: 600; }
+  .score { color: #6e6e73; font-size: .85em; }
+  .flags { color: #007aff; font-size: .85em; }
+  a.link { margin-left: auto; color: #007aff; text-decoration: none; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1em; }
+  .col { background: #fafafa; padding: .8em; border-radius: 6px;
+         max-height: 60vh; overflow: auto; }
+  .col h3 { margin-top: 0; font-size: .85em; color: #6e6e73; }
+  .body { font-size: .9em; line-height: 1.5; }
+  footer { margin-top: .8em; display: flex; gap: 1em; align-items: center; }
+  footer label { font-size: .9em; }
+  footer .notes { flex: 1; padding: .3em .5em; border: 1px solid #d2d2d7;
+                  border-radius: 4px; }
+  ac\\:structured-macro { display: block; border-left: 4px solid #007aff;
+                           background: #f0f6ff; padding: .5em .8em; margin: .4em 0; }
+  ac\\:structured-macro[ac\\:name="info"] { border-color: #007aff; background: #e8f3ff; }
+  ac\\:structured-macro[ac\\:name="tip"]  { border-color: #34c759; background: #ecf8ec; }
+  ac\\:structured-macro[ac\\:name="note"] { border-color: #ff9500; background: #fff5e6; }
+  ac\\:structured-macro[ac\\:name="warning"] { border-color: #ff3b30; background: #fde8e6; }
+</style>
+"""
+
+    head = (
+        '<!doctype html><html lang="ko"><head><meta charset="utf-8">'
+        f'<title>verify — {total} pages</title>{css}</head><body>'
+    )
+    topbar = (
+        '<div class="topbar">'
+        f'<h1>verify ({total} 페이지)</h1>'
+        '<span id="progress">0 / ? reviewed</span>'
+        '<button id="download">JSON 다운로드</button>'
+        f'<span style="color:#6e6e73;font-size:.85em">reviewer: {_h.escape(reviewer)}</span>'
+        '</div>'
+    )
+    return head + topbar + "".join(cards) + js + "</body></html>"
+
+
+def cmd_verify_build(args: argparse.Namespace) -> int:
+    conn = db_connect(args.db)
+    _ensure_verify_schema(conn)
+
+    queue = _verify_build_queue(
+        conn,
+        sample=args.sample,
+        strategy=args.strategy,
+        resume=args.resume,
+    )
+    if not queue:
+        log("verify 큐가 비었습니다 (UPLOADED 페이지 0 또는 모두 검수됨).")
+        conn.close()
+        return 1
+
+    log(f"verify 큐: {len(queue)} 페이지 (strategy={args.strategy}, "
+        f"sample={args.sample}, resume={args.resume})")
+
+    confluence_bodies: dict[str, str | None] = {}
+    base_view_url: str | None = None
+    if args.with_confluence_view:
+        if not args.email or not args.api_token:
+            log("--with-confluence-view 는 자격증명 필요. "
+                "fallback 으로 storage XML 표시.")
+        else:
+            session = _confluence_session(args)
+            if session is None:
+                log("Confluence 세션 생성 실패. storage XML fallback.")
+            else:
+                base = args.base_url.rstrip("/")
+                base_view_url = base
+                log(f"Confluence body-format=view fetch 시작 ({len(queue)} 페이지)")
+                for i, q in enumerate(queue, 1):
+                    page_id = q["confluence_page_id"]
+                    if not page_id:
+                        continue
+                    body = _verify_fetch_confluence_view(session, base, page_id)
+                    confluence_bodies[q["doku_id"]] = body
+                    if i % 20 == 0:
+                        log(f"  fetched {i}/{len(queue)}")
+
+    reviewer = args.reviewer or args.email or "anonymous"
+    html = _verify_render_html(queue, confluence_bodies, base_view_url, reviewer)
+
+    out_path = Path(args.output) if args.output else Path("verify-gallery.html")
+    out_path.write_text(html, encoding="utf-8")
+    log(f"verify 갤러리 → {out_path}")
+    log(f"  열어 검수 → 'JSON 다운로드' → "
+        f"`python run.py verify import <파일>` 으로 반영")
+
+    conn.close()
+    return 0
+
+
+def cmd_verify_import(args: argparse.Namespace) -> int:
+    import json as _json
+
+    if not Path(args.path).is_file():
+        log(f"파일 없음: {args.path}")
+        return 1
+
+    conn = db_connect(args.db)
+    _ensure_verify_schema(conn)
+
+    try:
+        items = _json.loads(Path(args.path).read_text(encoding="utf-8"))
+    except _json.JSONDecodeError as e:
+        log(f"JSON 파싱 실패: {e}")
+        conn.close()
+        return 1
+
+    if not isinstance(items, list):
+        log("JSON 의 최상위는 배열이어야 합니다.")
+        conn.close()
+        return 1
+
+    inserted = 0
+    updated = 0
+    skipped = 0
+    for item in items:
+        doku_id = item.get("doku_id")
+        decision = item.get("decision")
+        if not doku_id or decision not in ("OK", "NG", "DEFER"):
+            skipped += 1
+            continue
+        existing = conn.execute(
+            "SELECT decision FROM verify_decisions WHERE doku_id=?",
+            (doku_id,),
+        ).fetchone()
+        conn.execute(
+            "INSERT OR REPLACE INTO verify_decisions "
+            "(doku_id, decision, notes, reviewer, reviewed_at, "
+            " source_hash, visual_score, flags) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                doku_id,
+                decision,
+                item.get("notes") or "",
+                item.get("reviewer") or "",
+                item.get("reviewed_at") or now_iso(),
+                item.get("source_hash") or "",
+                item.get("visual_score"),
+                item.get("flags") or "",
+            ),
+        )
+        if existing:
+            updated += 1
+        else:
+            inserted += 1
+    conn.commit()
+    conn.close()
+
+    log(f"verify import: 신규 {inserted} / 갱신 {updated} / 무시 {skipped}")
+    return 0
+
+
+def cmd_verify_status(args: argparse.Namespace) -> int:
+    conn = db_connect(args.db)
+    _ensure_verify_schema(conn)
+
+    counts: dict[str, int] = {}
+    for d, n in conn.execute(
+        "SELECT decision, COUNT(*) FROM verify_decisions GROUP BY decision"
+    ).fetchall():
+        counts[d] = n
+    total = sum(counts.values())
+
+    # stale: source_hash 가 현재 content_hash 와 다른 OK
+    stale_rows = conn.execute(
+        "SELECT v.doku_id "
+        "  FROM verify_decisions v "
+        "  JOIN pages p ON p.doku_id=v.doku_id "
+        " WHERE v.decision='OK' "
+        "   AND COALESCE(v.source_hash,'') <> COALESCE(p.content_hash,'')"
+    ).fetchall()
+    stale = len(stale_rows)
+
+    uploaded_total = conn.execute(
+        "SELECT COUNT(*) FROM pages "
+        " WHERE status='UPLOADED' AND confluence_page_id IS NOT NULL"
+    ).fetchone()[0]
+
+    print("==== verify status ====")
+    print(f"  UPLOADED total:    {uploaded_total}")
+    print(f"  decisions logged:  {total}")
+    for k in ("OK", "NG", "DEFER"):
+        n = counts.get(k, 0)
+        pct = (n / uploaded_total * 100) if uploaded_total else 0
+        print(f"  {k:6s}             {n:5d}  ({pct:.1f}% of uploaded)")
+    print(f"  stale (변환 후 미재검수): {stale}")
+
+    if args.verbose:
+        ng_rows = conn.execute(
+            "SELECT doku_id, notes FROM verify_decisions "
+            " WHERE decision='NG' ORDER BY doku_id"
+        ).fetchall()
+        if ng_rows:
+            print("\nNG 페이지:")
+            for d, notes in ng_rows:
+                print(f"  - {d}  {notes or ''}")
+        if stale_rows:
+            print("\nstale 페이지:")
+            for (d,) in stale_rows:
+                print(f"  - {d}")
+
+    conn.close()
+    return 0
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    if args.action == "build":
+        return cmd_verify_build(args)
+    if args.action == "import":
+        return cmd_verify_import(args)
+    if args.action == "status":
+        return cmd_verify_status(args)
+    log(f"unknown verify action: {args.action}")
+    return 2
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     if not Path(args.db).exists():
         log(f"DB 없음: {args.db}")
@@ -4803,6 +5404,59 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp_lint.add_argument("--limit", type=int, default=20, help="실패 항목 출력 최대 개수")
     sp_lint.set_defaults(func=cmd_lint)
+
+    sp_verify = sub.add_parser(
+        "verify",
+        help="시각 검수 큐 (docs/visual-audit.md Phase 1: DOM side-by-side)",
+    )
+    verify_sub = sp_verify.add_subparsers(dest="action", required=True)
+
+    sp_verify_build = verify_sub.add_parser(
+        "build", help="우선순위 큐 + 단일 HTML 갤러리 생성"
+    )
+    sp_verify_build.add_argument(
+        "--sample", type=int, default=200,
+        help="큐 크기 (default 200, strategy=all 이면 무시)",
+    )
+    sp_verify_build.add_argument(
+        "--strategy", default="auto",
+        choices=("auto", "all", "critical-only"),
+        help="auto=상위 sample 개; all=모든 UPLOADED; critical-only=score≥5",
+    )
+    sp_verify_build.add_argument(
+        "--resume", action="store_true",
+        help="이미 OK 결정된(현재 content_hash 와 같은) 페이지는 큐에서 제외",
+    )
+    sp_verify_build.add_argument(
+        "--with-confluence-view", action="store_true",
+        help="Confluence body-format=view 도 fetch (자격증명 필요)",
+    )
+    sp_verify_build.add_argument(
+        "--base-url",
+        default=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+    )
+    sp_verify_build.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
+    sp_verify_build.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
+    sp_verify_build.add_argument("--reviewer", help="검수자 식별자 (default: --email)")
+    sp_verify_build.add_argument(
+        "--output", help="출력 HTML 경로 (default: verify-gallery.html)"
+    )
+    sp_verify_build.set_defaults(func=cmd_verify)
+
+    sp_verify_import = verify_sub.add_parser(
+        "import", help="브라우저에서 다운로드한 verify_decisions.json 을 state.db 에 반영"
+    )
+    sp_verify_import.add_argument("path", help="verify_decisions.json 경로")
+    sp_verify_import.set_defaults(func=cmd_verify)
+
+    sp_verify_status = verify_sub.add_parser(
+        "status", help="검수 진행률 요약"
+    )
+    sp_verify_status.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="NG 페이지 / stale 페이지 목록 표시"
+    )
+    sp_verify_status.set_defaults(func=cmd_verify)
 
     sp_dev = sub.add_parser(
         "dev",
