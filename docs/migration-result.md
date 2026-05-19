@@ -5,6 +5,94 @@ day 의 §0 표. 과거 로그는 그대로 보존.
 
 ---
 
+# Day 3 — 2026-05-19 새벽 (history 트랙 라이브 실행)
+
+history-render → history-convert → history-upload 본격 실행. 5 라운드의
+PUT replay 끝에 약 50% 회복. *큰 페이지의 뒤쪽 rev* 가 Confluence 본문
+parsing 한도로 영구 거부되는 패턴 관측.
+
+## §0 history 트랙 종료 통계
+
+| 단계 | 결과 |
+|------|------|
+| `history-render` 37,947 리비전 시도 | 37,281 RENDERED / 666 SKIPPED (404 또는 빈 본문) / **0 FAILED** |
+| `history-convert` 37,281 → storage XML | 37,279 CONVERTED / 2 FAILED (변환 오류) — ~1시간 cpu-bound |
+| `history-upload` 5 라운드 누적 | **18,729 UPLOADED / 18,503 CONVERTED 잔존 / 50 FAILED** |
+
+라운드별 회복 (resume-safe; 매 라운드 FAILED → CONVERTED reset 후 재시도):
+
+| 라운드 | 시작 시각 | 처리 페이지 | rev_ok | rev_fail | 누적 UPLOADED | 누적률 |
+|--------|-----------|-------------|--------|----------|---------------|--------|
+| 1 | 00:58 | 1,566 | 10,433 | 284 | 10,433 | 28% |
+| 2 | 04:00 | 284 | 3,829 | 128 | 14,262 | 38% |
+| 3 | ~05:00 | 128 | 2,228 | 76 | 16,490 | 44% |
+| 4 | ~05:38 | 76 | 1,044 | 58 | 17,534 | 47% |
+| 5 | ~06:02 | 58 | 1,195 | 47 | 18,729 | **50%** |
+
+페이지 단위 종료 분포:
+
+- 완전 처리 (모든 rev UPLOADED): **1,520 페이지** (대부분)
+- 부분 처리 (일부 rev 만 UPLOADED): **46 페이지** (큰 일지 페이지들)
+- 0 처리 (한 rev 도 UPLOADED 안 됨): **63 페이지** (large_body_fallback `u:neoocean:2020` 의 2,895 rev + `p:start` 649 rev + 작은 페이지들 한두 rev)
+
+## §1 큰 페이지 영구 fail 패턴
+
+같은 페이지의 *처음 N rev* 는 통과하지만 그 뒤 rev 가 거부되는 패턴.
+원인 추정: dokuwiki 의 매 edit 마다 본문이 누적되어 *후반 rev*
+storage XML 이 매우 크고 복잡해짐 → Confluence 본문 parsing 한도 초과
+(`no resp`).
+
+| 페이지 | 총 rev | UPLOADED | CONVERTED 잔존 |
+|--------|--------|----------|-----------------|
+| `u:lam:2019` | 5,531 | 20 | 5,509 |
+| `u:lam:2020` | 3,535 | 125 | 3,409 |
+| `u:neoocean:2020` (large_body_fallback) | 2,895 | 0 | 2,895 |
+| `u:neoocean:2019` | 2,195 | 125 | 2,067 |
+| `u:oh:start` | 1,102 | 264 | 837 |
+| `p:start` | 649 | 0 | 649 |
+
+가장 큰 페이지의 *처음 ~5%* 만 보존. 나머지 95% 의 history 는 시작
+지점(메인 파이프라인이 옮긴 최신 본문) + 이미 옮긴 일부 historic rev
+로 한정. *Confluence 의 본문 한도* 가 본질적 제약이라 더 시도해도
+같은 위치에서 거부됨.
+
+## §2 누적 통계 (Day 3 종료)
+
+| 항목 | 값 | Day 2 대비 |
+|------|----|----|
+| 메인 페이지 UPLOADED | 1,675 / 1,675 (100%) | 동일 |
+| 메인 첨부 UPLOADED | 10,732 | 동일 |
+| **history rev UPLOADED** | **18,729** / 37,279 (50%) | +18,729 (라이브 시작) |
+| history page 완전 처리 | 1,520 / 1,629 | (라이브 시작) |
+| history page 부분 처리 (큰 페이지) | 46 | (라이브 시작) |
+| history page 0 처리 | 63 (`u:neoocean:2020` + `p:start` + 기타) | (라이브 시작) |
+| struct 페이지 | 4 (1,213 rows) | 동일 |
+
+## §3 코드 적용
+
+이번 라운드는 *추가 코드 변경 없음*. CL 52882 의 history pipeline
+구현이 그대로 사용됨. resume-safe (history_meta.last_replayed_rev_ts)
++ 페이지별 fail 시 break + FAILED → CONVERTED 수동 reset 후 재시도
+패턴이 5 라운드 동안 의도대로 동작.
+
+## §4 outstanding
+
+| 항목 | 상태 | 권장 대응 |
+|------|------|----------|
+| 큰 페이지의 후반 rev (18,503 CONVERTED 잔존) | **영구** | 메인 페이지 본문은 이미 OK; history 의 *과거 시점* 만 일부 손실. 후속 추가 가능 — 옵션: (a) 본문 압축 + 다시 시도, (b) zip 첨부로 보존, (c) 그대로 기록. |
+| `u:neoocean:2020` (large_body_fallback) 의 2,895 rev | **영구** | 본 페이지는 이미 skeleton + zip 첨부 패턴 적용. history 는 zip 안에 보존 가능 (현 구현 미포함). |
+| `p:start` 649 rev (0 처리) | 미진단 | 별도 확인 권장 — 콘텐츠 패턴 거부 가능 |
+
+## §5 다음 단계 (Day 4 후보)
+
+- 사후 정리: API 토큰 revoke, `.secrets/confluence.env` 갱신, 로그 archive.
+- 휴지통 1,465 페이지 *영구 purge* 또는 30일 자동 만료 결정.
+- 큰 페이지의 history 추가 회복 시도 (옵션) — Day 3 결과로 *영구 제약*
+  확인됐으므로 *추가 큰 코드 없이* 추가 시도는 무의미.
+- 사용자가 마이그레이션 결과 시각 확인 + 정상 운영 모드 (검색, 편집, 공유) 시작.
+
+---
+
 # Day 2 — 2026-05-19 (별도 트랙 적용 + 공간 정리)
 
 후속 follow-up 작업 9건 (#4~#12) 자율 진행 + 별도 트랙 일부 실행 +

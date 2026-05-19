@@ -1,12 +1,16 @@
 # 히스토리/과거 버전 보존 시나리오
 
-**상태 (2026-05-19): pipeline 구현 완료 + history-render 진행 중.**
-`history-discover` 결과 37,947 리비전 인덱싱 완료. `history-render`
-백그라운드 진행 (~10%). 완료 후 `history-convert` → `history-upload`
-자동. 코드 (CL 52882): `cmd_history_render/convert/upload` +
-`_revision_header` (note 매크로) + `--users-map` flag (`_load_users_map`/
-`_format_user`). resume-safe via `history_meta.last_replayed_rev_ts`.
-`docs/migration-result.md §1 #6` 참고.
+**상태 (2026-05-19 Day 3): 50% 라이브 적용. 영구 제약 관측.**
+
+- `history-discover`: 37,947 리비전 인덱싱 (메인 dokuwiki + 휴지/이력).
+- `history-render`: 37,281 RENDERED / 666 SKIPPED (404/빈 본문) / 0 FAILED.
+- `history-convert`: 37,279 CONVERTED / 2 변환 실패.
+- `history-upload` 5 라운드 누적: **18,729 UPLOADED (50%)** / 18,503 CONVERTED 잔존 / 50 FAILED.
+
+라운드별 회복률 (10,433 → 3,829 → 2,228 → 1,044 → 1,195) 가 ~1k/round
+에서 수렴 안 함. 그러나 *큰 일지 페이지의 뒤쪽 rev* 가 본문 누적
+효과로 Confluence 본문 한도 초과 → 영구 fail. 1,520 페이지 완전 처리,
+46 부분, 63 미처리. **상세는 `migration-result.md` Day 3**.
 
 ---
 

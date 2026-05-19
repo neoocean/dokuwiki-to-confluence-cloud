@@ -20,7 +20,7 @@ format 으로 변환, 네임스페이스 트리를 그대로 페이지 계층에
 | 변환기 버그 fix | 9종 (라이브 + 후속 audit 발견) |
 | struct schema 라이브 | 4 / 5 (1,213 rows; snapshot mode) |
 | 공간 정리 | 1,465 비-마이그레이션 페이지 휴지통 (30일 회복 가능) |
-| 진행 중 | history-render (~37k 리비전) |
+| **history 리비전 보존** | **18,729 / 37,279 (50%)** — 큰 페이지의 후반 rev 는 Confluence 본문 한도 초과로 영구 거부 |
 
 자세한 결과는 [`docs/migration-result.md`](docs/migration-result.md).
 
@@ -136,7 +136,7 @@ docs/
 | **OVERSIZED 첨부 → note 박스** | ✅ B 모드 적용 (9건, 5 페이지 v↑) | `docs/oversized-attachments.md` |
 | **큰 본문 페이지 → skeleton + zip** | ✅ C 모드 적용 (1건, 119 자식 첨부 회복) | `docs/oversized-pages.md` |
 | **struct 데이터 → Confluence 페이지** | ✅ snapshot 모드 라이브 (4 schema, 1,213 rows) | `docs/struct-migration.md` (properties/native 모드는 stub) |
-| **과거 리비전 이전 (~37k)** | ⏳ history-render 진행 중 | `docs/history-migration.md` (B+A+F 채택, code 완료) |
+| **과거 리비전 이전 (~37k)** | ✅ 50% 라이브 (18,729 rev) — 큰 페이지의 뒤쪽 rev 는 본문 한도로 영구 거부 | `docs/history-migration.md` + `docs/migration-result.md` Day 3 |
 | **공간 비-마이그레이션 페이지 정리** | ✅ 1,465 휴지통 (30일 회복) | `docs/migration-result.md §2.5` |
 
 ## 개발
@@ -171,10 +171,11 @@ python run.py audit --full         # 결과 검증
 
 | 항목 | 상태 |
 |------|------|
-| history-render | 진행 중 (3,813 / 37,947 ~10%) — 완료 후 자동 convert + upload |
-| history-upload | ~37k PUT, 하룻밤 잡; resume-safe |
+| 큰 페이지의 history 후반 rev (~18,503 잔존) | 영구 — Confluence 본문 한도 초과. 추가 시도 시 *같은 위치* fail. zip 첨부 보존이 옵션 |
+| `p:start` 649 rev 0 처리 | 별도 진단 후 처리 |
 | struct properties / native 모드 | snapshot 만 라이브 적용. 본 인스턴스는 추가 필요 없음 |
 | 휴지통 1,465 페이지 영구 삭제 | 30일 자동 또는 사용자 즉시 purge 결정 |
+| API 토큰 revoke | 마이그레이션 종료 시 |
 
 ## 라이선스
 
