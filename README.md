@@ -24,6 +24,15 @@ format 으로 변환, 네임스페이스 트리를 그대로 페이지 계층에
 
 자세한 결과는 [`docs/migration-result.md`](docs/migration-result.md).
 
+## 한 줄 실행 — `python run.py wizard`
+
+대화형 step-by-step CLI. 모든 마이그레이션 단계(prereq → dev-up → discover →
+render → plugin-audit → convert → upload → rewrite-links → history →
+struct → audit → verify → report → report-publish, 총 14단계) 를 순서대로
+진행. 중단(Ctrl+C) 시 `wizard_state` 테이블에 상태 보존 — 다음 실행 시
+그 단계부터 이어짐. `--status` / `--restart` / `--from-step X` / `--yes`
+지원. 자세한 절차는 [`docs/runbook.md`](docs/runbook.md) §0.
+
 ## 파이프라인 (5단계)
 
 ```

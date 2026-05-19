@@ -7,6 +7,32 @@
 [`scenarios.md`](scenarios.md) 의 풀 dry-run 으로 이미 끝나 있다고
 가정한다.
 
+## 0. 한 줄 실행 — `python run.py wizard`
+
+본 런북의 모든 단계를 *대화형으로* 차례로 진행해주는 wizard. 중단(Ctrl+C)
+시 상태가 state.db 의 `wizard_state` 테이블에 보존되어, 다음 실행 시 그
+단계부터 이어진다.
+
+```sh
+python run.py wizard                    # 처음/이어서 진행 (각 단계 Y/n 프롬프트)
+python run.py wizard --status           # 진행 상황만 출력
+python run.py wizard --restart          # 모든 step state reset 후 처음부터
+python run.py wizard --from-step audit  # audit 단계부터만 (이전 단계 영향 없음)
+python run.py wizard --yes              # 모든 프롬프트 auto-yes (비대화)
+python run.py wizard --continue-on-error # 단계 실패해도 다음으로 (기본은 halt)
+```
+
+14 단계 — prereq → dev-up → discover → render → plugin-audit → convert →
+upload → rewrite-links → history → struct → audit → verify → report →
+report-publish.
+
+`history` / `struct` 는 옵션 단계 (대상 데이터 없으면 skip 가능).
+plugin-audit 는 잔존 매크로 (`~~MACRO~~`) 를 표시 + 사용자가 "render 결과가
+만족스럽나요?" 에 no 답하면 `render` 를 pending 으로 reset 해 플러그인
+설치 후 재실행 가능. report-publish 는 state.db 의 통계를 모아
+"DokuWiki → Confluence 마이그레이션 결과 보고서" 페이지를 공간 루트 아래에
+생성/갱신 (`wizard_report_page_id` meta 에 page_id 저장 — 이후 갱신).
+
 ## 1. 준비물 체크리스트
 
 | 항목 | 어디서 받는가 | 본 인스턴스 추정값 |

@@ -6633,6 +6633,572 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 2
 
 
+# ---------- wizard (대화형 step-by-step CLI, docs/runbook.md 의 시퀀스 자동화) ----------
+
+WIZARD_DDL = """
+CREATE TABLE IF NOT EXISTS wizard_state (
+    step_key      TEXT PRIMARY KEY,
+    status        TEXT NOT NULL,    -- pending / running / done / failed / skipped / interrupted
+    started_at    TEXT,
+    finished_at   TEXT,
+    summary       TEXT,
+    error         TEXT
+);
+"""
+
+
+def _wizard_init(conn: sqlite3.Connection) -> None:
+    conn.executescript(WIZARD_DDL)
+    conn.commit()
+
+
+def _wizard_get(conn, step_key: str):
+    return conn.execute(
+        "SELECT status, started_at, finished_at, summary, error FROM wizard_state WHERE step_key=?",
+        (step_key,),
+    ).fetchone()
+
+
+def _wizard_set(conn, step_key: str, status: str, *, summary: str | None = None, error: str | None = None) -> None:
+    cur = _wizard_get(conn, step_key)
+    started = cur[1] if cur else None
+    finished = cur[2] if cur else None
+    if status == "running" and not started:
+        started = now_iso()
+    if status in ("done", "failed", "skipped"):
+        finished = now_iso()
+    if status == "pending":
+        started = None
+        finished = None
+    conn.execute(
+        "INSERT OR REPLACE INTO wizard_state(step_key, status, started_at, finished_at, summary, error) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (step_key, status, started, finished, summary, error),
+    )
+    conn.commit()
+
+
+# 각 step 은 (key, title, fn) — fn 은 (conn, args) -> str summary (또는 raise)
+# fn 안에서 user 입력이 필요하면 직접 input() 호출
+
+def _wiz_prereq(conn, args) -> str:
+    needed = [
+        ("DOKUWIKI_SRC", env_default("DOKUWIKI_SRC")),
+        ("CONFLUENCE_BASE_URL", env_default("CONFLUENCE_BASE_URL")),
+        ("CONFLUENCE_EMAIL", env_default("CONFLUENCE_EMAIL")),
+        ("CONFLUENCE_API_TOKEN", env_default("CONFLUENCE_API_TOKEN")),
+        ("CONFLUENCE_SPACE_KEY", env_default("CONFLUENCE_SPACE_KEY")),
+        ("CONFLUENCE_ROOT_PAGE_ID", env_default("CONFLUENCE_ROOT_PAGE_ID")),
+    ]
+    missing = [k for k, v in needed if not v]
+    for k, v in needed:
+        masked = ("***" if "TOKEN" in k else v) if v else "(미설정)"
+        print(f"  {k:24s} = {masked}")
+    if missing:
+        raise RuntimeError(f"환경 변수 누락: {', '.join(missing)} — .secrets/confluence.env 등에 추가 후 재실행")
+    # docker / python 존재 확인
+    has_docker = shutil.which("docker") is not None
+    print(f"  docker available: {has_docker}")
+    return f"env vars OK ({len(needed)}개) docker={has_docker}"
+
+
+def _wiz_dev_up(conn, args) -> str:
+    if not _wizard_ask(args, "DokuWiki 컨테이너를 기동할까요? (이미 떠 있으면 skip 가능)"):
+        return "사용자 skip"
+    ns = argparse.Namespace(db=args.db, action="up", src=env_default("DOKUWIKI_SRC"), purge=False)
+    rc = cmd_dev(ns)
+    if rc != 0:
+        raise RuntimeError(f"dev up failed: rc={rc}")
+    return f"컨테이너 healthy: {DEV_BASE_URL}"
+
+
+def _wiz_discover(conn, args) -> str:
+    ns = argparse.Namespace(db=args.db, src=env_default("DOKUWIKI_SRC"))
+    rc = cmd_discover(ns)
+    if rc != 0:
+        raise RuntimeError(f"discover failed: rc={rc}")
+    n = conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
+    return f"{n} 페이지 발견"
+
+
+def _wiz_render(conn, args) -> str:
+    base = args.dokuwiki_base or env_default("DOKUWIKI_BASE_URL") or DEV_BASE_URL
+    ns = argparse.Namespace(
+        db=args.db, base_url=base,
+        user=env_default("DOKUWIKI_USER"), password=env_default("DOKUWIKI_PASSWORD"),
+        force=False, only=None, delay=0.05,
+    )
+    rc = cmd_render(ns)
+    if rc != 0:
+        raise RuntimeError(f"render failed: rc={rc}")
+    n = conn.execute("SELECT COUNT(*) FROM pages WHERE raw_xhtml_path IS NOT NULL").fetchone()[0]
+    return f"{n} 페이지 XHTML 캐시 완료"
+
+
+def _wiz_plugin_audit(conn, args) -> str:
+    """raw/*.xhtml 을 훑어 ~~MACRO~~ / <... class=\"plugin_*\"> 잔존 확인.
+    사용자가 플러그인을 추가 설치하고 re-render 할지 물음."""
+    from collections import Counter
+    import re as _re
+    macros: Counter[str] = Counter()
+    n_files = 0
+    for (raw_path,) in conn.execute(
+        "SELECT raw_xhtml_path FROM pages WHERE raw_xhtml_path IS NOT NULL"
+    ):
+        if not raw_path or not Path(raw_path).is_file():
+            continue
+        try:
+            txt = Path(raw_path).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        n_files += 1
+        for m in _re.findall(r"~~([A-Z][A-Z0-9_:]+)~~", txt):
+            macros[m] += 1
+    print(f"  {n_files} 개 파일 점검")
+    if not macros:
+        return "잔존 ~~MACRO~~ 없음"
+    print("  잔존 매크로 (상위 10):")
+    for name, cnt in macros.most_common(10):
+        print(f"    ~~{name}~~ × {cnt}")
+    print("\n  플러그인을 추가 설치하려면:")
+    print("    1) http://127.0.0.1:18080/doku.php?do=admin&page=extension 접속")
+    print("    2) 필요한 플러그인 설치/활성화")
+    print("    3) 본 wizard 를 다시 실행해 render 단계 reset")
+    if not _wizard_ask(args, "render 결과가 만족스럽나요? (no 면 step render reset 후 종료)"):
+        _wizard_set(conn, "render", "pending")
+        raise RuntimeError("사용자 요청으로 render 단계 reset — 플러그인 설치 후 다시 wizard 실행")
+    return f"잔존 매크로 {sum(macros.values())} (사용자 OK)"
+
+
+def _wiz_convert(conn, args) -> str:
+    ns = argparse.Namespace(db=args.db, force=False, only=None)
+    rc = cmd_convert(ns)
+    if rc != 0:
+        raise RuntimeError(f"convert failed: rc={rc}")
+    n = conn.execute("SELECT COUNT(*) FROM pages WHERE storage_path IS NOT NULL").fetchone()[0]
+    return f"{n} 페이지 storage XML 생성"
+
+
+def _wiz_upload(conn, args) -> str:
+    ns = argparse.Namespace(
+        db=args.db,
+        base_url=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+        email=env_default("CONFLUENCE_EMAIL"),
+        api_token=env_default("CONFLUENCE_API_TOKEN"),
+        space_key=env_default("CONFLUENCE_SPACE_KEY"),
+        root_page_id=env_default("CONFLUENCE_ROOT_PAGE_ID"),
+        dry_run=False, only=None, include_parents=False, limit=None,
+    )
+    rc = cmd_upload(ns)
+    if rc != 0:
+        raise RuntimeError(f"upload failed: rc={rc}")
+    p = conn.execute("SELECT COUNT(*) FROM pages WHERE confluence_page_id IS NOT NULL").fetchone()[0]
+    a = conn.execute("SELECT COUNT(*) FROM attachments WHERE confluence_attachment_id IS NOT NULL").fetchone()[0]
+    return f"{p} 페이지 + {a} 첨부 업로드"
+
+
+def _wiz_rewrite_links(conn, args) -> str:
+    ns = argparse.Namespace(
+        db=args.db,
+        base_url=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+        email=env_default("CONFLUENCE_EMAIL"),
+        api_token=env_default("CONFLUENCE_API_TOKEN"),
+        dry_run=False, only=None,
+    )
+    rc = cmd_rewrite_links(ns)
+    if rc != 0:
+        raise RuntimeError(f"rewrite-links failed: rc={rc}")
+    resolved = conn.execute(
+        "SELECT COUNT(*) FROM links WHERE confluence_page_id IS NOT NULL"
+    ).fetchone()[0] if _has_table(conn, "links") else 0
+    return f"링크 해소 {resolved}"
+
+
+def _wiz_history(conn, args) -> str:
+    if not _wizard_ask(args, "과거 리비전(history) 도 이전할까요? (~30분-수시간)"):
+        return "사용자 skip"
+    base = env_default("DOKUWIKI_BASE_URL") or DEV_BASE_URL
+    log("→ history-discover")
+    rc = cmd_history_discover(argparse.Namespace(db=args.db))
+    if rc != 0:
+        raise RuntimeError(f"history-discover failed")
+    log("→ history-render")
+    rc = cmd_history_render(argparse.Namespace(
+        db=args.db, base_url=base,
+        user=env_default("DOKUWIKI_USER"), password=env_default("DOKUWIKI_PASSWORD"),
+        only=None, limit=None, delay=0.05, force=False,
+    ))
+    if rc != 0:
+        raise RuntimeError(f"history-render failed")
+    log("→ history-convert")
+    rc = cmd_history_convert(argparse.Namespace(db=args.db, force=False, only=None))
+    if rc != 0:
+        raise RuntimeError(f"history-convert failed")
+    log("→ history-upload")
+    rc = cmd_history_upload(argparse.Namespace(
+        db=args.db,
+        base_url=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+        email=env_default("CONFLUENCE_EMAIL"),
+        api_token=env_default("CONFLUENCE_API_TOKEN"),
+        only=None, limit=None, users_map=None,
+    ))
+    if rc != 0:
+        raise RuntimeError(f"history-upload failed")
+    n = conn.execute("SELECT COUNT(*) FROM revisions WHERE status='UPLOADED'").fetchone()[0]
+    return f"{n} 리비전 업로드"
+
+
+def _wiz_struct(conn, args) -> str:
+    has_struct = False
+    sd = _struct_db_path_from_meta(conn)
+    has_struct = sd is not None and sd.is_file()
+    if not has_struct:
+        return "struct 플러그인 데이터 없음 (skip)"
+    if not _wizard_ask(args, "struct 플러그인 데이터를 이전할까요?"):
+        return "사용자 skip"
+    log("→ struct-discover")
+    rc = cmd_struct_discover(argparse.Namespace(db=args.db, struct_db=None))
+    if rc != 0:
+        raise RuntimeError("struct-discover failed")
+    log("→ struct-convert --mode native --reconvert")
+    rc = cmd_struct_convert(argparse.Namespace(db=args.db, mode="native", reconvert=True))
+    if rc != 0:
+        raise RuntimeError("struct-convert failed")
+    log("→ struct-upload --mode native")
+    rc = cmd_struct_upload(argparse.Namespace(
+        db=args.db,
+        base_url=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+        email=env_default("CONFLUENCE_EMAIL"),
+        api_token=env_default("CONFLUENCE_API_TOKEN"),
+        space_key=env_default("CONFLUENCE_SPACE_KEY"),
+        root_page_id=env_default("CONFLUENCE_ROOT_PAGE_ID"),
+        mode="native", fallback="auto", probe=False, probe_keep=False,
+        limit=None, no_native_shell=False, only_tbl=None, row_limit=None, index_only=False,
+    ))
+    if rc != 0:
+        raise RuntimeError("struct-upload failed")
+    log("→ struct-embed-on-bound-pages")
+    rc = cmd_struct_embed_on_bound_pages(argparse.Namespace(
+        db=args.db,
+        base_url=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+        email=env_default("CONFLUENCE_EMAIL"),
+        api_token=env_default("CONFLUENCE_API_TOKEN"),
+        only_doku=None,
+    ))
+    if rc != 0:
+        raise RuntimeError("struct-embed failed")
+    rows = conn.execute("SELECT COUNT(*) FROM struct_rows WHERE status='UPLOADED'").fetchone()[0]
+    return f"{rows} struct row 업로드"
+
+
+def _wiz_audit(conn, args) -> str:
+    sample = args.audit_sample or 50
+    ns = argparse.Namespace(
+        db=args.db,
+        base_url=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+        email=env_default("CONFLUENCE_EMAIL"),
+        api_token=env_default("CONFLUENCE_API_TOKEN"),
+        only=None, sample=sample, full=False, failed_only=False,
+        body_format="storage", verbose=False, output_json=None, output_html=None,
+    )
+    rc = cmd_audit(ns)
+    return f"sample={sample}, rc={rc} — 상세 stdout"
+
+
+def _wiz_verify(conn, args) -> str:
+    out = Path("verify-gallery.html")
+    sample = args.verify_sample or 100
+    ns = argparse.Namespace(
+        db=args.db,
+        base_url=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+        email=env_default("CONFLUENCE_EMAIL"),
+        api_token=env_default("CONFLUENCE_API_TOKEN"),
+        sample=sample, strategy="auto", output=str(out),
+        reviewer=env_default("CONFLUENCE_EMAIL"),
+        with_confluence_view=True, with_attachment_check=True,
+        with_screenshots=False, with_vision=False,
+        body_format="storage", dokuwiki_base_url=None,
+    )
+    rc = cmd_verify_build(ns)
+    if rc != 0:
+        raise RuntimeError(f"verify build failed: rc={rc}")
+    print(f"  HTML 큐 → {out.resolve()}")
+    print("  브라우저에서 카드를 OK/NG/DEFER 분류 후 'JSON 다운로드' → ")
+    print("  python run.py verify import <파일>")
+    if not _wizard_ask(args, "검수 완료했나요? (no 면 step 그대로 둠)"):
+        raise RuntimeError("검수 미완료 — 본 단계 그대로 두고 종료")
+    return f"verify queue {sample} 빌드 + 사용자 검수 완료"
+
+
+def _wiz_report(conn, args) -> str:
+    ns = argparse.Namespace(db=args.db, limit=20)
+    rc = cmd_report(ns)
+    return "report 출력됨 (stdout)"
+
+
+def _wiz_report_publish(conn, args) -> str:
+    """state.db 통계 기반 마이그레이션 결과 페이지를 Confluence 에 생성/갱신."""
+    if not env_default("CONFLUENCE_EMAIL") or not env_default("CONFLUENCE_API_TOKEN"):
+        raise RuntimeError("자격증명 누락")
+    title = args.report_title or "DokuWiki → Confluence 마이그레이션 결과 보고서"
+    body = _wizard_build_report_body(conn)
+    ns = argparse.Namespace(
+        db=args.db,
+        base_url=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"),
+        email=env_default("CONFLUENCE_EMAIL"),
+        api_token=env_default("CONFLUENCE_API_TOKEN"),
+        space_key=env_default("CONFLUENCE_SPACE_KEY"),
+        root_page_id=env_default("CONFLUENCE_ROOT_PAGE_ID"),
+    )
+    session = _confluence_session(ns)
+    if session is None:
+        raise RuntimeError("Confluence session 실패")
+    base = ns.base_url.rstrip("/")
+    space_id = _resolve_space_id(session, base, ns.space_key)
+    if not space_id:
+        raise RuntimeError("space_id 해소 실패")
+    # 기존 페이지 확인 (meta 에 report_page_id 저장)
+    existing = db_get_meta(conn, "wizard_report_page_id")
+    if existing:
+        ok = _struct_put_page(session, base, existing, title=title, storage=body)
+        if not ok:
+            raise RuntimeError("report PUT 실패")
+        return f"보고서 갱신 → page {existing}"
+    pid = _struct_post_page(
+        session, base, space_id, ns.root_page_id,
+        title=title, storage=body, sid=0,
+    )
+    if not pid:
+        raise RuntimeError("report POST 실패")
+    db_set_meta(conn, "wizard_report_page_id", str(pid))
+    return f"보고서 신규 발행 → page {pid}"
+
+
+def _has_table(conn, name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone() is not None
+
+
+def _wizard_build_report_body(conn) -> str:
+    """state.db 의 핵심 카운트를 모아 Confluence storage XML 본문 생성."""
+    import html as _h
+    def q1(sql, default=0):
+        try:
+            r = conn.execute(sql).fetchone()
+            return r[0] if r and r[0] is not None else default
+        except sqlite3.OperationalError:
+            return default
+    pages_total = q1("SELECT COUNT(*) FROM pages")
+    pages_uploaded = q1("SELECT COUNT(*) FROM pages WHERE confluence_page_id IS NOT NULL")
+    atts_total = q1("SELECT COUNT(*) FROM attachments")
+    atts_uploaded = q1("SELECT COUNT(*) FROM attachments WHERE confluence_attachment_id IS NOT NULL")
+    rev_total = q1("SELECT COUNT(*) FROM revisions") if _has_table(conn, "revisions") else 0
+    rev_uploaded = q1("SELECT COUNT(*) FROM revisions WHERE status='UPLOADED'") if _has_table(conn, "revisions") else 0
+    struct_schemas = q1("SELECT COUNT(*) FROM struct_schemas WHERE status='UPLOADED'") if _has_table(conn, "struct_schemas") else 0
+    struct_rows = q1("SELECT COUNT(*) FROM struct_rows WHERE status='UPLOADED'") if _has_table(conn, "struct_rows") else 0
+    verify_ok = q1("SELECT COUNT(*) FROM verify_decisions WHERE decision='OK'") if _has_table(conn, "verify_decisions") else 0
+    verify_ng = q1("SELECT COUNT(*) FROM verify_decisions WHERE decision='NG'") if _has_table(conn, "verify_decisions") else 0
+    verify_defer = q1("SELECT COUNT(*) FROM verify_decisions WHERE decision='DEFER'") if _has_table(conn, "verify_decisions") else 0
+
+    # wizard step 상태
+    step_rows = conn.execute(
+        "SELECT step_key, status, summary, started_at, finished_at FROM wizard_state ORDER BY rowid"
+    ).fetchall() if _has_table(conn, "wizard_state") else []
+
+    rows_html = []
+    for sk, st, sm, sa, fa in step_rows:
+        rows_html.append(
+            f"<tr><td>{_h.escape(sk)}</td><td>{_h.escape(st)}</td>"
+            f"<td>{_h.escape(sm or '')}</td>"
+            f"<td>{_h.escape((sa or '')[:19])}</td><td>{_h.escape((fa or '')[:19])}</td></tr>"
+        )
+
+    return (
+        f'<h1>DokuWiki → Confluence 마이그레이션 결과 보고서</h1>'
+        f'<p>생성 시각: <time datetime="{now_iso()}">{now_iso()}</time></p>'
+        '<h2>1. 메인 콘텐츠</h2>'
+        f'<table><tbody>'
+        f'<tr><th>페이지 (uploaded / total)</th><td>{pages_uploaded} / {pages_total} '
+        f'({(100*pages_uploaded//max(pages_total,1))}%)</td></tr>'
+        f'<tr><th>첨부 (uploaded / total)</th><td>{atts_uploaded} / {atts_total} '
+        f'({(100*atts_uploaded//max(atts_total,1))}%)</td></tr>'
+        '</tbody></table>'
+        '<h2>2. 과거 리비전 (history)</h2>'
+        f'<table><tbody>'
+        f'<tr><th>리비전 (uploaded / total)</th><td>{rev_uploaded} / {rev_total} '
+        f'({(100*rev_uploaded//max(rev_total,1))}%)</td></tr>'
+        '</tbody></table>'
+        '<h2>3. struct 데이터</h2>'
+        f'<table><tbody>'
+        f'<tr><th>schema 업로드</th><td>{struct_schemas}</td></tr>'
+        f'<tr><th>row 업로드</th><td>{struct_rows}</td></tr>'
+        '</tbody></table>'
+        '<h2>4. 시각 검수 (verify)</h2>'
+        f'<table><tbody>'
+        f'<tr><th>OK</th><td>{verify_ok}</td></tr>'
+        f'<tr><th>NG</th><td>{verify_ng}</td></tr>'
+        f'<tr><th>DEFER</th><td>{verify_defer}</td></tr>'
+        '</tbody></table>'
+        '<h2>5. wizard 단계 진행</h2>'
+        '<table><thead><tr><th>step</th><th>status</th><th>요약</th>'
+        '<th>시작</th><th>종료</th></tr></thead>'
+        f'<tbody>{"".join(rows_html)}</tbody></table>'
+        '<ac:structured-macro ac:name="info"><ac:rich-text-body>'
+        '<p>본 페이지는 <code>python run.py wizard</code> 또는 '
+        '<code>python run.py report-publish</code> 가 자동 갱신합니다.</p>'
+        '</ac:rich-text-body></ac:structured-macro>'
+    )
+
+
+# 단계 정의: (key, title, fn, optional)
+WIZARD_STEPS: list[tuple[str, str, "callable", bool]] = [
+    ("prereq",         "사전 점검 (자격증명/경로/CLI)",                     _wiz_prereq, False),
+    ("dev-up",         "DokuWiki 컨테이너 기동 (기존 데이터 복제)",         _wiz_dev_up, True),
+    ("discover",       "페이지 인벤토리 (state.db)",                         _wiz_discover, False),
+    ("render",         "DokuWiki XHTML 렌더 캐시",                          _wiz_render, False),
+    ("plugin-audit",   "잔존 매크로 점검 + 플러그인 설치 권장",             _wiz_plugin_audit, False),
+    ("convert",        "XHTML → Confluence storage 변환",                   _wiz_convert, False),
+    ("upload",         "페이지 + 첨부 업로드",                              _wiz_upload, False),
+    ("rewrite-links",  "내부 링크 2-pass 해소",                             _wiz_rewrite_links, False),
+    ("history",        "과거 리비전 이전 (옵션)",                           _wiz_history, True),
+    ("struct",         "struct 플러그인 데이터 이전 (옵션)",                _wiz_struct, True),
+    ("audit",          "Confluence 측 본문 검증 (sample)",                  _wiz_audit, False),
+    ("verify",         "사용자 시각 검수 큐 빌드 + 사람 검수",              _wiz_verify, False),
+    ("report",         "결과 리포트 생성 (stdout)",                         _wiz_report, False),
+    ("report-publish", "결과 보고서를 Confluence 페이지로 발행",            _wiz_report_publish, False),
+]
+
+
+def _wizard_ask(args, question: str) -> bool:
+    if args.yes:
+        print(f"  ? {question}  → [auto-yes]")
+        return True
+    try:
+        ans = input(f"  ? {question} [Y/n]: ").strip().lower()
+    except EOFError:
+        return False
+    return ans in ("", "y", "yes", "예")
+
+
+def _wizard_print_status(conn) -> None:
+    print(f"{'step':18} {'status':12} {'요약':32} 시작")
+    print("-" * 80)
+    for key, title, _fn, opt in WIZARD_STEPS:
+        row = _wizard_get(conn, key)
+        st = row[0] if row else "pending"
+        sm = (row[3] or "")[:30] if row else ""
+        sa = (row[1] or "")[:19] if row else ""
+        mark = "✓" if st == "done" else ("⊘" if st == "skipped" else ("✗" if st == "failed" else "·"))
+        print(f"{mark} {key:16} {st:12} {sm:32} {sa}")
+
+
+def cmd_wizard(args: argparse.Namespace) -> int:
+    """대화형 step-by-step wizard. 중단/재개 가능. Ctrl+C 로 안전 종료."""
+    conn = db_connect(args.db)
+    db_init(conn)
+    _wizard_init(conn)
+
+    if args.restart:
+        conn.execute("DELETE FROM wizard_state")
+        conn.commit()
+        log("처음부터 다시 시작 (모든 step state reset)")
+
+    if args.status:
+        _wizard_print_status(conn)
+        conn.close()
+        return 0
+
+    # --from-step X 의미: X 부터 끝까지만 실행. 이전 단계는 그대로 둠 (건드리지 않음).
+    start_idx = 0
+    if args.from_step:
+        keys = [k for k, *_ in WIZARD_STEPS]
+        if args.from_step not in keys:
+            log(f"존재하지 않는 step: {args.from_step}. 가능: {', '.join(keys)}")
+            return 2
+        start_idx = keys.index(args.from_step)
+        # 해당 step 부터의 상태만 pending 으로 (재실행 가능하게)
+        for key in keys[start_idx:]:
+            cur = _wizard_get(conn, key)
+            if cur and cur[0] in ("done", "skipped", "failed", "interrupted"):
+                _wizard_set(conn, key, "pending")
+
+    print("== DokuWiki → Confluence 마이그레이션 wizard ==")
+    print()
+    _wizard_print_status(conn)
+    print()
+
+    for idx, (key, title, fn, optional) in enumerate(WIZARD_STEPS, 1):
+        if idx - 1 < start_idx:
+            continue
+        row = _wizard_get(conn, key)
+        st = row[0] if row else "pending"
+
+        if st in ("done", "skipped"):
+            print(f"[{idx}/{len(WIZARD_STEPS)}] {title} — {st} (skip)")
+            continue
+
+        print()
+        print(f"[{idx}/{len(WIZARD_STEPS)}] {title}")
+        print(f"  step: {key} | 현재: {st}")
+        if optional:
+            print("  (선택) 이 단계는 건너뛸 수 있습니다.")
+
+        if not args.yes:
+            choice = input("  진행/skip/quit ? [Enter/s/q] ").strip().lower()
+            if choice in ("q", "quit"):
+                print("종료. 다음 실행 시 이 단계부터 이어집니다.")
+                conn.close()
+                return 0
+            if choice in ("s", "skip"):
+                _wizard_set(conn, key, "skipped", summary="사용자 skip")
+                continue
+            if choice in ("d", "done"):
+                _wizard_set(conn, key, "done", summary="사용자 수동 done")
+                continue
+
+        _wizard_set(conn, key, "running")
+        try:
+            summary = fn(conn, args)
+            _wizard_set(conn, key, "done", summary=summary)
+            print(f"  ✓ {summary}")
+        except KeyboardInterrupt:
+            _wizard_set(conn, key, "interrupted", error="Ctrl+C")
+            print("\n중단됨. 다음 실행 시 이 단계부터 이어집니다.")
+            conn.close()
+            return 130
+        except Exception as e:
+            _wizard_set(conn, key, "failed", error=str(e))
+            print(f"  ✗ 실패: {e}")
+            # 실패 시 기본 halt. --continue-on-error 일 때만 다음 단계로.
+            if not args.continue_on_error:
+                print("종료. 원인 해결 후 다시 실행하면 이 단계부터 이어집니다.")
+                print("  팁: `python run.py wizard --from-step", key, "` 로 특정 단계만 재시도")
+                conn.close()
+                return 1
+
+    print()
+    print("== 모든 단계 완료 ==")
+    _wizard_print_status(conn)
+    conn.close()
+    return 0
+
+
+def cmd_report_publish(args: argparse.Namespace) -> int:
+    """state.db 통계 기반 보고서 페이지 발행/갱신 (wizard 의 마지막 단계 단독 호출)."""
+    conn = db_connect(args.db)
+    db_init(conn)
+    _wizard_init(conn)
+    try:
+        summary = _wiz_report_publish(conn, args)
+    except Exception as e:
+        log(f"실패: {e}")
+        return 1
+    log(summary)
+    conn.close()
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     if not Path(args.db).exists():
         log(f"DB 없음: {args.db}")
@@ -7013,6 +7579,34 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"종료 후 복제본 {DEV_CLONE_DST} 도 삭제",
     )
     sp_dev_down.set_defaults(func=cmd_dev)
+
+    sp_wiz = sub.add_parser(
+        "wizard",
+        help="대화형 step-by-step 마이그레이션 — 중단/재개 안전",
+    )
+    sp_wiz.add_argument("--restart", action="store_true", help="모든 step state reset 후 처음부터")
+    sp_wiz.add_argument("--status", action="store_true", help="현재 진행 상황만 출력 후 종료")
+    sp_wiz.add_argument("--from-step", dest="from_step", help="지정한 step 부터 다시 (이후 모두 pending)")
+    sp_wiz.add_argument("--yes", action="store_true", help="모든 프롬프트 자동 yes (비대화)")
+    sp_wiz.add_argument("--continue-on-error", action="store_true",
+                        help="단계 실패해도 다음 단계로 진행 (기본: 실패 시 즉시 종료)")
+    sp_wiz.add_argument("--audit-sample", type=int, help="audit 단계의 sample 수 (기본 50)")
+    sp_wiz.add_argument("--verify-sample", type=int, help="verify 단계의 sample 수 (기본 100)")
+    sp_wiz.add_argument("--dokuwiki-base", help="render 단계의 DokuWiki base URL override")
+    sp_wiz.add_argument("--report-title", help="report-publish 단계의 페이지 제목 override")
+    sp_wiz.set_defaults(func=cmd_wizard)
+
+    sp_rp = sub.add_parser(
+        "report-publish",
+        help="state.db 통계 기반 결과 보고서를 Confluence 페이지로 발행/갱신",
+    )
+    sp_rp.add_argument("--base-url", default=env_default("CONFLUENCE_BASE_URL", "https://woojinkim.atlassian.net/wiki"))
+    sp_rp.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
+    sp_rp.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
+    sp_rp.add_argument("--space-key", default=env_default("CONFLUENCE_SPACE_KEY"))
+    sp_rp.add_argument("--root-page-id", default=env_default("CONFLUENCE_ROOT_PAGE_ID"))
+    sp_rp.add_argument("--report-title", help="페이지 제목 (기본: DokuWiki → Confluence 마이그레이션 결과 보고서)")
+    sp_rp.set_defaults(func=cmd_report_publish)
 
     return p
 
