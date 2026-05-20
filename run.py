@@ -9473,15 +9473,9 @@ def _add_confluence_space_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--root-page-id", default=env_default("CONFLUENCE_ROOT_PAGE_ID"))
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="run.py",
-        description="DokuWiki -> Confluence Cloud migration (scenarios in docs/scenarios.md)",
-    )
-    p.add_argument("--db", default=DEFAULT_DB_PATH, help=f"SQLite state path (default: {DEFAULT_DB_PATH})")
-    # required=False — 인자 없이 실행하면 main() 이 도움말 출력
-    sub = p.add_subparsers(dest="cmd", required=False)
-
+def _build_pipeline_subcommands(sub) -> None:
+    """메인 파이프라인 (S1~S7): discover / render / convert / upload /
+    rewrite-links / status."""
     sp_discover = sub.add_parser("discover", help="페이지 트리 발견 (S1)")
     sp_discover.add_argument(
         "--src",
@@ -9516,7 +9510,6 @@ def build_parser() -> argparse.ArgumentParser:
     sp_upload.add_argument(
         "--root-page-id", default=env_default("CONFLUENCE_ROOT_PAGE_ID"), help="루트 부모 페이지 ID"
     )
-
     _add_confluence_creds_args(sp_upload)
     sp_upload.add_argument("--dry-run", action="store_true")
     sp_upload.add_argument("--only", help="특정 doku_id 만 업로드")
@@ -9528,7 +9521,6 @@ def build_parser() -> argparse.ArgumentParser:
     sp_upload.set_defaults(func=cmd_upload)
 
     sp_rewrite = sub.add_parser("rewrite-links", help="내부 링크 2-pass 치환 (S7)")
-
     _add_confluence_creds_args(sp_rewrite)
     sp_rewrite.add_argument("--dry-run", action="store_true")
     sp_rewrite.add_argument("--only", help="특정 doku_id 만 처리")
@@ -9537,15 +9529,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp_status = sub.add_parser("status", help="상태 요약")
     sp_status.set_defaults(func=cmd_status)
 
+
+def _build_history_subcommands(sub) -> None:
+    """history 트랙: discover / render / convert / upload / status /
+    rewrite-headers."""
     sp_hd = sub.add_parser(
         "history-discover", help="attic/ + meta/*.changes + media_attic/ 인덱싱"
     )
     sp_hd.set_defaults(func=cmd_history_discover)
 
     sp_hr = sub.add_parser("history-render", help="attic 리비전을 ?rev= 로 받아 캐시")
-    sp_hr.add_argument(
-        "--base-url", default=env_default("DOKUWIKI_BASE_URL"),
-    )
+    sp_hr.add_argument("--base-url", default=env_default("DOKUWIKI_BASE_URL"))
     sp_hr.add_argument("--user", default=env_default("DOKUWIKI_USER"))
     sp_hr.add_argument("--password", default=env_default("DOKUWIKI_PASSWORD"))
     sp_hr.add_argument("--force", action="store_true")
@@ -9566,7 +9560,6 @@ def build_parser() -> argparse.ArgumentParser:
     sp_hc.set_defaults(func=cmd_history_convert)
 
     sp_hu = sub.add_parser("history-upload", help="시간순 PUT replay → Confluence 버전 체인")
-
     _add_confluence_creds_args(sp_hu)
     sp_hu.add_argument("--only", help="특정 doku_id 만 replay")
     sp_hu.add_argument("--limit", type=int, help="처음 N revision PUT 후 종료")
@@ -9580,7 +9573,6 @@ def build_parser() -> argparse.ArgumentParser:
         "history-rewrite-headers",
         help="이미 업로드된 페이지의 revision 헤더만 새 형식으로 교체 (PUT)",
     )
-
     _add_confluence_creds_args(sp_hrh)
     sp_hrh.add_argument(
         "--header-format", choices=REVISION_HEADER_FORMATS,
@@ -9592,6 +9584,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp_hrh.add_argument("--dry-run", action="store_true")
     sp_hrh.set_defaults(func=cmd_history_rewrite_headers)
 
+
+def _build_struct_subcommands(sub) -> None:
+    """struct 트랙: discover / convert / upload / status / embed-on-bound-pages."""
     sp_sd = sub.add_parser(
         "struct-discover", help="meta/struct.sqlite3 → state.db 의 struct_* 인덱싱"
     )
@@ -9608,7 +9603,6 @@ def build_parser() -> argparse.ArgumentParser:
     sp_sc.set_defaults(func=cmd_struct_convert)
 
     sp_su = sub.add_parser("struct-upload", help="struct-convert 결과를 Confluence 에 업로드")
-
     _add_confluence_space_args(sp_su)
     sp_su.add_argument("--probe", action="store_true", help="Confluence Database API 가용성만 측정")
     sp_su.add_argument("--probe-keep", action="store_true", help="probe 후 임시 Database 삭제 안 함")
@@ -9636,16 +9630,17 @@ def build_parser() -> argparse.ArgumentParser:
         "struct-embed-on-bound-pages",
         help="struct row 의 bound 페이지에 '관련 struct 데이터' 패널 임베드",
     )
-
     _add_confluence_creds_args(sp_se)
     sp_se.add_argument("--only-doku", help="특정 doku_id 한 페이지만 처리")
     sp_se.set_defaults(func=cmd_struct_embed_on_bound_pages)
 
+
+def _build_oversized_subcommands(sub) -> None:
+    """rewrite-oversized-pages / rewrite-oversized."""
     sp_rop = sub.add_parser(
         "rewrite-oversized-pages",
         help="본문 거부된 페이지를 skeleton + storage XML 첨부로 fallback (docs/oversized-pages.md C 모드)",
     )
-
     _add_confluence_space_args(sp_rop)
     sp_rop.add_argument("--only", help="특정 doku_id 만 처리")
     sp_rop.set_defaults(func=cmd_rewrite_oversized_pages)
@@ -9654,15 +9649,16 @@ def build_parser() -> argparse.ArgumentParser:
         "rewrite-oversized",
         help="OVERSIZED 첨부 reference 를 note 매크로 메타 박스로 (docs/oversized-attachments.md §4.1 B 모드)",
     )
-
     _add_confluence_creds_args(sp_ro)
     sp_ro.add_argument("--no-upload", action="store_true", help="storage 만 갱신, Confluence PUT 안 함")
     sp_ro.set_defaults(func=cmd_rewrite_oversized)
 
+
+def _build_audit_report_subcommands(sub) -> None:
+    """audit / report / preview / lint."""
     sp_audit = sub.add_parser(
         "audit", help="Confluence 의 실제 페이지를 받아 dokuwiki raw 와 비교"
     )
-
     _add_confluence_creds_args(sp_audit)
     sp_audit.add_argument("--only", help="특정 doku_id 만 비교")
     sp_audit.add_argument("--sample", type=int, help="UPLOADED 중 무작위 N개")
@@ -9703,6 +9699,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp_lint.add_argument("--limit", type=int, default=20, help="실패 항목 출력 최대 개수")
     sp_lint.set_defaults(func=cmd_lint)
 
+
+def _build_verify_subcommands(sub) -> None:
+    """verify (build / import / status) — visual-audit 큐 + Phase 4 신호."""
     sp_verify = sub.add_parser(
         "verify",
         help="시각 검수 큐 (docs/visual-audit.md Phase 1: DOM side-by-side)",
@@ -9786,7 +9785,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--with-all-extra-signals", action="store_true",
         help="(Phase 4) 위 7가지 시각 비교 추가 신호 모두 활성",
     )
-
     _add_confluence_creds_args(sp_verify_build)
     sp_verify_build.add_argument("--reviewer", help="검수자 식별자 (default: --email)")
     sp_verify_build.add_argument(
@@ -9809,6 +9807,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp_verify_status.set_defaults(func=cmd_verify)
 
+
+def _build_dev_subcommands(sub) -> None:
+    """dev (up / down / install-plugins) — 로컬 컨테이너."""
     sp_dev = sub.add_parser(
         "dev",
         help="로컬 DokuWiki 테스트 컨테이너 (dev/dokuwiki-local) up/down",
@@ -9851,6 +9852,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp_dev_install.set_defaults(func=cmd_dev)
 
+
+def _build_tool_subcommands(sub) -> None:
+    """plugin-scan / decrypt / link-check — 운영 보조 툴."""
     sp_ps = sub.add_parser(
         "plugin-scan",
         help="DokuWiki 페이지 본문을 스캔해 사용된 매크로/태그 → 미설치 플러그인 식별",
@@ -9881,7 +9885,6 @@ def build_parser() -> argparse.ArgumentParser:
     sp_dec.add_argument("cipher", nargs="*", help="base64-encoded cipher 1+ (생략 시 --page 또는 --confluence-id)")
     sp_dec.add_argument("--page", help="state.db 의 페이지 (raw/storage 본문에서 모든 cipher 추출 + 복호화)")
     sp_dec.add_argument("--confluence-id", help="Confluence 페이지 ID — 본문 GET 후 모든 cipher 복호화")
-
     _add_confluence_creds_args(sp_dec)
     sp_dec.set_defaults(func=cmd_decrypt)
 
@@ -9890,7 +9893,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Confluence 측 페이지의 링크 정합성 검증 (placeholder 잔존 / "
         "unresolved page link / 외부 URL HTTP HEAD)",
     )
-
     _add_confluence_creds_args(sp_lc)
     sp_lc.add_argument("--only", help="특정 doku_id 만")
     sp_lc.add_argument("--limit", type=int, help="처음 N 페이지")
@@ -9901,6 +9903,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="문제 페이지 상세 출력 (최대 50개)")
     sp_lc.set_defaults(func=cmd_link_check)
 
+
+def _build_wizard_subcommands(sub) -> None:
+    """wizard / report-publish — orchestration + 보고서 발행."""
     sp_wiz = sub.add_parser(
         "wizard",
         help="대화형 step-by-step 마이그레이션 — 중단/재개 안전",
@@ -9921,10 +9926,34 @@ def build_parser() -> argparse.ArgumentParser:
         "report-publish",
         help="state.db 통계 기반 결과 보고서를 Confluence 페이지로 발행/갱신",
     )
-
     _add_confluence_space_args(sp_rp)
     sp_rp.add_argument("--report-title", help="페이지 제목 (기본: DokuWiki → Confluence 마이그레이션 결과 보고서)")
     sp_rp.set_defaults(func=cmd_report_publish)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """argparse 트리 구성 (orchestrator) — 도메인별 _build_*_subcommands 에 위임.
+
+    각 helper 는 sub (add_subparsers 결과) 를 받아 자기 도메인의 add_parser 만 등록한다.
+    이 분리는 동작 변경 없는 순수 구조 리팩토링이며, 새 명령을 추가할 때 어느 helper 에
+    넣을지로 위치를 결정한다."""
+    p = argparse.ArgumentParser(
+        prog="run.py",
+        description="DokuWiki -> Confluence Cloud migration (scenarios in docs/scenarios.md)",
+    )
+    p.add_argument("--db", default=DEFAULT_DB_PATH, help=f"SQLite state path (default: {DEFAULT_DB_PATH})")
+    # required=False — 인자 없이 실행하면 main() 이 도움말 출력
+    sub = p.add_subparsers(dest="cmd", required=False)
+
+    _build_pipeline_subcommands(sub)
+    _build_history_subcommands(sub)
+    _build_struct_subcommands(sub)
+    _build_oversized_subcommands(sub)
+    _build_audit_report_subcommands(sub)
+    _build_verify_subcommands(sub)
+    _build_dev_subcommands(sub)
+    _build_tool_subcommands(sub)
+    _build_wizard_subcommands(sub)
 
     return p
 
