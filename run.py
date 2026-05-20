@@ -61,9 +61,13 @@ DokuWiki 가 렌더링한 최종 XHTML 을 받아 Confluence storage format 으�
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
+import html as _h
+import json as _json
 import os
 import re
+import re as _re  # 함수 내부 별칭 호환용 (기존 코드가 _re.X 로 호출)
 import shutil
 import sqlite3
 import subprocess
@@ -331,8 +335,6 @@ def read_meta_title(meta_root: Path, doku_id: str) -> tuple[str | None, str | No
     DokuWiki meta 는 PHP 직렬화 형식이라 정밀 파싱 대신 정규식 가벼운 추출만 한다.
     찾지 못하면 (None, None).
     """
-    import re
-
     rel = Path(*doku_id.split(":"))
     meta_path = meta_root / rel.with_suffix(".meta")
     if not meta_path.exists():
@@ -908,13 +910,11 @@ def _convert_encrypted_passwords(soup) -> None:
        tag 로 escape → 본문에 `&lt;decrypt&gt;cipher&lt;/decrypt&gt;` 텍스트.
        bs4 는 이 escape 를 풀어서 텍스트 노드로 인식.
     """
-    import re as _re
     from bs4 import BeautifulSoup as _BS, NavigableString
 
     pattern = _re.compile(r"<(decrypt|encrypt)>([^<>]+)</\1>")
 
     def _expand_macro(tag: str, cipher: str) -> str:
-        import html as _h
         # cipher 그대로 보존 (decrypt 시 사용). escape 만.
         cipher_esc = _h.escape(cipher)
         return (
@@ -947,7 +947,6 @@ def _convert_encrypted_passwords(soup) -> None:
 
 
 def _calendar_iframe_macro(src: str, width: str = "750", height: str = "500") -> str:
-    import html as _h
     return (
         f'<ac:structured-macro ac:name="iframe">'
         f'<ac:parameter ac:name="src"><ri:url ri:value="{_h.escape(src, quote=True)}"/></ac:parameter>'
@@ -978,8 +977,6 @@ def _convert_youtube_fallback(soup) -> None:
     본 함수는 *fallback 매크로 잔재* 만 처리.
     """
     from bs4 import BeautifulSoup as _BS
-    import re as _re
-
     for a in list(soup.find_all("a", href=True)):
         href = str(a.get("href", ""))
         m = _YOUTUBE_FALLBACK_RES[0].match(href)
@@ -1029,7 +1026,6 @@ def _convert_google_calendar_iframe(soup) -> None:
 
     # B. escape 된 텍스트 — `<a class="urlextern" href="https://calendar.google.com/...">`
     #    의 부모 <p> 의 텍스트가 iframe 텍스트 (escape) 를 포함하면 부모째 교체.
-    import re as _re
     for a in list(soup.find_all("a", href=True)):
         href = str(a.get("href", ""))
         if "calendar.google.com" not in href:
@@ -1296,12 +1292,54 @@ def _convert_html_to_storage(
     src_root: Path,
 ) -> tuple[str, list[dict], list[dict], str | None, list[str]]:
     """
-    raw_html (DokuWiki export_xhtmlbody) -> (storage_xml, links, attachments, title, tags).
+    DokuWiki export_xhtmlbody → Confluence storage format 변환 (메인 entry).
 
-    links:       [{'target': 'wiki:syntax', 'placeholder': 'dwc-link:wiki:syntax', 'anchor': '...'|None}, ...]
-    attachments: [{'media_id': 'wiki:foo.png', 'filename': 'foo.png', 'src_path': str|None}, ...]
-    title:       첫 h1 의 텍스트(없으면 None)
-    tags:        dokuwiki tag 플러그인의 page tag 값 리스트 (Confluence 페이지 label 로 매핑 후보)
+    ## 인자/반환
+
+    raw_html:   `?do=export_xhtmlbody` 응답 본문
+    src_root:   미디어 파일 lookup 의 base path
+
+    반환 tuple:
+      storage_xml:  Confluence storage XML 문자열
+      links:        [{'target': 'wiki:syntax', 'placeholder': 'dwc-link:wiki:syntax',
+                      'anchor': '...'|None}, ...]
+      attachments:  [{'media_id': 'wiki:foo.png', 'filename': 'foo.png',
+                      'src_path': str|None}, ...]
+      title:        첫 h1 의 텍스트 (없으면 None)
+      tags:         dokuwiki tag 플러그인의 page tag 값 리스트 (Confluence 페이지
+                    label 로 매핑 후보)
+
+    ## 변환 파이프라인 (순서 중요)
+
+    이전 단계 변경이 다음 단계 입력 — 순서 바꾸면 깨짐. grep '# § STEP' 으로 anchor.
+
+    ┌─────┬──────────────────────────────────────────────────────┬─────────────────┐
+    │ 단계│ 역할                                                  │ 호출 함수       │
+    ├─────┼──────────────────────────────────────────────────────┼─────────────────┤
+    │ 0   │ full-HTML fallback — `<main id=dokuwiki__content>`   │ (인라인)        │
+    │     │ 의 `<div class=page>` 만 살림                          │                 │
+    │ 1   │ 플러그인 매크로 → Confluence 매크로 (위 src 보존)     │                 │
+    │ 1.1 │  wrap callouts (info/tip/note/warning/panel)         │ _convert_wrap_callouts │
+    │ 1.2 │  monthcal fallback → 정적 캘린더 <table>             │ _convert_monthcal_fallback │
+    │ 1.3 │  youtube fallback → iframe embed                     │ _convert_youtube_fallback │
+    │ 1.4 │  encryptedpasswords → expand+code (cipher 보존)      │ _convert_encrypted_passwords │
+    │ 1.5 │  Google Calendar iframe → Confluence iframe          │ _convert_google_calendar_iframe │
+    │ 1.6 │  smiley 이미지 → emoji 텍스트                          │ _convert_smileys │
+    │ 1.7 │  정렬/밑줄/표 셀 정렬 → inline style                  │ _convert_visual_residue │
+    │ 1.8 │  풋노트 → <hr/><strong>각주</strong> + anchor 매크로  │ _convert_footnotes │
+    │ 1.9 │  todo → task-list / unicode 글리프                    │ _convert_todos │
+    │ 2   │ 위험 태그 strip (script/style/iframe/form 등)         │ (인라인)        │
+    │ 3   │ DokuWiki chrome strip (#dokuwiki__site 등)            │ (인라인)        │
+    │ 4   │ secedit / toc / EDIT 코멘트 / 잔존 ~~MACRO~~ strip   │ (인라인)        │
+    │ 5   │ 제목 추출 (첫 h1 또는 h2)                              │ (인라인)        │
+    │ 6   │ <img> → <ac:image><ri:attachment>                    │ (인라인)        │
+    │ 7   │ 내부 링크 → dwc-link: placeholder (2-pass rewrite)    │ (인라인)        │
+    │ 8   │ 외부 링크 / 첨부 링크 정리                            │ (인라인)        │
+    │ 9   │ 코드 블록 → ac:structured-macro[name=code]            │ (인라인)        │
+    │ 10  │ tag 플러그인 → Confluence label 후보                   │ (인라인)        │
+    │ 11  │ 잔존 class/id/data-* 속성 정리                        │ (인라인)        │
+    │ 12  │ void 태그 self-close + serialize                       │ (인라인)        │
+    └─────┴──────────────────────────────────────────────────────┴─────────────────┘
     """
     from bs4 import BeautifulSoup, Comment
 
@@ -1619,8 +1657,6 @@ def _convert_html_to_storage(
             del tag.attrs["class"]
 
     # 7) 직렬화 + void element XML 자체 닫기 + CDATA 치환
-    import re as _re
-
     result = "".join(str(c) for c in soup.children)
     result = _re.sub(r"<(br|hr|img)([^>]*?)(?<!/)\s*>", r"<\1\2/>", result)
 
@@ -1826,7 +1862,6 @@ def _load_users_map(path: str | None) -> dict[str, str]:
     """
     if not path:
         return {}
-    import json as _json
     try:
         data = _json.loads(Path(path).read_text(encoding="utf-8"))
         if not isinstance(data, dict):
@@ -1855,8 +1890,6 @@ def _apply_page_labels(session, base_url: str, page_id: str, labels: list[str]) 
     사용 — v2 의 label API 는 read-only 라 추가는 v1 endpoint 만 가능.
     Confluence label 은 lowercase + alphanumeric/-/_ 만 허용 — 자동 sanitize.
     """
-    import re as _re
-
     sanitized: list[dict] = []
     seen: set[str] = set()
     for raw in labels:
@@ -2583,8 +2616,6 @@ def _rewrite_links_in_xml(
 
     result = "".join(str(c) for c in soup.children)
 
-    import re as _re
-
     result = _re.sub(r"<(br|hr|img)([^>]*?)(?<!/)\s*>", r"<\1\2/>", result)
 
     for sentinel, text in link_body_texts.items():
@@ -2772,8 +2803,6 @@ def cmd_history_discover(args: argparse.Namespace) -> int:
     n_files = 0
     decode_replaced = 0
     import gzip
-    import re as _re
-
     rev_pattern = _re.compile(r"\.(\d{8,12})\.txt\.gz$")
     page_meta: dict[str, list[int]] = {}  # doku_id -> [ts, ts, ...]
 
@@ -3047,8 +3076,6 @@ def _revision_header(
       - 'paragraphs' 기존 동작 — 3 개의 <p> 로 분리 (이전 호환용)
     """
     from datetime import datetime, timezone
-    import html as _h
-
     if fmt == "none":
         return ""
 
@@ -3408,7 +3435,6 @@ def _extract_revision_header_data(body: str) -> dict | None:
 def _revision_header_from_extracted(d: dict, *, fmt: str) -> str:
     """추출된 헤더 데이터를 새 형식으로 재구성 — _revision_header 와 동일한
     템플릿이지만 rev_ts 가 아닌 이미 포맷된 dt 문자열 사용."""
-    import html as _h
     if fmt == "none":
         return ""
     dt = _h.escape(d["rev_dt"])
@@ -3665,7 +3691,6 @@ def cmd_struct_discover(args: argparse.Namespace) -> int:
         n_schemas += 1
 
         # types.config 에서 label.<lang> 추출
-        import json
         col_name_map: dict[int, str] = {}
         for colref, sort, tid, cls, cfg_json in col_rows:
             name = None
@@ -3765,7 +3790,6 @@ def cmd_struct_discover(args: argparse.Namespace) -> int:
                         )
                         n_refs += 1
 
-            import json
             conn.execute(
                 "INSERT OR REPLACE INTO struct_rows(sid, pid, bound_doku_id, payload_json, status) "
                 "VALUES (?, ?, ?, ?, 'DISCOVERED')",
@@ -3851,7 +3875,6 @@ def _struct_render_cell(conn, cls: str, value, *, multi_join: str = ", ") -> str
     Text/Decimal/Dropdown 은 escape 된 텍스트.
     multi 값은 같은 셀에 누적.
     """
-    import html as _h
     if value is None or value == "":
         return ""
     if isinstance(value, list):
@@ -3902,7 +3925,6 @@ def _struct_row_to_details_macro(conn, sid: int, payload: dict, columns) -> str:
 
     columns 는 [(colref, name, cls)] 정렬된 리스트.
     """
-    import html as _h
     rows_html = []
     for colref, name, cls in columns:
         val = payload.get(str(colref))
@@ -3976,9 +3998,6 @@ def cmd_struct_convert(args: argparse.Namespace) -> int:
     if not schemas:
         log("struct-convert 대상 schema 없음.")
         return 0
-
-    import json as _json
-    import html as _h
 
     converted = 0
     for sid, tbl, row_count, status in schemas:
@@ -4289,7 +4308,6 @@ def cmd_struct_upload(args: argparse.Namespace) -> int:
             "SELECT colref, name, dokuwiki_class FROM struct_columns WHERE sid=? ORDER BY sort",
             (sid,),
         ).fetchall()
-        import json as _json
         for pid, payload_json, existing_row_page in rows:
             row_sp = out_dir / f"{tbl}.row.{pid}.xml"
             if not row_sp.is_file():
@@ -4378,7 +4396,6 @@ def _struct_build_index_xml(
     base_url: str, space_key: str = "",
 ) -> str:
     """index 페이지의 storage XML 빌드. db_id 가 있으면 Database webui 링크 + 안내 박스 포함."""
-    import html as _h
     embed = ""
     if db_id and base_url:
         if space_key:
@@ -4474,8 +4491,6 @@ def cmd_struct_embed_on_bound_pages(args: argparse.Namespace) -> int:
     base = args.base_url.rstrip("/")
 
     # bound_page (doku_id) → [(tbl, pid, row_page_id, row_title)]
-    import json as _json
-    import html as _h
     bucket: dict[str, list[tuple[str, int, str, str]]] = {}
     schema_titles: dict[str, set[str]] = {}
     for tbl, (col, kind) in STRUCT_BINDINGS.items():
@@ -4867,7 +4882,6 @@ def cmd_rewrite_oversized(args: argparse.Namespace) -> int:
 
         if applied:
             new_xml = "".join(str(c) for c in soup.children)
-            import re as _re
             new_xml = _re.sub(r"<(br|hr|img)([^>]*?)(?<!/)\s*>", r"<\1\2/>", new_xml)
             new_hash = sha256_bytes(new_xml.encode("utf-8"))
             sp.write_text(new_xml, encoding="utf-8")
@@ -4966,7 +4980,6 @@ def _extract_visible_text(html_or_xml: str) -> str:
         div.decompose()
     text = s.get_text(separator=" ", strip=True)
     # 공백 정규화
-    import re as _re
     return _re.sub(r"\s+", " ", text).strip()
 
 
@@ -5086,7 +5099,6 @@ def _structural_features(html_or_xml: str, is_storage: bool) -> dict[str, int]:
         f["task"] = len(soup.find_all("ac:task"))
         # 텍스트 마커 폴백 (mixed todo)
         text_all = soup.get_text()
-        import re as _re
         f["task_text_marker"] = len(_re.findall(r"\[(?:x| )\] ", text_all))
     else:
         # DokuWiki: smiley 와 일반 미디어 분리, 외부 proxy 와 내부 분리
@@ -5186,7 +5198,6 @@ def _split_sentences(text: str) -> list[str]:
 
     완벽한 분리가 아니어도 양측에 *동일하게 적용* 하면 difflib 가 정렬을 잘 함.
     """
-    import re as _re
     # 줄바꿈을 보존하면서 구두점 뒤에 줄바꿈 삽입
     s = _re.sub(r"([.!?…])\s+", r"\1\n", text)
     s = _re.sub(r"([다요죠지요네까나]\.\s+|[다요죠].\s+)", r"\1\n", s)
@@ -5273,7 +5284,6 @@ def _extract_code_blocks(html_or_xml: str, is_storage: bool) -> list[str]:
             classes = pre.get("class") or []
             if any(c in ("code", "file") for c in classes):
                 blocks.append(pre.get_text())
-    import re as _re
     return [_re.sub(r"\s+", " ", b).strip() for b in blocks if b.strip()]
 
 
@@ -5626,7 +5636,6 @@ def cmd_audit(args: argparse.Namespace) -> int:
             log(f"  {cat:25} pages={n:4}  total_delta={cat_total_delta[cat]:+d}")
 
     if args.output_json:
-        import json as _json
         Path(args.output_json).write_text(
             _json.dumps(results, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -5634,7 +5643,6 @@ def cmd_audit(args: argparse.Namespace) -> int:
         log(f"JSON 결과 저장 → {args.output_json}")
 
     if args.output_html:
-        import html as _h
         lines = [
             "<!doctype html><html lang='ko'><head><meta charset='utf-8'>",
             "<title>audit report</title>",
@@ -5731,7 +5739,6 @@ def cmd_report(args: argparse.Namespace) -> int:
 
     header("Confluence 매크로 카운트 (storage 안)")
     if sizes:
-        import re as _re
         macro_counts: dict[str, int] = {}
         for f in _glob.glob("storage/**/*.xml", recursive=True):
             txt = Path(f).read_text(encoding="utf-8", errors="replace")
@@ -5798,8 +5805,6 @@ def cmd_preview(args: argparse.Namespace) -> int:
     storage_xml = ""
     if storage_path and Path(storage_path).is_file():
         storage_xml = Path(storage_path).read_text(encoding="utf-8")
-
-    import html as _h
 
     out = f"""<!doctype html>
 <html lang="ko">
@@ -6064,7 +6069,6 @@ def _scan_plugin_usage(src_path: Path, installed: set[str] | None = None) -> dic
 
     kind: 'tilde' (~~MACRO~~) / 'double_brace' ({{plugin>...}}) / 'block_tag' (<tag>)
     """
-    import re as _re
     from collections import Counter, defaultdict
     if installed is None:
         installed = set()
@@ -6265,7 +6269,6 @@ def _dev_detect_plugins(src: Path) -> dict[str, str]:
     if conf_root:
         pl = conf_root / "plugins.local.php"
         if pl.is_file():
-            import re as _re
             for name, val in _re.findall(
                 r"\$plugins\['([^']+)'\]\s*=\s*(\d+)",
                 pl.read_text(encoding="utf-8", errors="replace"),
@@ -6285,7 +6288,6 @@ def _dev_detect_plugins(src: Path) -> dict[str, str]:
     # 4) 페이지 본문 ~~MACRO~~ → 매크로별 플러그인
     pages_dir = data_root / "pages"
     if pages_dir.is_dir():
-        import re as _re
         macros_seen: set[str] = set()
         cnt = 0
         for txt in pages_dir.rglob("*.txt"):
@@ -6378,7 +6380,6 @@ def _dev_patch_acl_off(clone_root: Path) -> None:
     text = local_php.read_text(encoding="utf-8", errors="replace")
     new_text = text
     if "$conf['useacl']" in new_text:
-        import re as _re
         new_text = _re.sub(
             r"\$conf\['useacl'\]\s*=\s*\d+\s*;",
             "$conf['useacl'] = 0;",
@@ -6414,7 +6415,6 @@ def _evp_bytes_to_key(password: bytes, salt: bytes,
                        key_len: int = 32, iv_len: int = 16) -> tuple[bytes, bytes]:
     """OpenSSL EVP_BytesToKey with MD5, 1 iteration — encryptedpasswords plugin
     (gibberish-aes.js) 의 KDF 와 호환."""
-    import hashlib
     dtot = b""
     d = b""
     while len(dtot) < key_len + iv_len:
@@ -6431,7 +6431,6 @@ def decrypt_encryptedpasswords(cipher_b64: str, password: str) -> str:
     KDF: EVP_BytesToKey(MD5, 1 iter, key=32, iv=16)
     Padding: PKCS7
     """
-    import base64
     try:
         from Crypto.Cipher import AES  # type: ignore
     except ImportError:
@@ -6495,7 +6494,6 @@ def cmd_link_check(args: argparse.Namespace) -> int:
     rows = conn.execute(sql, params).fetchall()
     log(f"링크 점검 대상: {len(rows)} 페이지")
 
-    import re as _re
     summary = {
         "total_pages": len(rows),
         "checked": 0,
@@ -6572,7 +6570,6 @@ def cmd_link_check(args: argparse.Namespace) -> int:
     log(f"  문제 있는 페이지:   {len(summary['details'])}")
 
     if args.output:
-        import json as _json
         Path(args.output).write_text(
             _json.dumps(summary, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -6604,8 +6601,6 @@ def cmd_decrypt(args: argparse.Namespace) -> int:
       python run.py decrypt --password PASS --confluence-id PAGE_ID  # Confluence 페이지의 모든 cipher
     """
     import getpass
-    import re as _re
-
     password = args.password
     if password is None:
         password = getpass.getpass("Password: ")
@@ -6701,7 +6696,6 @@ def cmd_plugin_scan(args: argparse.Namespace) -> int:
     installed = result["installed"]
     log(f"페이지 스캔: {n} 파일 / 설치된 플러그인: {len(installed)}개")
 
-    import json as _json
     if args.json:
         # 직렬화: set → list
         serializable = dict(result)
@@ -7295,7 +7289,6 @@ def _verify_capture_screenshots(
 
     confluence_auth_header = ""
     if confluence_email and confluence_token:
-        import base64
         token = base64.b64encode(
             f"{confluence_email}:{confluence_token}".encode()
         ).decode()
@@ -7866,10 +7859,6 @@ def _verify_ai_compare(
     except ImportError:
         log("anthropic SDK 미설치 — `pip install anthropic` 후 재실행.")
         return {}
-    try:
-        import base64
-    except ImportError:
-        return {}
 
     client = anthropic.Anthropic(api_key=anthropic_api_key)
     results: dict[str, dict] = {}
@@ -7909,8 +7898,6 @@ def _verify_ai_compare(
                 }],
             )
             text = resp.content[0].text.strip() if resp.content else ""
-            import json as _json
-            import re as _re
             m = _re.search(r"\{.*\}", text, _re.DOTALL)
             if m:
                 parsed = _json.loads(m.group(0))
@@ -7986,7 +7973,6 @@ def _verify_render_iframe_doc(body_html: str) -> str:
 
 def _verify_render_metrics_row(metrics: dict) -> str:
     """양측 카운트 비교 미니 테이블 + 자동 신호 (sentence/artifact/code/heading/link)."""
-    import html as _h
     rows = metrics.get("rows", [])
     cells = []
     for label, d, s, c, ok in rows:
@@ -8160,9 +8146,6 @@ def _verify_render_html(
 ) -> str:
     """우선순위 큐를 받아 단일 정적 HTML 갤러리 생성. iframe 격리 + 자동
     지표 + 첨부 점검 + (옵션) 스크린샷 + (옵션) AI vision 점수."""
-    import html as _h
-    import json as _json
-
     metrics_map = metrics_map or {}
     attachment_map = attachment_map or {}
     screenshot_map = screenshot_map or {}
@@ -8651,8 +8634,6 @@ def cmd_verify_build(args: argparse.Namespace) -> int:
 
 
 def cmd_verify_import(args: argparse.Namespace) -> int:
-    import json as _json
-
     if not Path(args.path).is_file():
         log(f"파일 없음: {args.path}")
         return 1
@@ -8904,7 +8885,6 @@ def _wiz_plugin_audit(conn, args) -> str:
     """raw/*.xhtml 을 훑어 ~~MACRO~~ / <... class=\"plugin_*\"> 잔존 확인.
     사용자가 플러그인을 추가 설치하고 re-render 할지 물음."""
     from collections import Counter
-    import re as _re
     macros: Counter[str] = Counter()
     n_files = 0
     for (raw_path,) in conn.execute(
@@ -9147,7 +9127,6 @@ def _has_table(conn, name: str) -> bool:
 
 def _wizard_build_report_body(conn) -> str:
     """state.db 의 핵심 카운트를 모아 Confluence storage XML 본문 생성."""
-    import html as _h
     def q1(sql, default=0):
         try:
             r = conn.execute(sql).fetchone()
