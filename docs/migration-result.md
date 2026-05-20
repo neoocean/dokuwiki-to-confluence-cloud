@@ -73,6 +73,22 @@ CL 53121-53269. *대규모 변환기 보강 + 라이브 적용 사이클*.
 - 섹션 헤더 표준화 (20곳)
 - `_add_confluence_creds_args` / `_add_confluence_space_args` 로 argparse
   boilerplate -38%
+- **DDL 통합** (CL 53278): `MAIN_SCHEMA_DDL` / `HISTORY_SCHEMA_DDL` /
+  `STRUCT_SCHEMA_DDL` 상수 분리, `db_init()` 가 단일 진입점 (history/struct
+  도 메인 db_init 에서 동시에 생성) — schema 정의 산재 → 한곳에 모임
+- **build_parser 9 도메인 helper 분리** (CL 53279): ~460줄 거대 함수 →
+  25줄 orchestrator + 9개 `_build_*_subcommands()` (pipeline / history /
+  struct / oversized / audit_report / verify / dev / tool / wizard). 새 명령
+  추가 위치가 helper 명으로 자명해짐
+- **cmd_history_upload / cmd_struct_upload 본체 분리** (CL 53281):
+  - history-upload (100→43): `_history_upload_select_pages` + `_replay_one_page`
+  - struct-upload (280→57): `_probe_database_api` + `_select_schemas` +
+    `_snapshot_schema` + `_indexed_schema`
+- **return type hint 보강** (CL 53282): ast 검사로 누락 14개 발견 → 모두
+  명시 (`_confluence_session`, `_request_with_retry`, `_struct_resolve_*`,
+  `_struct_post_page`, `_diff_page`, `_vc_pil_open`, `_wizard_get`, q1, etc).
+  `from __future__ import annotations` 활성 → 외부 import 없는 forward ref 안전
+- 전체 164 tests 무회귀, 모든 helper 분리는 순수 구조 리팩토링 (동작 동일)
 
 ---
 
