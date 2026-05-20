@@ -6023,6 +6023,7 @@ def _verify_capture_screenshots(
     *,
     capture_main_only: bool = False,
     extract_bbox: bool = False,
+    confluence_view_html: dict[str, str] | None = None,
 ) -> dict[str, dict]:
     """Playwright + ImageHash 가 설치돼 있을 때만 동작. 양측 페이지를
     헤드리스 Chromium 으로 풀 렌더 → PNG → phash. 결과는 doku_id → dict.
@@ -6034,6 +6035,9 @@ def _verify_capture_screenshots(
     / `.cnf.main.png`) 추가 캡쳐.
     extract_bbox=True: 블록 (h1-h6/p/table/img/pre/ul/ol) 의 bbox + text 를
     `bboxes_dwk` / `bboxes_cnf` 키로 결과에 추가.
+    confluence_view_html: doku_id → Confluence body-format=view 의 본문 HTML.
+        제공되면 `page.goto()` 대신 `page.set_content()` 로 렌더 — Confluence
+        Cloud 의 페이지 UI 인증 (Basic Auth 만으로 view 접근 불가) 우회.
     """
     try:
         from playwright.sync_api import sync_playwright  # type: ignore
@@ -6128,7 +6132,40 @@ def _verify_capture_screenshots(
             except Exception as e:
                 log(f"  [dwk fail] {doku_id}: {e}")
             try:
-                if confluence_base and page_id:
+                view_html = (confluence_view_html or {}).get(doku_id)
+                if view_html:
+                    # 옵션 3: body-format=view 의 HTML 을 set_content 로 직접 주입.
+                    # Confluence Cloud UI 인증 우회 — 동일 viewport 에서 본문만 렌더.
+                    # base href 로 상대 URL (이미지 등) 해소.
+                    wrapped = (
+                        '<!DOCTYPE html><html><head><meta charset="utf-8">'
+                        f'<base href="{(confluence_base or "").rstrip("/")}/">'
+                        '<style>'
+                        'body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;'
+                        'max-width:760px;margin:1em auto;padding:0 1em;line-height:1.5;color:#1d1d1f;}'
+                        'table{border-collapse:collapse;margin:0.5em 0;}'
+                        'th,td{border:1px solid #ddd;padding:0.3em 0.6em;}'
+                        'img{max-width:100%;}'
+                        'pre{background:#f5f5f5;padding:0.5em;overflow:auto;border-radius:4px;}'
+                        '</style></head>'
+                        f'<body>{view_html}</body></html>'
+                    )
+                    page.set_content(wrapped, wait_until="domcontentloaded")
+                    page.screenshot(path=str(c_path), full_page=True)
+                    if capture_main_only:
+                        # view HTML 은 chrome 없음 — body 자체가 main
+                        try:
+                            page.locator("body").first.screenshot(path=str(c_main_path))
+                        except Exception:
+                            pass
+                    if extract_bbox:
+                        try:
+                            c_bboxes = page.evaluate(bbox_js) or []
+                        except Exception:
+                            c_bboxes = []
+                elif confluence_base and page_id:
+                    # 폴백: 인증 가능한 페이지면 직접 goto (보통 Confluence Cloud
+                    # 는 로그인 페이지로 redirect → confluence_view_html 권장).
                     page.goto(
                         f"{confluence_base.rstrip('/')}/pages/{page_id}",
                         timeout=20000, wait_until="networkidle",
@@ -7285,6 +7322,8 @@ def cmd_verify_build(args: argparse.Namespace) -> int:
     shots_dir = out_dir_for_shots / "verify-screenshots"
     if args.with_screenshots or needs_main_capture or needs_bbox:
         log(f"Playwright 스크린샷 시작 → {shots_dir} ({len(queue)} 페이지)")
+        # confluence_bodies (body-format=view) 를 Playwright 에 직접 주입 →
+        # Confluence Cloud UI 인증 우회 (Basic Auth 만으로 페이지 view 접근 불가)
         screenshot_map = _verify_capture_screenshots(
             queue, shots_dir,
             dokuwiki_base=args.dokuwiki_base_url or env_default("DOKUWIKI_BASE_URL"),
@@ -7293,6 +7332,7 @@ def cmd_verify_build(args: argparse.Namespace) -> int:
             confluence_token=args.api_token or "",
             capture_main_only=needs_main_capture,
             extract_bbox=needs_bbox,
+            confluence_view_html={k: v for k, v in confluence_bodies.items() if v},
         )
 
     # Phase 4 신호 계산 (페이지별)
