@@ -9395,6 +9395,26 @@ def env_default(key: str, fallback: str = "") -> str:
     return os.environ.get(key, fallback)
 
 
+def _add_confluence_creds_args(parser: argparse.ArgumentParser) -> None:
+    """모든 Confluence API 호출 명령에 공통인 자격증명 옵션 (--base-url /
+    --email / --api-token) 일괄 추가. env_default 로 .env 자동 fill.
+
+    이 helper 가 없으면 매 명령마다 3줄 boilerplate. 새 명령 추가 시 자격증명
+    인자 누락 방지.
+    """
+    parser.add_argument("--base-url", default=env_default("CONFLUENCE_BASE_URL"))
+    parser.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
+    parser.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
+
+
+def _add_confluence_space_args(parser: argparse.ArgumentParser) -> None:
+    """Confluence 자격증명 + space/root 옵션 — upload / struct-upload /
+    report-publish 등 *페이지 생성* 명령에 필요."""
+    _add_confluence_creds_args(parser)
+    parser.add_argument("--space-key", default=env_default("CONFLUENCE_SPACE_KEY"))
+    parser.add_argument("--root-page-id", default=env_default("CONFLUENCE_ROOT_PAGE_ID"))
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="run.py",
@@ -9438,12 +9458,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp_upload.add_argument(
         "--root-page-id", default=env_default("CONFLUENCE_ROOT_PAGE_ID"), help="루트 부모 페이지 ID"
     )
-    sp_upload.add_argument(
-        "--base-url",
-        default=env_default("CONFLUENCE_BASE_URL"),
-    )
-    sp_upload.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
-    sp_upload.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
+
+    _add_confluence_creds_args(sp_upload)
     sp_upload.add_argument("--dry-run", action="store_true")
     sp_upload.add_argument("--only", help="특정 doku_id 만 업로드")
     sp_upload.add_argument(
@@ -9454,12 +9470,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp_upload.set_defaults(func=cmd_upload)
 
     sp_rewrite = sub.add_parser("rewrite-links", help="내부 링크 2-pass 치환 (S7)")
-    sp_rewrite.add_argument(
-        "--base-url",
-        default=env_default("CONFLUENCE_BASE_URL"),
-    )
-    sp_rewrite.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
-    sp_rewrite.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
+
+    _add_confluence_creds_args(sp_rewrite)
     sp_rewrite.add_argument("--dry-run", action="store_true")
     sp_rewrite.add_argument("--only", help="특정 doku_id 만 처리")
     sp_rewrite.set_defaults(func=cmd_rewrite_links)
@@ -9496,12 +9508,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp_hc.set_defaults(func=cmd_history_convert)
 
     sp_hu = sub.add_parser("history-upload", help="시간순 PUT replay → Confluence 버전 체인")
-    sp_hu.add_argument(
-        "--base-url",
-        default=env_default("CONFLUENCE_BASE_URL"),
-    )
-    sp_hu.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
-    sp_hu.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
+
+    _add_confluence_creds_args(sp_hu)
     sp_hu.add_argument("--only", help="특정 doku_id 만 replay")
     sp_hu.add_argument("--limit", type=int, help="처음 N revision PUT 후 종료")
     sp_hu.add_argument("--users-map", help="dokuwiki user → Confluence accountId JSON 매핑")
@@ -9514,11 +9522,8 @@ def build_parser() -> argparse.ArgumentParser:
         "history-rewrite-headers",
         help="이미 업로드된 페이지의 revision 헤더만 새 형식으로 교체 (PUT)",
     )
-    sp_hrh.add_argument(
-        "--base-url", default=env_default("CONFLUENCE_BASE_URL"),
-    )
-    sp_hrh.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
-    sp_hrh.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
+
+    _add_confluence_creds_args(sp_hrh)
     sp_hrh.add_argument(
         "--header-format", choices=REVISION_HEADER_FORMATS,
         help=f"새 헤더 형식 (기본: meta 의 revision_header_fmt 또는 {REVISION_HEADER_DEFAULT})",
@@ -9545,14 +9550,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp_sc.set_defaults(func=cmd_struct_convert)
 
     sp_su = sub.add_parser("struct-upload", help="struct-convert 결과를 Confluence 에 업로드")
-    sp_su.add_argument(
-        "--base-url",
-        default=env_default("CONFLUENCE_BASE_URL"),
-    )
-    sp_su.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
-    sp_su.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
-    sp_su.add_argument("--space-key", default=env_default("CONFLUENCE_SPACE_KEY"))
-    sp_su.add_argument("--root-page-id", default=env_default("CONFLUENCE_ROOT_PAGE_ID"))
+
+    _add_confluence_space_args(sp_su)
     sp_su.add_argument("--probe", action="store_true", help="Confluence Database API 가용성만 측정")
     sp_su.add_argument("--probe-keep", action="store_true", help="probe 후 임시 Database 삭제 안 함")
     sp_su.add_argument(
@@ -9579,12 +9578,8 @@ def build_parser() -> argparse.ArgumentParser:
         "struct-embed-on-bound-pages",
         help="struct row 의 bound 페이지에 '관련 struct 데이터' 패널 임베드",
     )
-    sp_se.add_argument(
-        "--base-url",
-        default=env_default("CONFLUENCE_BASE_URL"),
-    )
-    sp_se.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
-    sp_se.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
+
+    _add_confluence_creds_args(sp_se)
     sp_se.add_argument("--only-doku", help="특정 doku_id 한 페이지만 처리")
     sp_se.set_defaults(func=cmd_struct_embed_on_bound_pages)
 
@@ -9592,14 +9587,8 @@ def build_parser() -> argparse.ArgumentParser:
         "rewrite-oversized-pages",
         help="본문 거부된 페이지를 skeleton + storage XML 첨부로 fallback (docs/oversized-pages.md C 모드)",
     )
-    sp_rop.add_argument(
-        "--base-url",
-        default=env_default("CONFLUENCE_BASE_URL"),
-    )
-    sp_rop.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
-    sp_rop.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
-    sp_rop.add_argument("--space-key", default=env_default("CONFLUENCE_SPACE_KEY"))
-    sp_rop.add_argument("--root-page-id", default=env_default("CONFLUENCE_ROOT_PAGE_ID"))
+
+    _add_confluence_space_args(sp_rop)
     sp_rop.add_argument("--only", help="특정 doku_id 만 처리")
     sp_rop.set_defaults(func=cmd_rewrite_oversized_pages)
 
@@ -9607,24 +9596,16 @@ def build_parser() -> argparse.ArgumentParser:
         "rewrite-oversized",
         help="OVERSIZED 첨부 reference 를 note 매크로 메타 박스로 (docs/oversized-attachments.md §4.1 B 모드)",
     )
-    sp_ro.add_argument(
-        "--base-url",
-        default=env_default("CONFLUENCE_BASE_URL"),
-    )
-    sp_ro.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
-    sp_ro.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
+
+    _add_confluence_creds_args(sp_ro)
     sp_ro.add_argument("--no-upload", action="store_true", help="storage 만 갱신, Confluence PUT 안 함")
     sp_ro.set_defaults(func=cmd_rewrite_oversized)
 
     sp_audit = sub.add_parser(
         "audit", help="Confluence 의 실제 페이지를 받아 dokuwiki raw 와 비교"
     )
-    sp_audit.add_argument(
-        "--base-url",
-        default=env_default("CONFLUENCE_BASE_URL"),
-    )
-    sp_audit.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
-    sp_audit.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
+
+    _add_confluence_creds_args(sp_audit)
     sp_audit.add_argument("--only", help="특정 doku_id 만 비교")
     sp_audit.add_argument("--sample", type=int, help="UPLOADED 중 무작위 N개")
     sp_audit.add_argument("--full", action="store_true", help="전체 UPLOADED 페이지 비교")
@@ -9747,12 +9728,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--with-all-extra-signals", action="store_true",
         help="(Phase 4) 위 7가지 시각 비교 추가 신호 모두 활성",
     )
-    sp_verify_build.add_argument(
-        "--base-url",
-        default=env_default("CONFLUENCE_BASE_URL"),
-    )
-    sp_verify_build.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
-    sp_verify_build.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
+
+    _add_confluence_creds_args(sp_verify_build)
     sp_verify_build.add_argument("--reviewer", help="검수자 식별자 (default: --email)")
     sp_verify_build.add_argument(
         "--output", help="출력 HTML 경로 (default: verify-gallery.html)"
@@ -9846,9 +9823,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp_dec.add_argument("cipher", nargs="*", help="base64-encoded cipher 1+ (생략 시 --page 또는 --confluence-id)")
     sp_dec.add_argument("--page", help="state.db 의 페이지 (raw/storage 본문에서 모든 cipher 추출 + 복호화)")
     sp_dec.add_argument("--confluence-id", help="Confluence 페이지 ID — 본문 GET 후 모든 cipher 복호화")
-    sp_dec.add_argument("--base-url", default=env_default("CONFLUENCE_BASE_URL"))
-    sp_dec.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
-    sp_dec.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
+
+    _add_confluence_creds_args(sp_dec)
     sp_dec.set_defaults(func=cmd_decrypt)
 
     sp_lc = sub.add_parser(
@@ -9856,9 +9832,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Confluence 측 페이지의 링크 정합성 검증 (placeholder 잔존 / "
         "unresolved page link / 외부 URL HTTP HEAD)",
     )
-    sp_lc.add_argument("--base-url", default=env_default("CONFLUENCE_BASE_URL"))
-    sp_lc.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
-    sp_lc.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
+
+    _add_confluence_creds_args(sp_lc)
     sp_lc.add_argument("--only", help="특정 doku_id 만")
     sp_lc.add_argument("--limit", type=int, help="처음 N 페이지")
     sp_lc.add_argument("--check-external", action="store_true",
@@ -9888,11 +9863,8 @@ def build_parser() -> argparse.ArgumentParser:
         "report-publish",
         help="state.db 통계 기반 결과 보고서를 Confluence 페이지로 발행/갱신",
     )
-    sp_rp.add_argument("--base-url", default=env_default("CONFLUENCE_BASE_URL"))
-    sp_rp.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
-    sp_rp.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
-    sp_rp.add_argument("--space-key", default=env_default("CONFLUENCE_SPACE_KEY"))
-    sp_rp.add_argument("--root-page-id", default=env_default("CONFLUENCE_ROOT_PAGE_ID"))
+
+    _add_confluence_space_args(sp_rp)
     sp_rp.add_argument("--report-title", help="페이지 제목 (기본: DokuWiki → Confluence 마이그레이션 결과 보고서)")
     sp_rp.set_defaults(func=cmd_report_publish)
 
