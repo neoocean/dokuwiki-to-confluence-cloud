@@ -808,6 +808,14 @@ TABLE_ALIGN_CLASS_MAP = {
 }
 
 
+# § 변환기: 플러그인 fallback / 외부 임베드
+#
+# 모두 _convert_html_to_storage 안에서 _convert_wrap_callouts 직후 호출:
+#   1. _convert_monthcal_fallback        — monthcal 플러그인 미설치 fallback
+#   2. _convert_youtube_fallback         — youtube 매크로 fallback
+#   3. _convert_encrypted_passwords      — <decrypt>...</decrypt> → expand+code
+#   4. _convert_google_calendar_iframe   — Google Calendar iframe 보존
+
 _MONTHCAL_HREF_RE = re.compile(
     r'^/_media/monthcal/(?:align_(\w+)_)?namespace/'
     r'(?P<ns>[^_]*)_?month_(?P<m>\d+)_year_(?P<y>\d+)'
