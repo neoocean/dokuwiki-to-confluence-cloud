@@ -5729,6 +5729,14 @@ PLUGIN_DOWNLOADS: dict[str, str | None] = {
     "tag":        "https://github.com/dokufreaks/plugin-tag/archive/refs/heads/master.tar.gz",
     "tagging":    "https://github.com/cosmocode/dokuwiki-plugin-tagging/archive/refs/heads/main.tar.gz",
     "sqlite":     "https://github.com/cosmocode/dokuwiki-plugin-sqlite/archive/refs/heads/master.tar.gz",
+    "monthcal":   "https://github.com/c5o/dokuwiki-plugin-monthcal/archive/refs/heads/master.tar.gz",
+    "youtube":    "https://github.com/anonymous-from-the-think-tank/youtube/archive/refs/heads/master.tar.gz",
+    "iframe":     "https://github.com/dokuwiki-iframe/iframe/archive/refs/heads/master.tar.gz",
+    "encrypt":    "https://github.com/splitbrain/dokuwiki-plugin-encrypted/archive/refs/heads/master.tar.gz",
+    "html":       None,   # 보안 위험 — 수동 설치만 권장
+    "davcal":     None,   # 패키지 형식 다양 — 수동
+    "box":        None,   # 다양한 fork — 수동
+    "info":       None,   # core 번들 (위에서 처리)
     "logviewer":  None,   # bundled
     "info":       None,   # bundled
     "popularity": None,   # bundled
@@ -5748,12 +5756,225 @@ PLUGIN_DOWNLOADS: dict[str, str | None] = {
 }
 
 # 페이지 본문 ~~MACRO~~ → 플러그인 매핑 (자동 감지용)
-MACRO_TO_PLUGIN: dict[str, str] = {
+# 값이 None 이면 DokuWiki core 매크로 (별도 플러그인 불필요).
+MACRO_TO_PLUGIN: dict[str, str | None] = {
+    # core macros
+    "NOTOC": None, "NOCACHE": None,
+    # plugin macros
     "DISCUSSION": "discussion",
-    "INFO":       "info",
+    "INFO":       "info",       # info plugin 또는 core
     "BOX":        "box",
     "TODO":       "todo",
+    "BLOG":       "blog",
+    "FIRSTCHILD": "include",
+    "MATHJAX":    "mathjax",
+    "GRAPHVIZ":   "graphviz",
+    "MERMAID":    "mermaid",
+    "NEWPAGE":    "newpagetemplate",
+    "REVEAL":     "reveal",
+    "TAGS":       "tag",
+    "INDEXMENU_N": "indexmenu",
+    "STATS":      "stats",
 }
+
+# `{{plugin>...}}` 또는 `{{plugin?...}}` 형식의 플러그인 이름 매핑
+DOUBLEBRACE_TO_PLUGIN: dict[str, str | None] = {
+    "page": "include", "section": "include", "nopages": "include",
+    "namespace": "include", "tagpage": "include",
+    "tag": "tag", "topic": "tag", "count": "tag",
+    "tagtopic": "tagging", "taglist": "tagging",
+    "rss": None,
+    "monthcal": "monthcal",
+    "calendar": "davcal", "davcal": "davcal",
+    "blog": "blog", "archive": "blog",
+    "youtube": "youtube", "vimeo": "vimeo", "video": "video",
+    "gallery": "gallery", "simplegallery": "simplegallery",
+    "iframe": "iframe",
+    "counter": "counter",
+    "struct": "struct", "schema": "struct", "table": "struct",
+    "form": "bureaucracy",
+    "csv": "csv",
+    "graphviz": "graphviz", "mermaid": "mermaid", "plantuml": "plantuml",
+    "include": "include",
+    "siteexport": "siteexport",
+    "table": "structpublish",
+}
+
+# `<plugin>...</plugin>` 형식의 블록/인라인 태그 → 플러그인
+# (HTML 표준 + DokuWiki core syntax 는 자동 제외 → STANDARD_BLOCK_TAGS)
+BLOCKTAG_TO_PLUGIN: dict[str, str | None] = {
+    "wrap": "wrap", "WRAP": "wrap",
+    "box": "box",
+    "color": "color",
+    "note": "note",
+    "todo": "todo",
+    "html": "html", "HTML": "html",
+    "php": "html", "PHP": "html",
+    "csv": "csv",
+    "form": "bureaucracy",
+    "decrypt": "encrypt", "encrypt": "encrypt",
+    "iframe": "iframe",
+    "highlight": "highlight",
+    "marquee": "marquee",
+    "fold": "folded",
+    "card": "cards",
+    "tag": "tag",
+}
+
+# HTML 표준 / DokuWiki core / GPS 데이터 등 false-positive 제외 리스트
+STANDARD_BLOCK_TAGS = {
+    "p", "br", "hr", "b", "i", "u", "em", "strong", "code", "pre",
+    "span", "div", "a", "img", "table", "tr", "td", "th",
+    "ul", "ol", "li", "dl", "dt", "dd",
+    "blockquote", "sup", "sub", "del", "ins",
+    "h1", "h2", "h3", "h4", "h5", "h6",
+    "html", "head", "body",  # 일부 HTML 매크로 안에서 사용 — 별도 처리
+    "abbr", "cite", "q", "small", "kbd", "samp", "var", "mark",
+    "section", "article", "aside", "nav", "header", "footer",
+    "figure", "figcaption", "details", "summary",
+    "input", "button", "select", "option", "label", "form", "textarea",
+    "audio", "video", "source", "track",
+    "thead", "tbody", "tfoot",
+    "fieldset", "legend",
+    # DokuWiki core syntax
+    "nowiki", "file", "code",  # 코어 ``` 또는 <code>
+    "del",
+    # GPS/GPX/TCX 데이터 (사용자 페이지에 잘라 붙은 경우)
+    "ele", "time", "sym", "name", "desc", "type", "cmt",
+    "lat", "lon", "trkpt", "trkseg", "trk", "rte", "rtept", "wpt",
+    "extensions", "speed", "course", "fix", "sat", "hdop", "vdop",
+    # Apache config 잔재
+    "IfModule", "IfVersion", "VirtualHost", "Directory", "Location",
+    "Limit", "LimitExcept", "Files", "FilesMatch",
+}
+
+
+def _scan_plugin_usage(src_path: Path, installed: set[str] | None = None) -> dict:
+    """src_path/pages/**/*.txt 를 스캔해 DokuWiki 매크로/태그 사용 카운트 +
+    설치된 플러그인 비교 → 미설치 플러그인 목록.
+
+    반환: {
+        'n_files': int,
+        'installed': set[str],
+        'macros': [{kind, name, plugin, count, installed, samples}],
+        'missing': [{plugin, kind, name, count, samples, install_url}],
+    }
+
+    kind: 'tilde' (~~MACRO~~) / 'double_brace' ({{plugin>...}}) / 'block_tag' (<tag>)
+    """
+    import re as _re
+    from collections import Counter, defaultdict
+    if installed is None:
+        installed = set()
+        for cand in (src_path / "lib" / "plugins",
+                     src_path.parent / "lib" / "plugins",
+                     _dev_data_root(src_path).parent / "lib" / "plugins" if _dev_data_root(src_path) else None):
+            if cand and cand.is_dir():
+                installed = {p.name for p in cand.iterdir()
+                            if p.is_dir() and not p.name.startswith(".")}
+                break
+
+    pages_dir = _dev_data_root(src_path)
+    if not pages_dir:
+        pages_dir = src_path
+    pages_dir = pages_dir / "pages" if (pages_dir / "pages").is_dir() else pages_dir
+
+    TILDE = _re.compile(r"~~([A-Z][A-Z0-9_]+)(?::[^~]*)?~~")
+    # `{{name>...}}` — `>` 가 핵심 separator (콜론은 namespace path 라 미디어 ID)
+    DB = _re.compile(r"\{\{(?!\s)([a-zA-Z][a-zA-Z0-9_]*)>[^}]*\}\}")
+    BLOCK = _re.compile(r"<(?!/)([a-zA-Z][a-zA-Z0-9_]*)(?:\s+[^>]*)?>", re.S)
+
+    tilde_c: Counter[str] = Counter()
+    db_c: Counter[str] = Counter()
+    block_c: Counter[str] = Counter()
+    sample: dict[str, list[str]] = defaultdict(list)
+    n_files = 0
+
+    for p in pages_dir.rglob("*.txt"):
+        try:
+            txt = p.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        n_files += 1
+        try:
+            rel = str(p.relative_to(pages_dir))
+        except ValueError:
+            rel = p.name
+        for m in TILDE.findall(txt):
+            tilde_c[m] += 1
+            key = f"~~{m}~~"
+            if len(sample[key]) < 3:
+                sample[key].append(rel)
+        for m in DB.findall(txt):
+            db_c[m] += 1
+            key = f"{{{{{m}>}}}}"
+            if len(sample[key]) < 3:
+                sample[key].append(rel)
+        for m in BLOCK.findall(txt):
+            if m.lower() in {t.lower() for t in STANDARD_BLOCK_TAGS}:
+                continue
+            block_c[m] += 1
+            key = f"<{m}>"
+            if len(sample[key]) < 3:
+                sample[key].append(rel)
+
+    rows: list[dict] = []
+    missing: list[dict] = []
+
+    def _row(kind: str, name: str, plugin: str | None, count: int) -> dict:
+        is_core = plugin is None and kind == "tilde"  # core macro
+        is_installed = plugin in installed if plugin else False
+        key = f"~~{name}~~" if kind == "tilde" else (
+            f"{{{{{name}>}}}}" if kind == "double_brace" else f"<{name}>"
+        )
+        return {
+            "kind": kind, "name": name, "plugin": plugin,
+            "count": count, "installed": is_installed, "core": is_core,
+            "samples": sample.get(key, []),
+        }
+
+    for name, count in tilde_c.most_common():
+        plugin = MACRO_TO_PLUGIN.get(name)
+        rows.append(_row("tilde", name, plugin, count))
+    for name, count in db_c.most_common():
+        plugin = DOUBLEBRACE_TO_PLUGIN.get(name)
+        # plugin 매핑 없음 → DokuWiki 미디어/namespace 일 가능성 (false positive 제외)
+        if plugin is None and name not in DOUBLEBRACE_TO_PLUGIN:
+            continue
+        rows.append(_row("double_brace", name, plugin, count))
+    for name, count in block_c.most_common():
+        plugin = BLOCKTAG_TO_PLUGIN.get(name) or BLOCKTAG_TO_PLUGIN.get(name.lower())
+        if plugin is None and name.lower() not in BLOCKTAG_TO_PLUGIN:
+            continue
+        rows.append(_row("block_tag", name, plugin, count))
+
+    # missing — 매핑된 플러그인 중 미설치
+    seen_missing: set[str] = set()
+    for r in rows:
+        plugin = r["plugin"]
+        if not plugin or plugin in installed or plugin in seen_missing:
+            continue
+        seen_missing.add(plugin)
+        missing.append({
+            "plugin": plugin,
+            "kind": r["kind"], "name": r["name"],
+            "count": r["count"], "samples": r["samples"],
+            "install_url": PLUGIN_DOWNLOADS.get(plugin),
+        })
+    # 같은 플러그인을 다른 매크로에서 참조한 카운트 합산
+    plugin_counts: Counter[str] = Counter()
+    for r in rows:
+        if r["plugin"]:
+            plugin_counts[r["plugin"]] += r["count"]
+    for m in missing:
+        m["count"] = plugin_counts[m["plugin"]]
+
+    return {
+        "n_files": n_files,
+        "installed": installed,
+        "macros": rows,
+        "missing": missing,
+    }
 
 
 def _project_root() -> Path:
@@ -5970,6 +6191,78 @@ def _dev_wait_healthy(timeout: int = DEV_HEALTH_TIMEOUT) -> bool:
             pass
         time.sleep(1)
     return False
+
+
+def cmd_plugin_scan(args: argparse.Namespace) -> int:
+    """DokuWiki 페이지 본문을 스캔해 사용된 매크로/태그를 카운트하고
+    설치된 플러그인 (lib/plugins/) 과 비교 → 미설치 플러그인 목록.
+
+    DokuWiki 가 동작 중일 필요 없음 — 데이터 디렉터리만 있으면 가능.
+    """
+    src = Path(args.src).expanduser().resolve() if args.src else None
+    if src is None:
+        conn = db_connect(args.db)
+        src_str = db_get_meta(conn, "dokuwiki_src")
+        if src_str:
+            src = Path(src_str)
+    if src is None or not src.is_dir():
+        log("DokuWiki 데이터 경로 미지정. --src /path 또는 discover 먼저 실행.")
+        return 2
+
+    log(f"스캔 대상: {src}")
+    result = _scan_plugin_usage(src)
+    n = result["n_files"]
+    installed = result["installed"]
+    log(f"페이지 스캔: {n} 파일 / 설치된 플러그인: {len(installed)}개")
+
+    import json as _json
+    if args.json:
+        # 직렬화: set → list
+        serializable = dict(result)
+        serializable["installed"] = sorted(installed)
+        Path(args.json).write_text(_json.dumps(serializable, ensure_ascii=False, indent=2),
+                                    encoding="utf-8")
+        log(f"JSON → {args.json}")
+
+    # 콘솔 표
+    print()
+    print(f"{'kind':14} {'name':16} {'plugin':14} {'count':>6} 상태  샘플 페이지")
+    print("-" * 100)
+    for r in result["macros"]:
+        if args.only_missing and (r["installed"] or r["core"]):
+            continue
+        status = "core" if r["core"] else ("✓" if r["installed"] else "✗ 미설치")
+        plugin = r["plugin"] or "-"
+        samples = ", ".join(r["samples"][:2])
+        print(f"{r['kind']:14} {r['name']:16} {plugin:14} {r['count']:>6}  {status:9} {samples[:60]}")
+    print()
+    if result["missing"]:
+        print(f"=== 미설치 플러그인 {len(result['missing'])}개 ===")
+        for m in result["missing"]:
+            url = m["install_url"] or "(PLUGIN_DOWNLOADS 매핑 없음 — 수동 설치)"
+            print(f"  {m['plugin']:18} ({m['count']:>5} 참조)  {url}")
+    else:
+        print("✓ 미설치 플러그인 없음 — 모든 참조된 플러그인이 설치됨")
+
+    # 옵션: 자동 설치 (PLUGIN_DOWNLOADS 매핑이 있는 미설치 플러그인만)
+    if args.install and result["missing"]:
+        if not DEV_CLONE_DST.exists():
+            log(f"클론이 없습니다 ({DEV_CLONE_DST}) — `dev up` 먼저 또는 --install-into 경로 지정")
+            if not args.install_into:
+                return 1
+            dest = Path(args.install_into).expanduser().resolve()
+        else:
+            dest = DEV_CLONE_DST
+        targets = [m["plugin"] for m in result["missing"] if m["install_url"]]
+        if not targets:
+            log("자동 설치 가능한 플러그인 없음 (매핑 부재)")
+            return 0
+        log(f"자동 설치 대상 {len(targets)}개 → {dest}/lib/plugins/")
+        res = _dev_install_plugins(dest, targets)
+        for kind, names in res.items():
+            if names:
+                log(f"  {kind} ({len(names)}): {', '.join(names)}")
+    return 0
 
 
 def cmd_dev(args: argparse.Namespace) -> int:
@@ -9044,6 +9337,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="감지에 쓸 데이터 디렉터리 (기본: 클론 자체에서 감지)",
     )
     sp_dev_install.set_defaults(func=cmd_dev)
+
+    sp_ps = sub.add_parser(
+        "plugin-scan",
+        help="DokuWiki 페이지 본문을 스캔해 사용된 매크로/태그 → 미설치 플러그인 식별",
+    )
+    sp_ps.add_argument(
+        "--src", default=env_default("DOKUWIKI_SRC"),
+        help="스캔할 DokuWiki 데이터 / install 디렉터리",
+    )
+    sp_ps.add_argument(
+        "--only-missing", action="store_true",
+        help="미설치 + 비-core 플러그인 만 표시 (출력 압축)",
+    )
+    sp_ps.add_argument("--json", help="결과를 JSON 파일로 저장")
+    sp_ps.add_argument(
+        "--install", action="store_true",
+        help="미설치 + PLUGIN_DOWNLOADS 매핑 있는 플러그인 자동 다운로드·설치 "
+        "(기본 대상: /tmp/dwc_test_dokuwiki/dwdata, --install-into 로 override)",
+    )
+    sp_ps.add_argument("--install-into", help="자동 설치 대상 디렉터리 override")
+    sp_ps.set_defaults(func=cmd_plugin_scan)
 
     sp_wiz = sub.add_parser(
         "wizard",

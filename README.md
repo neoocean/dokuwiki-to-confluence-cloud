@@ -644,6 +644,7 @@ WAL 모드라 동시 read 는 OK 지만 long-running write 가 있으면 lock.
 | 운영 | `dev up [--bootstrap] [--install-plugins]` | 컨테이너 기동 (full / data-only 자동 분기) |
 |  | `dev down [--purge]` | 컨테이너 종료 |
 |  | `dev install-plugins` | 기존 클론에 플러그인 추가 설치 |
+|  | `plugin-scan [--only-missing] [--install]` | DokuWiki 페이지 본문 스캔 → 미설치 플러그인 식별 (DokuWiki 동작 없이도) |
 | 사후 처리 | `rewrite-oversized` | 100MB+ 첨부 → note 매크로 |
 |  | `rewrite-oversized-pages` | 본문 거부 페이지 → skeleton + zip |
 | history | `history-discover/render/convert/upload/status` | attic 인덱싱 → ?rev= 캐시 → storage + 헤더 → 시간순 PUT replay |
