@@ -8463,6 +8463,84 @@ updateBadge();
     return head + topbar + "".join(cards) + js + "</body></html>"
 
 
+def _verify_resolve_vc_flags(args: argparse.Namespace) -> dict[str, bool]:
+    """Phase 4 옵션 7개 + --with-all-extra-signals 결합 → enabled dict."""
+    extra_all = getattr(args, "with_all_extra_signals", False)
+    return {
+        "pixel_diff":      extra_all or getattr(args, "with_pixel_diff", False),
+        "tile_phash":      extra_all or getattr(args, "with_tile_phash", False),
+        "element_compare": extra_all or getattr(args, "with_element_compare", False),
+        "ocr":             extra_all or getattr(args, "with_ocr", False),
+        "bbox_lcs":        extra_all or getattr(args, "with_bbox_lcs", False),
+        "storage_ast":     extra_all or getattr(args, "with_storage_ast", False),
+        "color_hist":      extra_all or getattr(args, "with_color_hist", False),
+    }
+
+
+def _verify_fetch_view_bodies(
+    session, base: str, queue: list[dict], body_format: str,
+) -> dict[str, str | None]:
+    """queue 의 각 페이지에 대해 Confluence body-format=view 본문 fetch."""
+    bodies: dict[str, str | None] = {}
+    log(f"Confluence body-format={body_format} fetch 시작 ({len(queue)} 페이지)")
+    for i, q in enumerate(queue, 1):
+        page_id = q["confluence_page_id"]
+        if not page_id:
+            continue
+        bodies[q["doku_id"]] = _verify_fetch_confluence_view(
+            session, base, page_id, body_format=body_format,
+        )
+        if i % 20 == 0:
+            log(f"  fetched {i}/{len(queue)}")
+    return bodies
+
+
+def _verify_compute_phase4_signals(
+    queue: list[dict], screenshot_map: dict[str, dict],
+    vc_enabled: dict[str, bool], conn: sqlite3.Connection,
+    shots_dir: Path,
+) -> dict[str, dict]:
+    """Phase 4 시각 비교 7신호 페이지별 계산. raw/storage 본문은 state.db
+    의 pages 테이블에서 로드 (storage_ast 신호 용)."""
+    out: dict[str, dict] = {}
+    log(f"Phase 4 시각 비교 신호 계산: {[k for k,v in vc_enabled.items() if v]}")
+    for i, q in enumerate(queue, 1):
+        doku_id = q["doku_id"]
+        sh = screenshot_map.get(doku_id, {})
+        stem = doku_id.replace(":", "_")
+        raw_html, storage_xml = "", ""
+        row = conn.execute(
+            "SELECT raw_xhtml_path, storage_path FROM pages WHERE doku_id=?",
+            (doku_id,),
+        ).fetchone()
+        if row:
+            rp, sp = row
+            if rp and Path(rp).is_file():
+                try:
+                    raw_html = Path(rp).read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    pass
+            if sp and Path(sp).is_file():
+                try:
+                    storage_xml = Path(sp).read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    pass
+        out[doku_id] = _vc_compute_all(
+            d_full_png=sh.get("dokuwiki_png"),
+            c_full_png=sh.get("confluence_png"),
+            d_main_png=sh.get("dokuwiki_main_png"),
+            c_main_png=sh.get("confluence_main_png"),
+            bboxes_dwk=sh.get("bboxes_dwk") or [],
+            bboxes_cnf=sh.get("bboxes_cnf") or [],
+            raw_html=raw_html, storage_xml=storage_xml,
+            overlay_dir=shots_dir, stem=stem,
+            enabled=vc_enabled,
+        )
+        if i % 20 == 0:
+            log(f"  Phase 4 신호 {i}/{len(queue)}")
+    return out
+
+
 def cmd_verify_build(args: argparse.Namespace) -> int:
     conn = db_connect(args.db)
     _ensure_verify_schema(conn)
@@ -8495,18 +8573,9 @@ def cmd_verify_build(args: argparse.Namespace) -> int:
     if args.with_confluence_view and session is not None:
         base = args.base_url.rstrip("/")
         base_view_url = base
-        log(f"Confluence body-format={args.body_format} fetch 시작 "
-            f"({len(queue)} 페이지)")
-        for i, q in enumerate(queue, 1):
-            page_id = q["confluence_page_id"]
-            if not page_id:
-                continue
-            body = _verify_fetch_confluence_view(
-                session, base, page_id, body_format=args.body_format,
-            )
-            confluence_bodies[q["doku_id"]] = body
-            if i % 20 == 0:
-                log(f"  fetched {i}/{len(queue)}")
+        confluence_bodies = _verify_fetch_view_bodies(
+            session, base, queue, args.body_format,
+        )
 
     # 시각 지표 자동 계산 — raw / storage / (옵션) view 양측
     metrics_map: dict[str, dict] = {}
@@ -8545,16 +8614,7 @@ def cmd_verify_build(args: argparse.Namespace) -> int:
                 log(f"  attachment check {i}/{len(queue)}")
 
     # Phase 4 옵션 결합
-    extra_all = getattr(args, "with_all_extra_signals", False)
-    vc_enabled = {
-        "pixel_diff":      extra_all or getattr(args, "with_pixel_diff", False),
-        "tile_phash":      extra_all or getattr(args, "with_tile_phash", False),
-        "element_compare": extra_all or getattr(args, "with_element_compare", False),
-        "ocr":             extra_all or getattr(args, "with_ocr", False),
-        "bbox_lcs":        extra_all or getattr(args, "with_bbox_lcs", False),
-        "storage_ast":     extra_all or getattr(args, "with_storage_ast", False),
-        "color_hist":      extra_all or getattr(args, "with_color_hist", False),
-    }
+    vc_enabled = _verify_resolve_vc_flags(args)
     needs_main_capture = any(vc_enabled[k] for k in ("pixel_diff", "tile_phash", "ocr", "color_hist"))
     needs_bbox = any(vc_enabled[k] for k in ("element_compare", "bbox_lcs"))
 
@@ -8580,43 +8640,9 @@ def cmd_verify_build(args: argparse.Namespace) -> int:
     # Phase 4 신호 계산 (페이지별)
     vc_map: dict[str, dict] = {}
     if any(vc_enabled.values()):
-        log(f"Phase 4 시각 비교 신호 계산: {[k for k,v in vc_enabled.items() if v]}")
-        for i, q in enumerate(queue, 1):
-            doku_id = q["doku_id"]
-            sh = screenshot_map.get(doku_id, {})
-            stem = doku_id.replace(":", "_")
-            # raw_html / storage_xml 로드 (storage_ast 용)
-            raw_html = ""
-            storage_xml = ""
-            row = conn.execute(
-                "SELECT raw_xhtml_path, storage_path FROM pages WHERE doku_id=?",
-                (doku_id,),
-            ).fetchone()
-            if row:
-                rp, sp = row
-                if rp and Path(rp).is_file():
-                    try:
-                        raw_html = Path(rp).read_text(encoding="utf-8", errors="ignore")
-                    except OSError:
-                        pass
-                if sp and Path(sp).is_file():
-                    try:
-                        storage_xml = Path(sp).read_text(encoding="utf-8", errors="ignore")
-                    except OSError:
-                        pass
-            vc_map[doku_id] = _vc_compute_all(
-                d_full_png=sh.get("dokuwiki_png"),
-                c_full_png=sh.get("confluence_png"),
-                d_main_png=sh.get("dokuwiki_main_png"),
-                c_main_png=sh.get("confluence_main_png"),
-                bboxes_dwk=sh.get("bboxes_dwk") or [],
-                bboxes_cnf=sh.get("bboxes_cnf") or [],
-                raw_html=raw_html, storage_xml=storage_xml,
-                overlay_dir=shots_dir, stem=stem,
-                enabled=vc_enabled,
-            )
-            if i % 20 == 0:
-                log(f"  Phase 4 신호 {i}/{len(queue)}")
+        vc_map = _verify_compute_phase4_signals(
+            queue, screenshot_map, vc_enabled, conn, shots_dir,
+        )
 
     # AI vision 비교 (옵션, 스크린샷 필수)
     vision_map: dict[str, dict] = {}
