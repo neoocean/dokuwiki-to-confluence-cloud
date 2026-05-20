@@ -3091,7 +3091,7 @@ def _revision_header(
 
     fmt:
       - 'none'       헤더 박스 생략 (본문만)
-      - 'panel'      panel 매크로 + 한 단락 내부에 shift+enter (<br/>) 줄바꿈 (기본)
+      - 'panel'      panel 매크로 + 불릿 리스트 3 항목 (기본)
       - 'info'/'note'/'tip'/'warning'  같은 모양, 매크로 종류만 변경
       - 'quote'      <blockquote> 안에 3줄 (shift+enter)
       - 'table'      2열 표 (라벨/값 × 3행)
@@ -3138,16 +3138,16 @@ def _revision_header(
             '</table>'
         )
 
-    # panel / info / note / tip / warning — 한 단락 + shift+enter (<br/>)
+    # panel / info / note / tip / warning — 매크로 + 불릿 리스트 3 항목
     macro_name = fmt if fmt in ("panel", "info", "note", "tip", "warning") else "panel"
     return (
         f'<ac:structured-macro ac:name="{macro_name}">'
         '<ac:rich-text-body>'
-        '<p>'
-        f'DokuWiki revision: <code>{dt}</code> ({type_label})<br/>'
-        f'Author: {user_repr}<br/>'
-        f'Comment: <code>{comment_h}</code>'
-        '</p>'
+        '<ul>'
+        f'<li>DokuWiki revision: <code>{dt}</code> ({type_label})</li>'
+        f'<li>Author: {user_repr}</li>'
+        f'<li>Comment: <code>{comment_h}</code></li>'
+        '</ul>'
         '</ac:rich-text-body>'
         '</ac:structured-macro>'
     )
@@ -3381,7 +3381,20 @@ _REV_HEADER_PATTERNS = [
         r'</ac:structured-macro>',
         re.S,
     ),
-    # panel/info/note/tip/warning (한 단락 + <br/>)
+    # 매크로 + 불릿 리스트 3 항목 (현 기본 panel)
+    re.compile(
+        r'<ac:structured-macro[^>]*ac:name="(?:panel|info|note|tip|warning)"[^>]*>'
+        r'<ac:rich-text-body>'
+        r'\s*<ul>\s*'
+        r'<li>\s*DokuWiki revision.*?</li>\s*'
+        r'<li>\s*Author.*?</li>\s*'
+        r'<li>\s*Comment.*?</li>\s*'
+        r'</ul>\s*'
+        r'</ac:rich-text-body>'
+        r'</ac:structured-macro>',
+        re.S,
+    ),
+    # panel/info/note/tip/warning (한 단락 + <br/>) — 이전 호환
     re.compile(
         r'<ac:structured-macro[^>]*ac:name="(?:panel|info|note|tip|warning)"[^>]*>'
         r'<ac:rich-text-body>'
@@ -3491,11 +3504,11 @@ def _revision_header_from_extracted(d: dict, *, fmt: str) -> str:
     macro_name = fmt if fmt in ("panel", "info", "note", "tip", "warning") else "panel"
     return (
         f'<ac:structured-macro ac:name="{macro_name}"><ac:rich-text-body>'
-        '<p>'
-        f'DokuWiki revision: <code>{dt}</code> ({type_label})<br/>'
-        f'Author: {author}<br/>'
-        f'Comment: <code>{comment}</code>'
-        '</p>'
+        '<ul>'
+        f'<li>DokuWiki revision: <code>{dt}</code> ({type_label})</li>'
+        f'<li>Author: {author}</li>'
+        f'<li>Comment: <code>{comment}</code></li>'
+        '</ul>'
         '</ac:rich-text-body></ac:structured-macro>'
     )
 

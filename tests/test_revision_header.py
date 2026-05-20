@@ -27,40 +27,42 @@ def test_header_none_returns_empty() -> None:
     assert out == ""
 
 
-def test_header_panel_uses_br() -> None:
-    """기본 (panel) — 한 단락 + shift+enter (<br/>) 줄바꿈."""
+def test_header_panel_uses_bullet_list() -> None:
+    """기본 (panel) — 불릿 리스트 3 항목."""
     out = run._revision_header(RT, "alice", "msg", "E", UM, fmt="panel")
     assert 'ac:name="panel"' in out
-    assert "<p>" in out and "</p>" in out
-    # 3개 라인이 한 <p> 안에 br/ 로 구분
-    assert out.count("<br/>") == 2
+    # 3개의 <li>
+    assert out.count("<ul>") == 1
+    assert out.count("<li>") == 3
+    assert "<br/>" not in out  # 이전 형식이 아님
     assert "DokuWiki revision" in out
     assert "Author: alice" in out
     assert "Comment:" in out
-    # 3개의 별도 <p> 가 아님
-    assert out.count("<p>") == 1
 
 
 def test_header_info_macro() -> None:
     out = run._revision_header(RT, "alice", "msg", "E", UM, fmt="info")
     assert 'ac:name="info"' in out
-    assert out.count("<br/>") == 2
+    assert out.count("<li>") == 3
+    assert "<br/>" not in out
 
 
 def test_header_note_macro() -> None:
     out = run._revision_header(RT, "alice", "msg", "E", UM, fmt="note")
     assert 'ac:name="note"' in out
-    assert out.count("<br/>") == 2
+    assert out.count("<li>") == 3
 
 
 def test_header_tip_macro() -> None:
     out = run._revision_header(RT, "alice", "msg", "E", UM, fmt="tip")
     assert 'ac:name="tip"' in out
+    assert out.count("<li>") == 3
 
 
 def test_header_warning_macro() -> None:
     out = run._revision_header(RT, "alice", "msg", "E", UM, fmt="warning")
     assert 'ac:name="warning"' in out
+    assert out.count("<li>") == 3
 
 
 def test_header_quote() -> None:
