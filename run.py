@@ -2307,7 +2307,8 @@ def _upload_attachments_for_page(
     return ok, fail
 
 
-def cmd_upload(args: argparse.Namespace) -> int:
+def _upload_validate_args(args: argparse.Namespace) -> list[str]:
+    """cmd_upload 의 인자 검증 — 누락 항목 메시지 리스트 반환. 빈 리스트면 OK."""
     missing = []
     if not args.space_key:
         missing.append("--space-key (또는 환경변수 CONFLUENCE_SPACE_KEY) — 대상 Confluence 공간의 키")
@@ -2318,6 +2319,51 @@ def cmd_upload(args: argparse.Namespace) -> int:
             missing.append("--email / 환경변수 CONFLUENCE_EMAIL")
         if not args.api_token:
             missing.append("--api-token / 환경변수 CONFLUENCE_API_TOKEN (https://id.atlassian.com/manage-profile/security/api-tokens 에서 생성)")
+    return missing
+
+
+def _upload_prepare_namespace(conn: sqlite3.Connection) -> None:
+    """업로드 전 네임스페이스 정리 — SKIPPED chain promote / stub / title disambig.
+
+    각 함수의 결과 개수를 로깅. 동작 없음 (count 0) 이면 조용.
+    """
+    promoted = _promote_skipped_pages_in_chain(conn)
+    if promoted:
+        log(f"SKIPPED → placeholder 자동 promote: {promoted}개 (chain 부모로 쓰이던 페이지)")
+    stub_count = _ensure_namespace_stubs(conn)
+    if stub_count:
+        log(f"네임스페이스 stub {stub_count}개 자동 생성")
+    dup_count = _disambiguate_duplicate_titles(conn)
+    if dup_count:
+        log(f"중복 title 사전 disambiguation: {dup_count}개 (Confluence per-space unique 제약)")
+
+
+def _upload_select_targets(
+    conn: sqlite3.Connection, only: str | None, include_parents: bool, limit: int | None,
+) -> list[str]:
+    """BFS upload 순서 + --only/--include-parents/--limit 필터 적용."""
+    order = _bfs_upload_order(conn)
+    if only:
+        # only 지정 시 부모 chain 도 함께 포함하지 않으면 SKIP 되므로,
+        # --include-parents 또는 단일 페이지 의도 분기.
+        selected = {only}
+        if include_parents:
+            cur = only
+            while cur:
+                row = conn.execute(
+                    "SELECT parent_doku_id FROM pages WHERE doku_id=?", (cur,)
+                ).fetchone()
+                cur = row[0] if row else None
+                if cur:
+                    selected.add(cur)
+        order = [d for d in order if d in selected]
+    if limit:
+        order = order[: limit]
+    return order
+
+
+def cmd_upload(args: argparse.Namespace) -> int:
+    missing = _upload_validate_args(args)
     if missing:
         log("upload 호출에 필요한 항목이 누락되었습니다:")
         for m in missing:
@@ -2332,15 +2378,7 @@ def cmd_upload(args: argparse.Namespace) -> int:
     db_set_meta(conn, "confluence_space_key", args.space_key)
     db_set_meta(conn, "confluence_root_page_id", args.root_page_id)
 
-    promoted = _promote_skipped_pages_in_chain(conn)
-    if promoted:
-        log(f"SKIPPED → placeholder 자동 promote: {promoted}개 (chain 부모로 쓰이던 페이지)")
-    stub_count = _ensure_namespace_stubs(conn)
-    if stub_count:
-        log(f"네임스페이스 stub {stub_count}개 자동 생성")
-    dup_count = _disambiguate_duplicate_titles(conn)
-    if dup_count:
-        log(f"중복 title 사전 disambiguation: {dup_count}개 (Confluence per-space unique 제약)")
+    _upload_prepare_namespace(conn)
 
     base_url = args.base_url.rstrip("/")
     session = None
@@ -2353,23 +2391,7 @@ def cmd_upload(args: argparse.Namespace) -> int:
         if not space_id:
             return 1
 
-    order = _bfs_upload_order(conn)
-    if args.only:
-        # only 지정 시 부모 chain 도 함께 포함하지 않으면 SKIP 되므로,
-        # --include-parents 또는 단일 페이지 의도 분기.
-        selected = {args.only}
-        if args.include_parents:
-            cur = args.only
-            while cur:
-                row = conn.execute(
-                    "SELECT parent_doku_id FROM pages WHERE doku_id=?", (cur,)
-                ).fetchone()
-                cur = row[0] if row else None
-                if cur:
-                    selected.add(cur)
-        order = [d for d in order if d in selected]
-    if args.limit:
-        order = order[: args.limit]
+    order = _upload_select_targets(conn, args.only, args.include_parents, args.limit)
 
     log(f"upload 대상: {len(order)} 페이지 (space_id={space_id}, root={args.root_page_id})")
 
