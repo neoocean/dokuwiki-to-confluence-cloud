@@ -6,13 +6,56 @@ DokuWiki 가 렌더링한 최종 XHTML 을 받아 Confluence storage format 으�
 변환하고, 네임스페이스 트리를 그대로 페이지 계층에 매핑한다. 자세한
 설계는 docs/scenarios.md 의 S1~S10 을 참고.
 
-서브커맨드:
+## 메인 파이프라인 서브커맨드 (라이브 마이그레이션)
+
   discover       페이지 트리 발견 (S1)
   render         DokuWiki XHTML 캐시 (S2)
   convert        XHTML -> Confluence storage format (S3)
   upload         페이지/첨부 생성·갱신 (S4~S6)
   rewrite-links  2-pass 내부 링크 치환 (S7)
   status         상태 요약
+
+## 별도 트랙
+
+  history-*      과거 리비전 이전 (시간순 PUT replay)
+  struct-*       struct plugin 데이터 → Confluence Database
+  rewrite-oversized*  100MB+ 첨부 / 본문 한도 거부 폴백
+  audit          Confluence 측 본문 ↔ DokuWiki 비교
+  verify build/import/status   사용자 시각 검수 큐 + 자동 신호
+  report / preview / lint      corpus 통계 / 페이지 미리보기 / XML lint
+
+## 도구 / 운영
+
+  dev up/down/install-plugins  로컬 DokuWiki 컨테이너 (full / data-only 자동)
+  plugin-scan                  데이터에서 사용 매크로 → 미설치 플러그인 식별
+  decrypt                      encryptedpasswords cipher 복호화 (AES-256-CBC)
+  link-check                   Confluence 측 링크 정합성 검사
+  wizard                       대화형 14 단계 (중단/재개 안전)
+  report-publish               state.db 통계 → Confluence 페이지 자동 발행
+
+## 코드 섹션 인덱스 (grep anchor — '# §' 로 시작)
+
+  § 유틸 / DB                    line ~40
+  § S1 Discover                  line ~250
+  § S2 Render                    line ~420
+  § S3 Convert (변환기 본체)      line ~540
+       _convert_*_callouts/footnotes/todos/smileys/visual_residue
+       _convert_monthcal_fallback / _convert_youtube_fallback
+       _convert_google_calendar_iframe / _convert_encrypted_passwords
+       _convert_html_to_storage   (메인 entry)
+  § S4-6 Upload                  line ~1750
+  § S7 Rewrite-links             line ~2470
+  § history-* track              line ~2700
+  § struct-* track               line ~3550
+  § rewrite-oversized-pages      line ~4570
+  § rewrite-oversized            line ~4730
+  § audit                        line ~4890
+  § report / preview / lint      line ~5630
+  § dev (컨테이너 + plugin-scan) line ~5860
+  § verify (시각 검수 + Phase 4) line ~6820
+  § wizard / report-publish      line ~8740
+  § decrypt / link-check         line ~6390
+  § argparse                     line ~9370 (메인 진입점)
 """
 
 from __future__ import annotations
@@ -39,7 +82,7 @@ STORAGE_DIR = Path("storage")
 LOGS_DIR = Path("logs")
 
 
-# ---------- 유틸 ----------
+# § 유틸
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -61,7 +104,7 @@ def log(msg: str) -> None:
     print(f"[{now_iso()}] {msg}", flush=True)
 
 
-# ---------- DB ----------
+# § DB
 
 def db_connect(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
@@ -246,7 +289,7 @@ def db_get_meta(conn: sqlite3.Connection, key: str) -> str | None:
     return row[0] if row else None
 
 
-# ---------- S1: Discover ----------
+# § S1: Discover
 
 def path_to_doku_id(pages_root: Path, txt_path: Path) -> tuple[str, str, bool]:
     """
@@ -419,7 +462,7 @@ def cmd_discover(args: argparse.Namespace) -> int:
     return 0
 
 
-# ---------- S2: Render ----------
+# § S2: Render
 
 def cmd_render(args: argparse.Namespace) -> int:
     try:
@@ -540,7 +583,7 @@ def cmd_render(args: argparse.Namespace) -> int:
     return 0
 
 
-# ---------- S3: Convert ----------
+# § S3: Convert
 
 DOKU_LINK_SCHEME = "dwc-link"
 CODE_BODY_SENTINEL_PREFIX = "__DWC_CODE_BODY_"
@@ -1746,7 +1789,7 @@ def cmd_convert(args: argparse.Namespace) -> int:
     return 0
 
 
-# ---------- S4~S6: Upload ----------
+# § S4~S6: Upload
 
 MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024  # 100MB
 
@@ -2466,7 +2509,7 @@ def cmd_upload(args: argparse.Namespace) -> int:
     return 0 if failed == 0 else 1
 
 
-# ---------- S7: Rewrite links ----------
+# § S7: Rewrite links
 
 LINK_BODY_SENTINEL_PREFIX = "__DWC_LINK_BODY_"
 
@@ -2691,7 +2734,7 @@ def cmd_rewrite_links(args: argparse.Namespace) -> int:
     return 0 if failed == 0 else 1
 
 
-# ---------- history: discover ----------
+# § history: discover
 
 def cmd_history_discover(args: argparse.Namespace) -> int:
     """attic/ + meta/*.changes + media_attic/ 인덱싱. 라이브 호출 없음.
@@ -3546,7 +3589,7 @@ def cmd_history_status(args: argparse.Namespace) -> int:
     return 0
 
 
-# ---------- struct: discover / convert ----------
+# § struct: discover / convert
 
 def _struct_db_path_from_meta(conn: sqlite3.Connection) -> Path | None:
     src = db_get_meta(conn, "dokuwiki_src")
@@ -4567,7 +4610,7 @@ def cmd_struct_status(args: argparse.Namespace) -> int:
     return 0
 
 
-# ---------- rewrite-oversized-pages: 본문 거부된 페이지 → skeleton + 첨부 ----------
+# § rewrite-oversized-pages: 본문 거부된 페이지 → skeleton + 첨부
 
 def cmd_rewrite_oversized_pages(args: argparse.Namespace) -> int:
     """
@@ -4730,7 +4773,7 @@ def cmd_rewrite_oversized_pages(args: argparse.Namespace) -> int:
     return 0 if failed == 0 else 1
 
 
-# ---------- rewrite-oversized: OVERSIZED 첨부 reference 를 메타 박스로 ----------
+# § rewrite-oversized: OVERSIZED 첨부 reference 를 메타 박스로
 
 def cmd_rewrite_oversized(args: argparse.Namespace) -> int:
     """
@@ -4887,7 +4930,7 @@ def cmd_rewrite_oversized(args: argparse.Namespace) -> int:
     return 0 if failed == 0 else 1
 
 
-# ---------- 보조: audit (dokuwiki vs Confluence 비교) ----------
+# § 보조: audit (dokuwiki vs Confluence 비교)
 
 def _extract_visible_text(html_or_xml: str) -> str:
     """텍스트만 추출 + 정규화. dokuwiki HTML 와 Confluence storage/view
@@ -5622,7 +5665,7 @@ def cmd_audit(args: argparse.Namespace) -> int:
     return 0 if bad == 0 else 1
 
 
-# ---------- 보조: report (corpus 통계 + 분포) ----------
+# § 보조: report (corpus 통계 + 분포)
 
 def cmd_report(args: argparse.Namespace) -> int:
     """pages / attachments / 매크로 분포 / 큰 페이지 / 충돌 후보 등 corpus
@@ -5724,7 +5767,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
-# ---------- 보조: preview (raw + storage 나란히) ----------
+# § 보조: preview (raw + storage 나란히)
 
 def cmd_preview(args: argparse.Namespace) -> int:
     """한 페이지의 dokuwiki raw HTML 과 Confluence storage XML 을 한
@@ -5801,7 +5844,7 @@ def cmd_preview(args: argparse.Namespace) -> int:
     return 0
 
 
-# ---------- 보조: lint (storage XML 유효성 검사) ----------
+# § 보조: lint (storage XML 유효성 검사)
 
 def cmd_lint(args: argparse.Namespace) -> int:
     """
@@ -5853,7 +5896,7 @@ def cmd_lint(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
-# ---------- 보조: dev up/down (로컬 DokuWiki 테스트 컨테이너) ----------
+# § 보조: dev up/down (로컬 DokuWiki 테스트 컨테이너)
 
 DEV_COMPOSE_REL = Path("dev/dokuwiki-local/docker-compose.yml")
 DEV_CLONE_DST = Path("/tmp/dwc_test_dokuwiki/dwdata")
@@ -6813,9 +6856,9 @@ def cmd_dev(args: argparse.Namespace) -> int:
     return 2
 
 
-# ---------- 보조: status ----------
+# § 보조: status
 
-# ---------- verify (시각 검수 큐, docs/visual-audit.md) ----------
+# § verify (시각 검수 큐, docs/visual-audit.md)
 
 VERIFY_DECISIONS_DDL = """
 CREATE TABLE IF NOT EXISTS verify_decisions (
@@ -8740,7 +8783,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 2
 
 
-# ---------- wizard (대화형 step-by-step CLI, docs/runbook.md 의 시퀀스 자동화) ----------
+# § wizard (대화형 step-by-step CLI, docs/runbook.md 의 시퀀스 자동화)
 
 WIZARD_DDL = """
 CREATE TABLE IF NOT EXISTS wizard_state (
@@ -9346,7 +9389,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
-# ---------- argparse ----------
+# § argparse
 
 def env_default(key: str, fallback: str = "") -> str:
     return os.environ.get(key, fallback)
