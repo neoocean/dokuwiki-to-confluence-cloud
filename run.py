@@ -3271,6 +3271,100 @@ def cmd_history_convert(args: argparse.Namespace) -> int:
     return 0
 
 
+def _history_upload_select_pages(
+    conn: sqlite3.Connection, args: argparse.Namespace
+) -> list[tuple[str, str, str]]:
+    """history-upload 대상 페이지 SELECT (doku_id, confluence_page_id, title).
+
+    args.only 지정 시 한 페이지로 제한. large_body_fallback 페이지는 호출자에서
+    건너뜀 (선택 단계에서는 포함)."""
+    where = "p.status='UPLOADED' AND p.confluence_page_id IS NOT NULL"
+    params: tuple = ()
+    if args.only:
+        where = "p.doku_id=?"
+        params = (args.only,)
+    return conn.execute(
+        f"SELECT p.doku_id, p.confluence_page_id, p.title FROM pages p "
+        f"WHERE {where} ORDER BY p.doku_id",
+        params,
+    ).fetchall()
+
+
+def _history_upload_replay_one_page(
+    session,
+    base: str,
+    conn: sqlite3.Connection,
+    doku_id: str,
+    cid: str,
+    title: str,
+    limit_left: int | None,
+) -> tuple[int, int, bool]:
+    """한 페이지의 CONVERTED 리비전을 ts 오름차순으로 PUT replay.
+
+    Returns (rev_ok, rev_fail, hit_limit). hit_limit 이면 호출자에서 즉시 종료.
+    동일 page 의 다음 rev 가 base version 충돌을 일으킬 수 있으므로 첫 실패 시
+    break 후 다음 페이지로 넘어감."""
+    hm = conn.execute(
+        "SELECT last_replayed_rev_ts FROM history_meta WHERE doku_id=?", (doku_id,)
+    ).fetchone()
+    last_ts = hm[0] if hm and hm[0] else 0
+    revs = conn.execute(
+        "SELECT rev_ts, storage_path FROM revisions "
+        "WHERE doku_id=? AND status='CONVERTED' AND rev_ts > ? "
+        "ORDER BY rev_ts",
+        (doku_id, last_ts),
+    ).fetchall()
+    if not revs:
+        return (0, 0, False)
+    log(f"  {doku_id}: {len(revs)} 리비전 replay")
+
+    rev_ok = rev_fail = 0
+    for rev_ts, sp in revs:
+        if not sp or not Path(sp).is_file():
+            rev_fail += 1
+            continue
+        body = Path(sp).read_text(encoding="utf-8")
+        cur_ver = _get_page_version(session, base, cid)
+        if cur_ver is None:
+            rev_fail += 1
+            break
+        payload = {
+            "id": cid, "status": "current", "title": title,
+            "body": {"representation": "storage", "value": body},
+            "version": {
+                "number": cur_ver + 1,
+                "message": f"DokuWiki rev {rev_ts}",
+            },
+        }
+        resp = _request_with_retry(
+            session, "PUT", f"{base}/api/v2/pages/{cid}", json=payload
+        )
+        if resp is None or resp.status_code >= 400:
+            conn.execute(
+                "UPDATE revisions SET status='FAILED', last_error=?, last_checked_at=? "
+                "WHERE doku_id=? AND rev_ts=?",
+                (f"PUT {resp.status_code if resp else 'no resp'}", now_iso(), doku_id, rev_ts),
+            )
+            conn.commit()
+            rev_fail += 1
+            break
+        conn.execute(
+            "UPDATE revisions SET status='UPLOADED', last_error=NULL, last_checked_at=? "
+            "WHERE doku_id=? AND rev_ts=?",
+            (now_iso(), doku_id, rev_ts),
+        )
+        conn.execute(
+            "INSERT INTO history_meta(doku_id, last_replayed_rev_ts) VALUES(?, ?) "
+            "ON CONFLICT(doku_id) DO UPDATE SET last_replayed_rev_ts=excluded.last_replayed_rev_ts",
+            (doku_id, rev_ts),
+        )
+        conn.commit()
+        rev_ok += 1
+        if limit_left is not None and rev_ok >= limit_left:
+            return (rev_ok, rev_fail, True)
+    return (rev_ok, rev_fail, False)
+
+
 def cmd_history_upload(args: argparse.Namespace) -> int:
     """페이지마다 ts 오름차순으로 PUT replay. 각 PUT 의 version.message 에
     원본 dokuwiki rev 메타 (ts/user/comment) 동봉. resume 안전.
@@ -3288,93 +3382,32 @@ def cmd_history_upload(args: argparse.Namespace) -> int:
     if session is None:
         return 2
     base = args.base_url.rstrip("/")
-    users_map = _load_users_map(args.users_map)
+    _load_users_map(args.users_map)  # 검증 — message 에는 rev_ts 만 동봉
 
-    # 대상 페이지: 메인 파이프라인에서 UPLOADED 된 페이지 + CONVERTED revision 가진 페이지
-    where = "p.status='UPLOADED' AND p.confluence_page_id IS NOT NULL"
-    params: tuple = ()
-    if args.only:
-        where = "p.doku_id=?"
-        params = (args.only,)
-
-    pages = conn.execute(
-        f"SELECT p.doku_id, p.confluence_page_id, p.title FROM pages p "
-        f"WHERE {where} ORDER BY p.doku_id",
-        params,
-    ).fetchall()
-
+    pages = _history_upload_select_pages(conn, args)
     log(f"history-upload 페이지 후보: {len(pages)}")
-    page_ok = page_fail = rev_ok = rev_fail = 0
+    page_ok = rev_ok_total = rev_fail_total = 0
 
     for doku_id, cid, title in pages:
         # large body fallback 페이지 skip — 본문 PUT 거부
         if db_get_meta(conn, f"large_body_fallback:{doku_id}"):
             continue
-        # 마지막 replayed_rev_ts 확인 (resume)
-        hm = conn.execute(
-            "SELECT last_replayed_rev_ts FROM history_meta WHERE doku_id=?", (doku_id,)
-        ).fetchone()
-        last_ts = hm[0] if hm and hm[0] else 0
-        revs = conn.execute(
-            "SELECT rev_ts, storage_path FROM revisions "
-            "WHERE doku_id=? AND status='CONVERTED' AND rev_ts > ? "
-            "ORDER BY rev_ts",
-            (doku_id, last_ts),
-        ).fetchall()
-        if not revs:
-            continue
-        log(f"  {doku_id}: {len(revs)} 리비전 replay")
+        limit_left = (args.limit - rev_ok_total) if args.limit else None
+        rev_ok, rev_fail, hit_limit = _history_upload_replay_one_page(
+            session, base, conn, doku_id, cid, title, limit_left
+        )
+        rev_ok_total += rev_ok
+        rev_fail_total += rev_fail
+        if rev_ok > 0 or rev_fail > 0:
+            page_ok += 1
+        if hit_limit:
+            log(f"--limit {args.limit} 도달")
+            conn.close()
+            return 0
 
-        for rev_ts, sp in revs:
-            if not sp or not Path(sp).is_file():
-                rev_fail += 1
-                continue
-            body = Path(sp).read_text(encoding="utf-8")
-            cur_ver = _get_page_version(session, base, cid)
-            if cur_ver is None:
-                rev_fail += 1
-                break
-            payload = {
-                "id": cid, "status": "current", "title": title,
-                "body": {"representation": "storage", "value": body},
-                "version": {
-                    "number": cur_ver + 1,
-                    "message": f"DokuWiki rev {rev_ts}",
-                },
-            }
-            resp = _request_with_retry(
-                session, "PUT", f"{base}/api/v2/pages/{cid}", json=payload
-            )
-            if resp is None or resp.status_code >= 400:
-                conn.execute(
-                    "UPDATE revisions SET status='FAILED', last_error=?, last_checked_at=? "
-                    "WHERE doku_id=? AND rev_ts=?",
-                    (f"PUT {resp.status_code if resp else 'no resp'}", now_iso(), doku_id, rev_ts),
-                )
-                conn.commit()
-                rev_fail += 1
-                break  # 같은 페이지의 다음 rev 도 같은 base version 충돌 우려
-            conn.execute(
-                "UPDATE revisions SET status='UPLOADED', last_error=NULL, last_checked_at=? "
-                "WHERE doku_id=? AND rev_ts=?",
-                (now_iso(), doku_id, rev_ts),
-            )
-            conn.execute(
-                "INSERT INTO history_meta(doku_id, last_replayed_rev_ts) VALUES(?, ?) "
-                "ON CONFLICT(doku_id) DO UPDATE SET last_replayed_rev_ts=excluded.last_replayed_rev_ts",
-                (doku_id, rev_ts),
-            )
-            conn.commit()
-            rev_ok += 1
-            if args.limit and rev_ok >= args.limit:
-                log(f"--limit {args.limit} 도달")
-                conn.close()
-                return 0
-        page_ok += 1
-
-    log(f"history-upload 완료: pages={page_ok} rev_ok={rev_ok} rev_fail={rev_fail}")
+    log(f"history-upload 완료: pages={page_ok} rev_ok={rev_ok_total} rev_fail={rev_fail_total}")
     conn.close()
-    return 0 if rev_fail == 0 else 1
+    return 0 if rev_fail_total == 0 else 1
 
 
 # Confluence 가 PUT 후 ac:schema-version / ac:macro-id 등 attr 를 자동 추가하므로
@@ -4117,6 +4150,271 @@ def cmd_struct_convert(args: argparse.Namespace) -> int:
     return 0
 
 
+def _struct_upload_probe_database_api(
+    session, base: str, space_id: str, args: argparse.Namespace
+) -> int:
+    """Confluence Database API 가용성 probe — 빈 Database 생성 후 컬럼/row
+    입력이 가능한 endpoint 가 있는지 후보 경로들을 체계적으로 탐색.
+
+    Atlassian 이 비공개로 운영 중인 경로 (rows/entries/items/records 등) 도 시도.
+    cleanup 으로 생성한 임시 Database 삭제 (--probe-keep 으로 보존 가능).
+    Returns: 0=발견, 1=Database 생성 실패, 3=발견 못함."""
+    log("=== Confluence Database API probe ===")
+    resp = _request_with_retry(
+        session, "POST", f"{base}/api/v2/databases",
+        json={"spaceId": space_id, "title": "dwc-probe", "parentId": args.root_page_id},
+    )
+    log(f"  POST /api/v2/databases → {resp.status_code if resp else 'no resp'}")
+    if not resp or resp.status_code >= 400:
+        log(f"    body: {(resp.text if resp else '')[:300]}")
+        log("=== probe 종료 (Database 생성 자체 실패) ===")
+        return 1
+    db_obj = resp.json()
+    db_id = db_obj.get("id")
+    log(f"  생성된 db: id={db_id} title={db_obj.get('title')}")
+
+    column_probes = [
+        ("POST", f"/api/v2/databases/{db_id}/columns", {"title": "txt", "type": "text"}),
+        ("POST", f"/api/v2/databases/{db_id}/fields",  {"title": "txt", "type": "text"}),
+        ("POST", f"/api/v2/databases/{db_id}/schema",  {"columns": [{"title": "txt", "type": "text"}]}),
+        ("PATCH", f"/api/v2/databases/{db_id}",        {"columns": [{"title": "txt", "type": "text"}]}),
+        ("PUT", f"/api/v2/databases/{db_id}",          {"title": "dwc-probe", "columns": [{"title": "txt", "type": "text"}]}),
+    ]
+    row_probes = [
+        ("POST", f"/api/v2/databases/{db_id}/rows",      {"values": {"txt": "x"}}),
+        ("POST", f"/api/v2/databases/{db_id}/entries",   {"values": {"txt": "x"}}),
+        ("POST", f"/api/v2/databases/{db_id}/items",     {"values": {"txt": "x"}}),
+        ("POST", f"/api/v2/databases/{db_id}/records",   {"values": {"txt": "x"}}),
+    ]
+    get_probes = [
+        f"/api/v2/databases/{db_id}/columns",
+        f"/api/v2/databases/{db_id}/fields",
+        f"/api/v2/databases/{db_id}/rows",
+        f"/api/v2/databases/{db_id}/entries",
+        f"/api/v2/databases/{db_id}?include-properties=true",
+    ]
+    any_ok = False
+    log("  -- column endpoints --")
+    for method, path, payload in column_probes:
+        r = _request_with_retry(session, method, f"{base}{path}", json=payload)
+        log(f"    {method:5} {path} → {r.status_code if r else 'no resp'}")
+        if r and r.status_code < 400:
+            any_ok = True
+            log(f"      body[:200]={(r.text or '')[:200]}")
+    log("  -- row endpoints --")
+    for method, path, payload in row_probes:
+        r = _request_with_retry(session, method, f"{base}{path}", json=payload)
+        log(f"    {method:5} {path} → {r.status_code if r else 'no resp'}")
+        if r and r.status_code < 400:
+            any_ok = True
+            log(f"      body[:200]={(r.text or '')[:200]}")
+    log("  -- GET probes --")
+    for path in get_probes:
+        r = _request_with_retry(session, "GET", f"{base}{path}")
+        log(f"    GET   {path} → {r.status_code if r else 'no resp'}")
+        if r and r.status_code < 400:
+            log(f"      body[:200]={(r.text or '')[:200]}")
+
+    log(f"  probe 결과: 컬럼/row 입력 endpoint {'발견됨' if any_ok else '없음'}.")
+    if not args.probe_keep:
+        r = _request_with_retry(session, "DELETE", f"{base}/api/v2/databases/{db_id}")
+        log(f"  cleanup DELETE → {r.status_code if r else 'no resp'} (db_id={db_id})")
+    else:
+        log(f"  probe-keep: db_id={db_id} 유지")
+    log("=== probe 종료 ===")
+    return 0 if any_ok else 3
+
+
+def _struct_upload_select_schemas(
+    conn: sqlite3.Connection, args: argparse.Namespace
+) -> list[tuple[int, str, str]]:
+    """업로드 대상 schemas (sid, tbl, mode). auto 면 각 schema 의 chosen_mode
+    사용; explicit 이면 그 모드로 덮어쓰기. --only-tbl / --limit 적용."""
+    if args.mode == "auto":
+        sql = (
+            "SELECT sid, tbl, COALESCE(chosen_mode,'snapshot') FROM struct_schemas "
+            "WHERE status IN ('DEFINED','UPLOADED') ORDER BY tbl"
+        )
+        schemas = conn.execute(sql).fetchall()
+    else:
+        sql = "SELECT sid, tbl, ? FROM struct_schemas WHERE status IN ('DEFINED','UPLOADED') ORDER BY tbl"
+        schemas = [(sid, tbl, args.mode) for sid, tbl, _ in conn.execute(sql, (args.mode,)).fetchall()]
+    if args.only_tbl:
+        schemas = [s for s in schemas if s[1] == args.only_tbl]
+    if args.limit:
+        schemas = schemas[: args.limit]
+    return schemas
+
+
+def _struct_upload_snapshot_schema(
+    conn: sqlite3.Connection,
+    session,
+    base: str,
+    space_id: str,
+    args: argparse.Namespace,
+    sid: int,
+    tbl: str,
+    out_dir: Path,
+) -> bool:
+    """snapshot 모드 한 schema 업로드 — 1 페이지에 큰 표 전체. Returns success."""
+    sp = out_dir / f"{tbl}.snapshot.xml"
+    if not sp.is_file():
+        log(f"  storage 파일 없음: {sp}")
+        return False
+    page_id = conn.execute(
+        "SELECT snapshot_page_id FROM struct_schemas WHERE sid=?", (sid,)
+    ).fetchone()[0]
+    storage = sp.read_text(encoding="utf-8")
+    title = f"dokuwiki struct: {tbl}"
+    if page_id:
+        if not _struct_put_page(session, base, page_id, title=title, storage=storage):
+            log(f"  [FAIL] PUT {tbl}")
+            return False
+        log(f"  [SNAPSHOT] {tbl} → page {page_id} (updated)")
+    else:
+        page_id = _struct_post_page(
+            session, base, space_id, args.root_page_id,
+            title=title, storage=storage, sid=sid,
+        )
+        if not page_id:
+            log(f"  [FAIL] POST {tbl}")
+            return False
+        conn.execute(
+            "UPDATE struct_schemas SET snapshot_page_id=?, status='UPLOADED', last_checked_at=? WHERE sid=?",
+            (str(page_id), now_iso(), sid),
+        )
+        conn.commit()
+        log(f"  [SNAPSHOT] {tbl} → page {page_id} (created)")
+    return True
+
+
+def _struct_upload_indexed_schema(
+    conn: sqlite3.Connection,
+    session,
+    base: str,
+    space_id: str,
+    args: argparse.Namespace,
+    sid: int,
+    tbl: str,
+    mode: str,
+    out_dir: Path,
+) -> tuple[bool, int, int]:
+    """properties/native 모드 한 schema — index 페이지 + row 자식 페이지들.
+
+    native 모드면 빈 Confluence Database 쉘 생성 시도 (없을 때만, --no-native-shell
+    아니면). Returns (schema_ok, row_pushed, row_failed)."""
+    index_sp = out_dir / f"{tbl}.index.xml"
+    if not index_sp.is_file():
+        log(f"  index storage 파일 없음: {index_sp}. struct-convert 먼저 실행.")
+        return (False, 0, 0)
+
+    # native: 빈 Confluence Database 객체 생성 (없을 때만)
+    db_id_row = conn.execute(
+        "SELECT confluence_db_id FROM struct_schemas WHERE sid=?", (sid,)
+    ).fetchone()
+    existing_db_id = db_id_row[0] if db_id_row else None
+    if mode == "native" and not existing_db_id and not args.no_native_shell:
+        r = _request_with_retry(
+            session, "POST", f"{base}/api/v2/databases",
+            json={"spaceId": space_id, "parentId": args.root_page_id, "title": f"dwc-struct-{tbl}"},
+        )
+        if r and r.status_code < 400:
+            new_db_id = r.json().get("id")
+            conn.execute(
+                "UPDATE struct_schemas SET confluence_db_id=? WHERE sid=?",
+                (str(new_db_id), sid),
+            )
+            conn.commit()
+            log(f"  [NATIVE] Database 쉘 생성 → id={new_db_id}")
+            _struct_rewrite_index(conn, sid, tbl, mode, out_dir, args.base_url, args.space_key)
+            index_sp = out_dir / f"{tbl}.index.xml"
+        else:
+            log(f"  [WARN] Database 쉘 생성 실패 → fallback properties only")
+
+    # 1) index 페이지 — snapshot_page_id 재사용 가능
+    idx_existing = conn.execute(
+        "SELECT properties_index_page_id, snapshot_page_id FROM struct_schemas WHERE sid=?",
+        (sid,),
+    ).fetchone()
+    idx_page_id = idx_existing[0] or idx_existing[1]
+    idx_storage = index_sp.read_text(encoding="utf-8")
+    idx_title = f"dokuwiki struct: {tbl}"
+    if idx_page_id:
+        if not _struct_put_page(session, base, idx_page_id, title=idx_title, storage=idx_storage):
+            log(f"  [FAIL] index PUT {tbl}")
+            return (False, 0, 0)
+        log(f"  index updated → page {idx_page_id}")
+    else:
+        idx_page_id = _struct_post_page(
+            session, base, space_id, args.root_page_id,
+            title=idx_title, storage=idx_storage, sid=sid,
+        )
+        if not idx_page_id:
+            log(f"  [FAIL] index POST {tbl}")
+            return (False, 0, 0)
+        log(f"  index created → page {idx_page_id}")
+    conn.execute(
+        "UPDATE struct_schemas SET properties_index_page_id=?, snapshot_page_id=COALESCE(snapshot_page_id, ?), chosen_mode=?, status='UPLOADED', last_checked_at=? WHERE sid=?",
+        (str(idx_page_id), str(idx_page_id), mode, now_iso(), sid),
+    )
+    conn.commit()
+
+    if args.index_only:
+        log(f"  --index-only: row 페이지 갱신 skip")
+        return (True, 0, 0)
+
+    # 2) 자식 row 페이지 업로드
+    row_sql = "SELECT pid, payload_json, confluence_page_id FROM struct_rows WHERE sid=? ORDER BY pid"
+    if args.row_limit:
+        row_sql += f" LIMIT {int(args.row_limit)}"
+    rows = conn.execute(row_sql, (sid,)).fetchall()
+    cols = conn.execute(
+        "SELECT colref, name, dokuwiki_class FROM struct_columns WHERE sid=? ORDER BY sort",
+        (sid,),
+    ).fetchall()
+    row_pushed = row_failed = 0
+    for pid, payload_json, existing_row_page in rows:
+        row_sp = out_dir / f"{tbl}.row.{pid}.xml"
+        if not row_sp.is_file():
+            continue
+        payload = _json.loads(payload_json)
+        title = _struct_row_title(payload, cols, tbl, pid)
+        storage = row_sp.read_text(encoding="utf-8")
+        if existing_row_page:
+            if not _struct_put_page(session, base, existing_row_page, title=title, storage=storage):
+                conn.execute(
+                    "UPDATE struct_rows SET status='FAILED', last_error='PUT row' WHERE sid=? AND pid=?",
+                    (sid, pid),
+                )
+                row_failed += 1
+                continue
+            row_page_id = existing_row_page
+        else:
+            row_page_id = _struct_post_page(
+                session, base, space_id, idx_page_id,
+                title=title, storage=storage, sid=sid, pid=pid,
+            )
+            if not row_page_id:
+                conn.execute(
+                    "UPDATE struct_rows SET status='FAILED', last_error='POST row' WHERE sid=? AND pid=?",
+                    (sid, pid),
+                )
+                row_failed += 1
+                continue
+            conn.execute(
+                "UPDATE struct_rows SET confluence_page_id=?, status='UPLOADED' WHERE sid=? AND pid=?",
+                (str(row_page_id), sid, pid),
+            )
+            conn.commit()
+        _apply_page_labels(session, base, str(row_page_id), [f"dokuwiki-struct-{tbl}"])
+        row_pushed += 1
+        if row_pushed % 50 == 0:
+            log(f"  ... rows pushed={row_pushed}")
+    conn.commit()
+    log(f"  완료: {tbl} index={idx_page_id} rows={len(rows)} (실패={row_failed})")
+    return (True, row_pushed, row_failed)
+
+
 def cmd_struct_upload(args: argparse.Namespace) -> int:
     """struct-convert 결과를 Confluence 에.
 
@@ -4143,261 +4441,37 @@ def cmd_struct_upload(args: argparse.Namespace) -> int:
         return 1
 
     if args.probe:
-        # 빈 Database 생성 후 컬럼/row 입력이 가능한 endpoint 가 있는지 체계적으로 탐색.
-        log("=== Confluence Database API probe ===")
-        resp = _request_with_retry(
-            session, "POST", f"{base}/api/v2/databases",
-            json={"spaceId": space_id, "title": "dwc-probe", "parentId": args.root_page_id},
-        )
-        log(f"  POST /api/v2/databases → {resp.status_code if resp else 'no resp'}")
-        if not resp or resp.status_code >= 400:
-            log(f"    body: {(resp.text if resp else '')[:300]}")
-            log("=== probe 종료 (Database 생성 자체 실패) ===")
-            return 1
-        db_obj = resp.json()
-        db_id = db_obj.get("id")
-        log(f"  생성된 db: id={db_id} title={db_obj.get('title')}")
-
-        # 후보 endpoint 들 (Atlassian 가 비공개로 운영 중인 경로 포함)
-        column_probes = [
-            ("POST", f"/api/v2/databases/{db_id}/columns", {"title": "txt", "type": "text"}),
-            ("POST", f"/api/v2/databases/{db_id}/fields",  {"title": "txt", "type": "text"}),
-            ("POST", f"/api/v2/databases/{db_id}/schema",  {"columns": [{"title": "txt", "type": "text"}]}),
-            ("PATCH", f"/api/v2/databases/{db_id}",        {"columns": [{"title": "txt", "type": "text"}]}),
-            ("PUT", f"/api/v2/databases/{db_id}",          {"title": "dwc-probe", "columns": [{"title": "txt", "type": "text"}]}),
-        ]
-        row_probes = [
-            ("POST", f"/api/v2/databases/{db_id}/rows",      {"values": {"txt": "x"}}),
-            ("POST", f"/api/v2/databases/{db_id}/entries",   {"values": {"txt": "x"}}),
-            ("POST", f"/api/v2/databases/{db_id}/items",     {"values": {"txt": "x"}}),
-            ("POST", f"/api/v2/databases/{db_id}/records",   {"values": {"txt": "x"}}),
-        ]
-        get_probes = [
-            f"/api/v2/databases/{db_id}/columns",
-            f"/api/v2/databases/{db_id}/fields",
-            f"/api/v2/databases/{db_id}/rows",
-            f"/api/v2/databases/{db_id}/entries",
-            f"/api/v2/databases/{db_id}?include-properties=true",
-        ]
-        any_ok = False
-        log("  -- column endpoints --")
-        for method, path, payload in column_probes:
-            r = _request_with_retry(session, method, f"{base}{path}", json=payload)
-            log(f"    {method:5} {path} → {r.status_code if r else 'no resp'}")
-            if r and r.status_code < 400:
-                any_ok = True
-                log(f"      body[:200]={(r.text or '')[:200]}")
-        log("  -- row endpoints --")
-        for method, path, payload in row_probes:
-            r = _request_with_retry(session, method, f"{base}{path}", json=payload)
-            log(f"    {method:5} {path} → {r.status_code if r else 'no resp'}")
-            if r and r.status_code < 400:
-                any_ok = True
-                log(f"      body[:200]={(r.text or '')[:200]}")
-        log("  -- GET probes --")
-        for path in get_probes:
-            r = _request_with_retry(session, "GET", f"{base}{path}")
-            log(f"    GET   {path} → {r.status_code if r else 'no resp'}")
-            if r and r.status_code < 400:
-                log(f"      body[:200]={(r.text or '')[:200]}")
-
-        log(f"  probe 결과: 컬럼/row 입력 endpoint {'발견됨' if any_ok else '없음'}.")
-        # cleanup
-        if not args.probe_keep:
-            r = _request_with_retry(session, "DELETE", f"{base}/api/v2/databases/{db_id}")
-            log(f"  cleanup DELETE → {r.status_code if r else 'no resp'} (db_id={db_id})")
-        else:
-            log(f"  probe-keep: db_id={db_id} 유지")
-        log("=== probe 종료 ===")
-        return 0 if any_ok else 3
+        return _struct_upload_probe_database_api(session, base, space_id, args)
 
     out_dir = Path("storage_struct")
-
-    # auto: 각 schema 의 chosen_mode 따름. 모드 explicit 이면 그걸로 덮어쓰기.
-    if args.mode == "auto":
-        sql = (
-            "SELECT sid, tbl, COALESCE(chosen_mode,'snapshot') FROM struct_schemas "
-            "WHERE status IN ('DEFINED','UPLOADED') ORDER BY tbl"
-        )
-        schemas = conn.execute(sql).fetchall()
-    else:
-        sql = "SELECT sid, tbl, ? FROM struct_schemas WHERE status IN ('DEFINED','UPLOADED') ORDER BY tbl"
-        schemas = [(sid, tbl, args.mode) for sid, tbl, _ in conn.execute(sql, (args.mode,)).fetchall()]
-    if args.only_tbl:
-        schemas = [s for s in schemas if s[1] == args.only_tbl]
-    if args.limit:
-        schemas = schemas[: args.limit]
+    schemas = _struct_upload_select_schemas(conn, args)
     if not schemas:
         log("업로드 대상 schema 없음.")
         conn.close()
         return 0
 
-    pushed = failed = row_pushed = row_failed = 0
+    pushed = failed = row_pushed_total = row_failed_total = 0
     for sid, tbl, mode in schemas:
         log(f"=== {tbl} (mode={mode}, sid={sid}) ===")
-
         if mode == "snapshot":
-            sp = out_dir / f"{tbl}.snapshot.xml"
-            if not sp.is_file():
-                log(f"  storage 파일 없음: {sp}")
-                continue
-            page_id = conn.execute(
-                "SELECT snapshot_page_id FROM struct_schemas WHERE sid=?", (sid,)
-            ).fetchone()[0]
-            if page_id:
-                ok = _struct_put_page(
-                    session, base, page_id,
-                    title=f"dokuwiki struct: {tbl}",
-                    storage=sp.read_text(encoding="utf-8"),
-                )
-                if not ok:
-                    log(f"  [FAIL] PUT {tbl}")
-                    failed += 1
-                    continue
-                log(f"  [SNAPSHOT] {tbl} → page {page_id} (updated)")
+            if _struct_upload_snapshot_schema(conn, session, base, space_id, args, sid, tbl, out_dir):
+                pushed += 1
             else:
-                page_id = _struct_post_page(
-                    session, base, space_id, args.root_page_id,
-                    title=f"dokuwiki struct: {tbl}",
-                    storage=sp.read_text(encoding="utf-8"),
-                    sid=sid,
-                )
-                if not page_id:
-                    log(f"  [FAIL] POST {tbl}")
-                    failed += 1
-                    continue
-                conn.execute(
-                    "UPDATE struct_schemas SET snapshot_page_id=?, status='UPLOADED', last_checked_at=? WHERE sid=?",
-                    (str(page_id), now_iso(), sid),
-                )
-                conn.commit()
-                log(f"  [SNAPSHOT] {tbl} → page {page_id} (created)")
-            pushed += 1
-            continue
-
-        # properties / native: index page + row child pages
-        index_sp = out_dir / f"{tbl}.index.xml"
-        if not index_sp.is_file():
-            log(f"  index storage 파일 없음: {index_sp}. struct-convert 먼저 실행.")
-            failed += 1
-            continue
-
-        # native: 빈 Confluence Database 객체를 spaceに 생성 (없을 때만)
-        db_id_row = conn.execute(
-            "SELECT confluence_db_id FROM struct_schemas WHERE sid=?", (sid,)
-        ).fetchone()
-        existing_db_id = db_id_row[0] if db_id_row else None
-        if mode == "native" and not existing_db_id and not args.no_native_shell:
-            r = _request_with_retry(
-                session, "POST", f"{base}/api/v2/databases",
-                json={"spaceId": space_id, "parentId": args.root_page_id, "title": f"dwc-struct-{tbl}"},
-            )
-            if r and r.status_code < 400:
-                new_db_id = r.json().get("id")
-                conn.execute(
-                    "UPDATE struct_schemas SET confluence_db_id=? WHERE sid=?",
-                    (str(new_db_id), sid),
-                )
-                conn.commit()
-                existing_db_id = new_db_id
-                log(f"  [NATIVE] Database 쉘 생성 → id={new_db_id}")
-                # rebuild index storage with the new db_id embed
-                _struct_rewrite_index(conn, sid, tbl, mode, out_dir, args.base_url, args.space_key)
-                index_sp = out_dir / f"{tbl}.index.xml"
-            else:
-                log(f"  [WARN] Database 쉘 생성 실패 → fallback properties only")
-
-        # 1) index 페이지 — snapshot_page_id 재사용 (있으면 그것을 부모 페이지로)
-        idx_existing = conn.execute(
-            "SELECT properties_index_page_id, snapshot_page_id FROM struct_schemas WHERE sid=?",
-            (sid,),
-        ).fetchone()
-        idx_page_id = idx_existing[0] or idx_existing[1]
-        idx_storage = index_sp.read_text(encoding="utf-8")
-        idx_title = f"dokuwiki struct: {tbl}"
-        if idx_page_id:
-            ok = _struct_put_page(session, base, idx_page_id, title=idx_title, storage=idx_storage)
-            if not ok:
-                log(f"  [FAIL] index PUT {tbl}")
                 failed += 1
-                continue
-            log(f"  index updated → page {idx_page_id}")
         else:
-            idx_page_id = _struct_post_page(
-                session, base, space_id, args.root_page_id,
-                title=idx_title, storage=idx_storage, sid=sid,
+            ok, rp, rf = _struct_upload_indexed_schema(
+                conn, session, base, space_id, args, sid, tbl, mode, out_dir
             )
-            if not idx_page_id:
-                log(f"  [FAIL] index POST {tbl}")
-                failed += 1
-                continue
-            log(f"  index created → page {idx_page_id}")
-        conn.execute(
-            "UPDATE struct_schemas SET properties_index_page_id=?, snapshot_page_id=COALESCE(snapshot_page_id, ?), chosen_mode=?, status='UPLOADED', last_checked_at=? WHERE sid=?",
-            (str(idx_page_id), str(idx_page_id), mode, now_iso(), sid),
-        )
-        conn.commit()
-
-        if args.index_only:
-            pushed += 1
-            log(f"  --index-only: row 페이지 갱신 skip")
-            continue
-
-        # 2) 자식 row 페이지 업로드
-        row_sql = "SELECT pid, payload_json, confluence_page_id FROM struct_rows WHERE sid=? ORDER BY pid"
-        row_params = (sid,)
-        if args.row_limit:
-            row_sql += f" LIMIT {int(args.row_limit)}"
-        rows = conn.execute(row_sql, row_params).fetchall()
-        cols = conn.execute(
-            "SELECT colref, name, dokuwiki_class FROM struct_columns WHERE sid=? ORDER BY sort",
-            (sid,),
-        ).fetchall()
-        for pid, payload_json, existing_row_page in rows:
-            row_sp = out_dir / f"{tbl}.row.{pid}.xml"
-            if not row_sp.is_file():
-                continue
-            payload = _json.loads(payload_json)
-            title = _struct_row_title(payload, cols, tbl, pid)
-            storage = row_sp.read_text(encoding="utf-8")
-            if existing_row_page:
-                ok = _struct_put_page(session, base, existing_row_page, title=title, storage=storage)
-                if not ok:
-                    conn.execute(
-                        "UPDATE struct_rows SET status='FAILED', last_error='PUT row' WHERE sid=? AND pid=?",
-                        (sid, pid),
-                    )
-                    row_failed += 1
-                    continue
-                row_page_id = existing_row_page
+            row_pushed_total += rp
+            row_failed_total += rf
+            if ok:
+                pushed += 1
             else:
-                row_page_id = _struct_post_page(
-                    session, base, space_id, idx_page_id,
-                    title=title, storage=storage, sid=sid, pid=pid,
-                )
-                if not row_page_id:
-                    conn.execute(
-                        "UPDATE struct_rows SET status='FAILED', last_error='POST row' WHERE sid=? AND pid=?",
-                        (sid, pid),
-                    )
-                    row_failed += 1
-                    continue
-                conn.execute(
-                    "UPDATE struct_rows SET confluence_page_id=?, status='UPLOADED' WHERE sid=? AND pid=?",
-                    (str(row_page_id), sid, pid),
-                )
-                conn.commit()
-            _apply_page_labels(session, base, str(row_page_id), [f"dokuwiki-struct-{tbl}"])
-            row_pushed += 1
-            if row_pushed % 50 == 0:
-                log(f"  ... rows pushed={row_pushed}")
-        pushed += 1
-        conn.commit()
-        log(f"  완료: {tbl} index={idx_page_id} rows={len(rows)} (실패={row_failed})")
+                failed += 1
 
-    log(f"struct-upload 완료: schemas pushed={pushed} failed={failed} / rows pushed={row_pushed} failed={row_failed}")
+    log(f"struct-upload 완료: schemas pushed={pushed} failed={failed} / rows pushed={row_pushed_total} failed={row_failed_total}")
     conn.close()
-    return 0 if failed == 0 and row_failed == 0 else 1
+    return 0 if failed == 0 and row_failed_total == 0 else 1
 
 
 def _struct_put_page(session, base, page_id: str, *, title: str, storage: str) -> bool:
