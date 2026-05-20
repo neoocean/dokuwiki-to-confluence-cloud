@@ -304,7 +304,15 @@ SENTENCE_DIVERGED / ARTIFACT_LOSS / CODE_DIVERGED / HEADING_DIVERGED.
 가능 (`--with-vision` 은 잔여 모호 케이스에만 사용). 18 케이스 테스트
 추가 (sentence/artifact/code/heading/link 5개 헬퍼).
 
-### Phase 4 (선택, 미적용) — 검수자 협업
+### Phase 4 (제안서 — 미적용) — 시각 비교 자동화 추가 후보
+
+타일 분할 PHash / chrome 마스킹 후 픽셀 diff / per-요소 캡쳐 비교 / bbox
+tree LCS / storage AST diff / 구조화된 vision 프롬프트 등 8 가지 후보.
+권장 우선순위 1-3순위 (제안 1/2/5) + 임계값/통합 지점/테스트 계획 모두
+[`visual-comparison-proposal.md`](visual-comparison-proposal.md) 에 정리.
+채택 결정 후 본 문서의 Phase 4 로 흡수 예정.
+
+### Phase 5 (선택, 미적용) — 검수자 협업
 
 - 정적 HTML 대신 가벼운 Flask `verify serve` — 결정 즉시 state.db 저장
 - 다중 검수자 + 페이지 락 + reviewer 필드

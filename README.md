@@ -662,6 +662,7 @@ WAL 모드라 동시 read 는 OK 지만 long-running write 가 있으면 lock.
     ├── element-mapping.md  — DokuWiki → Confluence 요소 매트릭스
     ├── plugin-validation.md — 플러그인 동작 검증
     ├── visual-audit.md     — 시각 검수 자동화 (Phase 1+2+3)
+    ├── visual-comparison-proposal.md — 시각 비교 추가 자동화 8 후보 (Phase 4 제안서)
     ├── struct-migration.md — struct → Confluence Database
     ├── history-migration.md — 과거 리비전 이전
     ├── oversized-attachments.md — 100MB+ 첨부 폴백
