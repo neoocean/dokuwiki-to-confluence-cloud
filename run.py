@@ -765,6 +765,148 @@ TABLE_ALIGN_CLASS_MAP = {
 }
 
 
+_MONTHCAL_HREF_RE = re.compile(
+    r'^/_media/monthcal/(?:align_(\w+)_)?namespace/'
+    r'(?P<ns>[^_]*)_?month_(?P<m>\d+)_year_(?P<y>\d+)'
+    r'(?:_week_start_on_(?P<w>\w+))?'
+)
+
+
+def _convert_monthcal_fallback(soup) -> None:
+    """DokuWiki monthcal 플러그인 미설치 시 fallback 으로 출력되는 깨진 media
+    링크 (`/_media/monthcal/align_X_namespace/NS_month_M_year_Y_...`) 를 감지해
+    정적 캘린더 표로 교체.
+
+    캘린더 셀의 각 날짜는 자동으로 `ns:Y:M:DD` 형식의 페이지 링크 (dokuwiki
+    의 일지 페이지 컨벤션) — 본 도구의 `dwc-link:` placeholder 패턴 활용
+    → rewrite-links 단계에서 실제 Confluence 페이지 ID 로 치환.
+    """
+    import calendar as _cal
+    for a in list(soup.find_all("a", href=True)):
+        m = _MONTHCAL_HREF_RE.match(str(a.get("href", "")))
+        if not m:
+            continue
+        try:
+            year = int(m.group("y"))
+            month = int(m.group("m"))
+        except (ValueError, TypeError):
+            continue
+        ns = (m.group("ns") or "").strip(":")
+        wstart_str = m.group("w") or "monday"
+        firstweekday = 6 if wstart_str == "sunday" else 0
+
+        cal = _cal.Calendar(firstweekday=firstweekday)
+        # header: 요일 (firstweekday 부터)
+        weekday_names_en = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        ordered_weekdays = [
+            weekday_names_en[(firstweekday + i) % 7] for i in range(7)
+        ]
+        header_cells = "".join(f"<th>{w}</th>" for w in ordered_weekdays)
+        body_rows = []
+        for week in cal.monthdatescalendar(year, month):
+            cells = []
+            for d in week:
+                if d.month != month:
+                    cells.append('<td style="color:#bbb;">·</td>')
+                    continue
+                # 일지 페이지 링크 (dwc-link placeholder — rewrite-links 가 해소)
+                day = d.day
+                if ns:
+                    page_id = f"{ns}:{year:04d}:{month:02d}:{day:02d}"
+                    cells.append(
+                        f'<td><a href="dwc-link:{page_id}" '
+                        f'data-wiki-id="{page_id}">{day}</a></td>'
+                    )
+                else:
+                    cells.append(f"<td>{day}</td>")
+            body_rows.append("<tr>" + "".join(cells) + "</tr>")
+
+        title = f"📅 {year}-{month:02d}"
+        if ns:
+            title += f" — namespace <code>:{ns}:</code>"
+        html = (
+            '<div class="dwc-monthcal">'
+            f'<p><strong>{title}</strong></p>'
+            f'<table><thead><tr>{header_cells}</tr></thead>'
+            f'<tbody>{"".join(body_rows)}</tbody></table>'
+            '</div>'
+        )
+        from bs4 import BeautifulSoup as _BS
+        new_node = _BS(html, "html.parser")
+        # 부모 <p> 안에 단일 <a> 인 경우 (이 fallback 의 흔한 모양) 부모 째 교체
+        parent = a.parent
+        if parent and parent.name == "p" and len(list(parent.stripped_strings)) <= 1 \
+                and len(parent.find_all("a")) == 1:
+            parent.replace_with(new_node)
+        else:
+            a.replace_with(new_node)
+
+
+def _calendar_iframe_macro(src: str, width: str = "750", height: str = "500") -> str:
+    import html as _h
+    return (
+        f'<ac:structured-macro ac:name="iframe">'
+        f'<ac:parameter ac:name="src"><ri:url ri:value="{_h.escape(src, quote=True)}"/></ac:parameter>'
+        f'<ac:parameter ac:name="width">{_h.escape(str(width), quote=True)}</ac:parameter>'
+        f'<ac:parameter ac:name="height">{_h.escape(str(height), quote=True)}</ac:parameter>'
+        f'<ac:parameter ac:name="frameborder">no</ac:parameter>'
+        f'<ac:parameter ac:name="scrolling">no</ac:parameter>'
+        f'</ac:structured-macro>'
+    )
+
+
+def _convert_google_calendar_iframe(soup) -> None:
+    """`<iframe src="https://calendar.google.com/...">` 를 Confluence iframe
+    매크로로. 두 케이스 처리:
+
+    A. 실제 iframe 태그 — DokuWiki 의 html 플러그인이 활성화된 페이지
+    B. escape 된 텍스트 — html 플러그인 미활성 시 `&lt;iframe ...&gt;`
+       텍스트로 표시되고 src URL 부분만 `<a class="urlextern">` 으로
+       auto-linkify. 부모 `<p>` 의 자식이 escaped iframe 텍스트 + `<a>`
+       (URL) 패턴이면 같이 교체.
+
+    본 도구의 일반 변환기는 iframe 을 strip (Confluence storage 거부) —
+    캘린더 iframe 만 ac:structured-macro 로 보존.
+    """
+    from bs4 import BeautifulSoup as _BS
+
+    # A. 실제 iframe 태그
+    for iframe in list(soup.find_all("iframe")):
+        src = str(iframe.get("src", ""))
+        if "calendar.google.com" not in src:
+            continue
+        iframe.replace_with(_BS(
+            _calendar_iframe_macro(
+                src,
+                width=str(iframe.get("width") or "750"),
+                height=str(iframe.get("height") or "500"),
+            ),
+            "html.parser",
+        ))
+
+    # B. escape 된 텍스트 — `<a class="urlextern" href="https://calendar.google.com/...">`
+    #    의 부모 <p> 의 텍스트가 iframe 텍스트 (escape) 를 포함하면 부모째 교체.
+    import re as _re
+    for a in list(soup.find_all("a", href=True)):
+        href = str(a.get("href", ""))
+        if "calendar.google.com" not in href:
+            continue
+        parent = a.parent
+        if parent is None:
+            continue
+        parent_text = parent.get_text(" ", strip=True)
+        # escape 된 iframe 흔적 검사
+        if "iframe" not in parent_text:
+            continue
+        # width / height 추출 (있으면)
+        w = _re.search(r'width\s*=\s*[“"\']?(\d+)', parent_text)
+        h = _re.search(r'height\s*=\s*[“"\']?(\d+)', parent_text)
+        width = w.group(1) if w else "750"
+        height = h.group(1) if h else "500"
+        macro = _calendar_iframe_macro(href, width=width, height=height)
+        parent.replace_with(_BS(macro, "html.parser"))
+
+
 def _convert_footnotes(soup) -> None:
     """
     DokuWiki 의 ((풋노트)) 출력은 두 부분이다:
@@ -1007,6 +1149,12 @@ def _convert_html_to_storage(
     # 정렬/레이아웃 클래스(wrap_left/right/center/clear/indent 등) 는 의미가
     # 없어서 별도 변환 없이 div 그대로 두고, class 정리 단계에서 떨군다.
     _convert_wrap_callouts(soup)
+
+    # 1.41) monthcal 플러그인 미설치 fallback 링크 -> 정적 캘린더 표
+    _convert_monthcal_fallback(soup)
+
+    # 1.415) Google Calendar iframe -> Confluence iframe 매크로
+    _convert_google_calendar_iframe(soup)
 
     # 1.42) DokuWiki 코어 smiley 이미지 -> emoji 텍스트
     _convert_smileys(soup)
@@ -2676,26 +2824,82 @@ def cmd_history_render(args: argparse.Namespace) -> int:
     return 0
 
 
-def _revision_header(rev_ts: int, user: str | None, comment: str | None,
-                     type_code: str | None, users_map: dict[str, str]) -> str:
-    """각 revision body 최상단에 박을 메타 헤더 박스 (history-migration §6.4)."""
+REVISION_HEADER_FORMATS = ("none", "panel", "info", "note", "tip", "warning",
+                            "quote", "table", "paragraphs")
+REVISION_HEADER_DEFAULT = "panel"
+
+
+def _revision_header(
+    rev_ts: int, user: str | None, comment: str | None,
+    type_code: str | None, users_map: dict[str, str],
+    *,
+    fmt: str = REVISION_HEADER_DEFAULT,
+) -> str:
+    """각 revision body 최상단에 박을 메타 헤더 (history-migration §6.4).
+
+    fmt:
+      - 'none'       헤더 박스 생략 (본문만)
+      - 'panel'      panel 매크로 + 한 단락 내부에 shift+enter (<br/>) 줄바꿈 (기본)
+      - 'info'/'note'/'tip'/'warning'  같은 모양, 매크로 종류만 변경
+      - 'quote'      <blockquote> 안에 3줄 (shift+enter)
+      - 'table'      2열 표 (라벨/값 × 3행)
+      - 'paragraphs' 기존 동작 — 3 개의 <p> 로 분리 (이전 호환용)
+    """
     from datetime import datetime, timezone
+    import html as _h
+
+    if fmt == "none":
+        return ""
+
     dt = datetime.fromtimestamp(rev_ts, tz=timezone.utc).isoformat(timespec="seconds")
     user_repr = _format_user(user, users_map) if user else "(unknown)"
     type_label = {
         "C": "create", "E": "edit", "e": "minor edit",
         "R": "revert", "D": "delete",
     }.get(type_code or "", type_code or "?")
-    import html as _h
     comment_h = _h.escape(comment or "") if comment else "(no comment)"
+
+    if fmt == "paragraphs":
+        return (
+            '<ac:structured-macro ac:name="note">'
+            '<ac:rich-text-body>'
+            f'<p>DokuWiki revision: <code>{dt}</code> ({type_label})</p>'
+            f'<p>Author: {user_repr}</p>'
+            f'<p>Comment: <code>{comment_h}</code></p>'
+            '</ac:rich-text-body>'
+            '</ac:structured-macro>'
+        )
+
+    if fmt == "quote":
+        return (
+            '<blockquote><p>'
+            f'DokuWiki revision: <code>{dt}</code> ({type_label})<br/>'
+            f'Author: {user_repr}<br/>'
+            f'Comment: <code>{comment_h}</code>'
+            '</p></blockquote>'
+        )
+
+    if fmt == "table":
+        return (
+            '<table>'
+            f'<tr><th>DokuWiki revision</th><td><code>{dt}</code> ({type_label})</td></tr>'
+            f'<tr><th>Author</th><td>{user_repr}</td></tr>'
+            f'<tr><th>Comment</th><td><code>{comment_h}</code></td></tr>'
+            '</table>'
+        )
+
+    # panel / info / note / tip / warning — 한 단락 + shift+enter (<br/>)
+    macro_name = fmt if fmt in ("panel", "info", "note", "tip", "warning") else "panel"
     return (
-        f'<ac:structured-macro ac:name="note">'
-        f'<ac:rich-text-body>'
-        f'<p>DokuWiki revision: <code>{dt}</code> ({type_label})</p>'
-        f'<p>Author: {user_repr}</p>'
-        f'<p>Comment: <code>{comment_h}</code></p>'
-        f'</ac:rich-text-body>'
-        f'</ac:structured-macro>'
+        f'<ac:structured-macro ac:name="{macro_name}">'
+        '<ac:rich-text-body>'
+        '<p>'
+        f'DokuWiki revision: <code>{dt}</code> ({type_label})<br/>'
+        f'Author: {user_repr}<br/>'
+        f'Comment: <code>{comment_h}</code>'
+        '</p>'
+        '</ac:rich-text-body>'
+        '</ac:structured-macro>'
     )
 
 
@@ -2718,6 +2922,17 @@ def cmd_history_convert(args: argparse.Namespace) -> int:
         return 2
     src_root = Path(src)
     HISTORY_STORAGE_DIR.mkdir(exist_ok=True)
+
+    # 헤더 형식 — CLI --header-format 우선, 없으면 meta 'revision_header_fmt', 없으면 기본값
+    header_fmt = (getattr(args, "header_format", None)
+                  or db_get_meta(conn, "revision_header_fmt")
+                  or REVISION_HEADER_DEFAULT)
+    if header_fmt not in REVISION_HEADER_FORMATS:
+        log(f"알 수 없는 header-format: {header_fmt} (가능: {', '.join(REVISION_HEADER_FORMATS)})")
+        return 2
+    if getattr(args, "header_format", None):
+        db_set_meta(conn, "revision_header_fmt", header_fmt)
+    log(f"revision 헤더 형식: {header_fmt}")
 
     where = "status='RENDERED'" if not args.force else "status IN ('RENDERED','CONVERTED','FAILED')"
     params: tuple = ()
@@ -2760,7 +2975,10 @@ def cmd_history_convert(args: argparse.Namespace) -> int:
             failed += 1
             continue
 
-        header = _revision_header(rev_ts, user, comment, type_code, users_map)
+        header = _revision_header(
+            rev_ts, user, comment, type_code, users_map,
+            fmt=header_fmt,
+        )
         full_body = header + storage_xml
         content_hash = sha256_bytes(full_body.encode("utf-8"))
 
@@ -2897,6 +3115,246 @@ def cmd_history_upload(args: argparse.Namespace) -> int:
     log(f"history-upload 완료: pages={page_ok} rev_ok={rev_ok} rev_fail={rev_fail}")
     conn.close()
     return 0 if rev_fail == 0 else 1
+
+
+# Confluence 가 PUT 후 ac:schema-version / ac:macro-id 등 attr 를 자동 추가하므로
+# 매크로 태그의 attr 부분은 [^>]*? 로 받아들임.
+_REV_HEADER_PATTERNS = [
+    # 'paragraphs' 형식 (기존 호환)
+    re.compile(
+        r'<ac:structured-macro[^>]*ac:name="(?:note|panel|info|tip|warning)"[^>]*>'
+        r'<ac:rich-text-body>'
+        r'<p>DokuWiki revision.*?</p>'
+        r'<p>Author.*?</p>'
+        r'<p>Comment.*?</p>'
+        r'</ac:rich-text-body>'
+        r'</ac:structured-macro>',
+        re.S,
+    ),
+    # panel/info/note/tip/warning (한 단락 + <br/>)
+    re.compile(
+        r'<ac:structured-macro[^>]*ac:name="(?:panel|info|note|tip|warning)"[^>]*>'
+        r'<ac:rich-text-body>'
+        r'<p>\s*DokuWiki revision.*?Author.*?Comment.*?</p>'
+        r'</ac:rich-text-body>'
+        r'</ac:structured-macro>',
+        re.S,
+    ),
+    # blockquote
+    re.compile(r'<blockquote><p>\s*DokuWiki revision.*?Comment.*?</p></blockquote>', re.S),
+    # table
+    re.compile(
+        r'<table>\s*<tr><th>DokuWiki revision.*?</tr>\s*<tr><th>Author.*?</tr>'
+        r'\s*<tr><th>Comment.*?</tr>\s*</table>',
+        re.S,
+    ),
+]
+
+
+def _strip_revision_header(body: str) -> str:
+    """페이지 본문 앞부분의 기존 revision 헤더 (어떤 형식이든) 제거.
+
+    revision 헤더는 본문 *제일 앞* 에 있으므로 본문 초반의 매칭만 제거.
+    여러 번 reformat 된 페이지의 *누적된* 헤더 모두 제거 — 한 번에 가능한
+    한 모두 (loop).
+    """
+    # 본문 시작에서 공백/줄바꿈 후 첫 매크로까지의 위치 = 초기 위치 허용 범위
+    # 누적된 헤더가 여러 개 있을 수 있으므로 (이전 reformat 의 잔재) loop.
+    for _ in range(5):
+        changed = False
+        for pat in _REV_HEADER_PATTERNS:
+            m = pat.search(body[:8192])
+            if m and m.start() < 400:
+                body = body[:m.start()] + body[m.end():]
+                changed = True
+                break
+        if not changed:
+            break
+    return body
+
+
+_REV_HEADER_EXTRACT_RES = {
+    "rev_dt": re.compile(r"DokuWiki revision:\s*<code>([^<]+)</code>\s*\(([^)]+)\)"),
+    "author": re.compile(r"Author:\s*([^<\n][^<\n]*?)(?:<br|</p|</td)"),
+    "comment": re.compile(r"Comment:\s*<code>([^<]*)</code>"),
+    "comment_alt": re.compile(r"Comment:\s*([^<\n][^<\n]*?)(?:</p|</td)"),
+}
+
+
+def _extract_revision_header_data(body: str) -> dict | None:
+    """이미 업로드된 페이지 본문에서 revision 헤더의 데이터 (rev_dt/type_label/
+    author/comment) 추출 — revisions 테이블이 없을 때 fallback.
+
+    어떤 형식 (paragraphs/panel/info/quote/table) 이든 같은 텍스트 패턴.
+    """
+    head = body[:4096]
+    rev_m = _REV_HEADER_EXTRACT_RES["rev_dt"].search(head)
+    if not rev_m:
+        return None
+    rev_dt = rev_m.group(1).strip()
+    type_label = rev_m.group(2).strip()
+    author_m = _REV_HEADER_EXTRACT_RES["author"].search(head)
+    author = author_m.group(1).strip() if author_m else "(unknown)"
+    comment_m = (_REV_HEADER_EXTRACT_RES["comment"].search(head)
+                 or _REV_HEADER_EXTRACT_RES["comment_alt"].search(head))
+    comment = comment_m.group(1).strip() if comment_m else ""
+    return {
+        "rev_dt": rev_dt, "type_label": type_label,
+        "author": author, "comment": comment,
+    }
+
+
+def _revision_header_from_extracted(d: dict, *, fmt: str) -> str:
+    """추출된 헤더 데이터를 새 형식으로 재구성 — _revision_header 와 동일한
+    템플릿이지만 rev_ts 가 아닌 이미 포맷된 dt 문자열 사용."""
+    import html as _h
+    if fmt == "none":
+        return ""
+    dt = _h.escape(d["rev_dt"])
+    type_label = _h.escape(d["type_label"])
+    author = _h.escape(d["author"])
+    comment = _h.escape(d["comment"]) if d["comment"] else "(no comment)"
+
+    if fmt == "paragraphs":
+        return (
+            '<ac:structured-macro ac:name="note"><ac:rich-text-body>'
+            f'<p>DokuWiki revision: <code>{dt}</code> ({type_label})</p>'
+            f'<p>Author: {author}</p>'
+            f'<p>Comment: <code>{comment}</code></p>'
+            '</ac:rich-text-body></ac:structured-macro>'
+        )
+    if fmt == "quote":
+        return (
+            '<blockquote><p>'
+            f'DokuWiki revision: <code>{dt}</code> ({type_label})<br/>'
+            f'Author: {author}<br/>'
+            f'Comment: <code>{comment}</code>'
+            '</p></blockquote>'
+        )
+    if fmt == "table":
+        return (
+            '<table>'
+            f'<tr><th>DokuWiki revision</th><td><code>{dt}</code> ({type_label})</td></tr>'
+            f'<tr><th>Author</th><td>{author}</td></tr>'
+            f'<tr><th>Comment</th><td><code>{comment}</code></td></tr>'
+            '</table>'
+        )
+    macro_name = fmt if fmt in ("panel", "info", "note", "tip", "warning") else "panel"
+    return (
+        f'<ac:structured-macro ac:name="{macro_name}"><ac:rich-text-body>'
+        '<p>'
+        f'DokuWiki revision: <code>{dt}</code> ({type_label})<br/>'
+        f'Author: {author}<br/>'
+        f'Comment: <code>{comment}</code>'
+        '</p>'
+        '</ac:rich-text-body></ac:structured-macro>'
+    )
+
+
+def cmd_history_rewrite_headers(args: argparse.Namespace) -> int:
+    """이미 업로드된 페이지의 *현재 표시 중인* revision 헤더를 새 형식으로 교체.
+
+    GET 으로 본문 받기 → _strip_revision_header 로 기존 헤더 제거 → 새 형식
+    헤더 prepend → PUT. revisions 테이블의 *최신* rev 만 적용 (history 의
+    이전 버전들은 새로 history-convert+upload 해야 반영됨).
+    """
+    if not args.email or not args.api_token:
+        log("자격증명 필요.")
+        for line in CREDENTIAL_HELP.splitlines():
+            log("  " + line)
+        return 2
+
+    conn = db_connect(args.db)
+    fmt = args.header_format or db_get_meta(conn, "revision_header_fmt") or REVISION_HEADER_DEFAULT
+    if fmt not in REVISION_HEADER_FORMATS:
+        log(f"알 수 없는 header-format: {fmt}")
+        return 2
+    db_set_meta(conn, "revision_header_fmt", fmt)
+
+    session = _confluence_session(args)
+    if session is None:
+        return 2
+    base = args.base_url.rstrip("/")
+
+    users_map = _load_users_map(args.users_map)
+
+    # 모든 UPLOADED 메인 페이지가 대상 — revisions 테이블 비어있으면 본문에서
+    # 헤더 데이터 추출하는 fallback 사용.
+    sql = "SELECT doku_id, confluence_page_id FROM pages WHERE confluence_page_id IS NOT NULL"
+    params: tuple = ()
+    if args.only:
+        sql += " AND doku_id=?"
+        params = (args.only,)
+    sql += " ORDER BY doku_id"
+    if args.limit:
+        sql += f" LIMIT {int(args.limit)}"
+    rows = conn.execute(sql, params).fetchall()
+    log(f"대상 후보: {len(rows)} 페이지 (헤더 없는 페이지는 skip)")
+
+    pushed = unchanged = no_header = failed = 0
+    for doku_id, page_id in rows:
+        # GET 현재 storage 본문
+        r = _request_with_retry(
+            session, "GET", f"{base}/api/v2/pages/{page_id}",
+            params={"body-format": "storage"},
+        )
+        if r is None or r.status_code >= 400:
+            log(f"  [SKIP] {doku_id} GET 실패")
+            failed += 1
+            continue
+        js = r.json()
+        cur_body = (js.get("body") or {}).get("storage", {}).get("value", "") or ""
+        cur_ver = js.get("version", {}).get("number", 1)
+        title = js.get("title")
+
+        # revisions 테이블의 최신 rev 우선, 없으면 본문에서 추출
+        rev_row = conn.execute(
+            "SELECT rev_ts, user, comment, type FROM revisions "
+            "WHERE doku_id=? AND status='UPLOADED' ORDER BY rev_ts DESC LIMIT 1",
+            (doku_id,),
+        ).fetchone()
+
+        if rev_row:
+            rev_ts, user, comment, type_code = rev_row
+            new_header = _revision_header(rev_ts, user, comment, type_code, users_map, fmt=fmt)
+        else:
+            extracted = _extract_revision_header_data(cur_body)
+            if not extracted:
+                no_header += 1
+                continue
+            new_header = _revision_header_from_extracted(extracted, fmt=fmt)
+
+        stripped = _strip_revision_header(cur_body)
+        new_body = new_header + stripped
+
+        if new_body == cur_body:
+            unchanged += 1
+            continue
+
+        if args.dry_run:
+            log(f"  [dry] {doku_id} → fmt={fmt} (rev={rev_row or 'extracted'})")
+            continue
+
+        payload = {
+            "id": str(page_id),
+            "status": "current",
+            "title": title,
+            "body": {"representation": "storage", "value": new_body},
+            "version": {"number": cur_ver + 1},
+        }
+        r = _request_with_retry(session, "PUT", f"{base}/api/v2/pages/{page_id}", json=payload)
+        if r is None or r.status_code >= 400:
+            log(f"  [FAIL] {doku_id}: {r.status_code if r else 'no resp'}")
+            failed += 1
+            continue
+        pushed += 1
+        if pushed % 50 == 0:
+            log(f"  ... rewritten={pushed}")
+
+    log(f"history-rewrite-headers 완료: pushed={pushed} unchanged={unchanged} "
+        f"no_header={no_header} failed={failed} fmt={fmt}")
+    conn.close()
+    return 0 if failed == 0 else 1
 
 
 def cmd_history_status(args: argparse.Namespace) -> int:
@@ -8258,6 +8716,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp_hc = sub.add_parser("history-convert", help="raw_history → storage_history + 헤더 박스")
     sp_hc.add_argument("--force", action="store_true")
     sp_hc.add_argument("--only", help="특정 doku_id 만")
+    sp_hc.add_argument(
+        "--header-format", choices=REVISION_HEADER_FORMATS,
+        help=f"revision 헤더 형식 (기본: meta 의 revision_header_fmt 또는 {REVISION_HEADER_DEFAULT}). "
+        "none=헤더 생략, panel/info/note/tip/warning=매크로+shift-enter 줄바꿈, "
+        "quote=blockquote, table=2열 표, paragraphs=기존 3개 <p>",
+    )
     sp_hc.set_defaults(func=cmd_history_convert)
 
     sp_hu = sub.add_parser("history-upload", help="시간순 PUT replay → Confluence 버전 체인")
@@ -8274,6 +8738,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp_hs = sub.add_parser("history-status", help="history 진행 상황 요약")
     sp_hs.set_defaults(func=cmd_history_status)
+
+    sp_hrh = sub.add_parser(
+        "history-rewrite-headers",
+        help="이미 업로드된 페이지의 revision 헤더만 새 형식으로 교체 (PUT)",
+    )
+    sp_hrh.add_argument(
+        "--base-url", default=env_default("CONFLUENCE_BASE_URL"),
+    )
+    sp_hrh.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
+    sp_hrh.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
+    sp_hrh.add_argument(
+        "--header-format", choices=REVISION_HEADER_FORMATS,
+        help=f"새 헤더 형식 (기본: meta 의 revision_header_fmt 또는 {REVISION_HEADER_DEFAULT})",
+    )
+    sp_hrh.add_argument("--only", help="특정 doku_id 만")
+    sp_hrh.add_argument("--limit", type=int, help="처음 N 페이지만")
+    sp_hrh.add_argument("--users-map", help="dokuwiki user → Confluence accountId JSON")
+    sp_hrh.add_argument("--dry-run", action="store_true")
+    sp_hrh.set_defaults(func=cmd_history_rewrite_headers)
 
     sp_sd = sub.add_parser(
         "struct-discover", help="meta/struct.sqlite3 → state.db 의 struct_* 인덱싱"

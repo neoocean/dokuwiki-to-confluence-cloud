@@ -188,8 +188,10 @@ python run.py rewrite-oversized-pages
 # 과거 리비전 이전 (~37k 호출, 하룻밤 잡; resume-safe)
 python run.py history-discover                                        # attic 인덱싱
 python run.py history-render --base-url http://127.0.0.1:18080 --delay 0.05
-python run.py history-convert                                         # storage XML + 헤더 박스
+python run.py history-convert [--header-format panel]                 # storage XML + 헤더 박스
 python run.py history-upload [--users-map users.json] [--limit N]    # 시간순 PUT replay
+# 이미 업로드된 페이지의 헤더 형식만 교체 (panel/info/note/quote/table/none/...):
+python run.py history-rewrite-headers --header-format panel
 
 # struct 데이터 (4 schema / 1,213 row → native 모드 적용)
 python run.py struct-discover                                         # sqlite 인덱싱

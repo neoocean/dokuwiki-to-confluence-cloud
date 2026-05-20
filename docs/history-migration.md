@@ -243,17 +243,42 @@ CREATE TABLE media_revisions (
 
 ### 6.4 시간순 replay (옵션 B) 의 본문 헤더
 
-각 리비전 본문 최상단에:
+**설정 가능 (2026-05-20)**: `--header-format` (`history-convert` /
+`history-rewrite-headers`) 또는 `meta.revision_header_fmt` 로 선택.
 
+| fmt | 결과 | 용도 |
+|-----|------|------|
+| `none` | 헤더 박스 생략 | 깔끔한 본문 만 |
+| `panel` (기본) | panel 매크로 한 단락 + `<br/>` (shift+enter) 줄바꿈 | 권장 — 컴팩트 + 시각 강조 |
+| `info` / `note` / `tip` / `warning` | 동일 모양, 매크로 종류만 변경 | 색/아이콘 취향 |
+| `quote` | `<blockquote>` + `<br/>` | 매크로 사용 안 함 |
+| `table` | 2열 표 (라벨/값 × 3행) | 표 선호 |
+| `paragraphs` | 기존 — 3 개의 `<p>` 분리 (note 매크로) | 호환 |
+
+기본 (`panel`) 예:
 ```xml
-<ac:structured-macro ac:name="note">
+<ac:structured-macro ac:name="panel">
   <ac:rich-text-body>
-    <p>DokuWiki revision: <time>2020-01-23T03:18:48+09:00</time></p>
-    <p>Author: neoocean — IP 5.181.235.199</p>
-    <p>Type: E — comment: <code>[2019-01-03]</code></p>
+    <p>DokuWiki revision: <code>2020-01-23T03:18:48+09:00</code> (edit)<br/>
+    Author: neoocean<br/>
+    Comment: <code>[2019-01-03]</code></p>
   </ac:rich-text-body>
 </ac:structured-macro>
 ```
+
+옵션 사용:
+```sh
+# 변환 시점에 지정 — 이후 history-convert 모두 같은 형식
+python run.py history-convert --header-format panel
+
+# 이미 업로드된 페이지의 헤더만 새 형식으로 라이브 교체 (revisions 테이블
+# 없어도 기존 헤더 텍스트에서 데이터 추출해 재구성)
+python run.py history-rewrite-headers --header-format panel
+python run.py history-rewrite-headers --header-format none --dry-run
+```
+
+`meta.revision_header_fmt` 가 캐시되므로 다음 `history-convert` 부터는
+`--header-format` 생략 가능.
 
 ### 6.5 B replay 알고리즘 (채택안 핵심)
 
