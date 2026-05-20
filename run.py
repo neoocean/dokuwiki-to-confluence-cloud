@@ -1600,7 +1600,8 @@ def cmd_convert(args: argparse.Namespace) -> int:
     if args.only:
         where, params = "doku_id = ?", (args.only,)
     elif args.force:
-        where, params = "status IN ('RENDERED', 'CONVERTED', 'FAILED')", ()
+        # 이미 업로드된 페이지도 변환기 변경 시 재변환 필요 → UPLOADED 포함
+        where, params = "status IN ('RENDERED', 'CONVERTED', 'FAILED', 'UPLOADED')", ()
     else:
         where, params = "status = 'RENDERED'", ()
 
@@ -6403,6 +6404,146 @@ def decrypt_encryptedpasswords(cipher_b64: str, password: str) -> str:
     return pt[:-pad].decode("utf-8", errors="replace")
 
 
+def cmd_link_check(args: argparse.Namespace) -> int:
+    """Confluence 측 마이그래이션 결과 페이지의 링크 정합성 검증.
+
+    세 가지 검사:
+    1. dwc-link: placeholder 잔존 (rewrite-links 가 처리 안 한 흔적)
+    2. <ac:link><ri:page ri:content-title="X"/> 의 title 이 *실 존재* 페이지를
+       가리키는지 (state.db.pages 의 title 과 매치)
+    3. <a href="..."> 외부 URL HTTP HEAD (옵션, --check-external)
+
+    결과 JSON / 콘솔 표.
+    """
+    if not args.email or not args.api_token:
+        log("자격증명 필요")
+        return 2
+    conn = db_connect(args.db)
+    session = _confluence_session(args)
+    if session is None:
+        return 2
+    base = args.base_url.rstrip("/")
+
+    # 모든 알려진 title → page_id 매핑 (resolve check 용)
+    title_to_page: dict[str, str] = {}
+    for title, pid in conn.execute(
+        "SELECT title, confluence_page_id FROM pages "
+        "WHERE confluence_page_id IS NOT NULL AND title IS NOT NULL AND title != ''"
+    ):
+        title_to_page.setdefault(title, pid)
+
+    # 검사 대상
+    sql = "SELECT doku_id, confluence_page_id FROM pages WHERE confluence_page_id IS NOT NULL"
+    params: tuple = ()
+    if args.only:
+        sql += " AND doku_id=?"
+        params = (args.only,)
+    sql += " ORDER BY doku_id"
+    if args.limit:
+        sql += f" LIMIT {int(args.limit)}"
+    rows = conn.execute(sql, params).fetchall()
+    log(f"링크 점검 대상: {len(rows)} 페이지")
+
+    import re as _re
+    summary = {
+        "total_pages": len(rows),
+        "checked": 0,
+        "placeholder_residual": 0,
+        "unresolved_page_links": 0,
+        "broken_external": 0,
+        "fetch_failed": 0,
+        "details": [],
+    }
+
+    external_seen: set[str] = set()
+    external_cache: dict[str, int] = {}
+
+    for i, (doku_id, page_id) in enumerate(rows, 1):
+        r = _request_with_retry(
+            session, "GET", f"{base}/api/v2/pages/{page_id}",
+            params={"body-format": "storage"},
+        )
+        if r is None or r.status_code >= 400:
+            summary["fetch_failed"] += 1
+            continue
+        body = (r.json().get("body") or {}).get("storage", {}).get("value", "") or ""
+        summary["checked"] += 1
+
+        page_issues: dict = {"doku_id": doku_id, "page_id": page_id,
+                              "placeholders": [], "unresolved_pages": [],
+                              "broken_external": []}
+
+        # 1. placeholder 잔존
+        for m in _re.finditer(r'dwc-link:([^"\s<]+)', body):
+            page_issues["placeholders"].append(m.group(1))
+        summary["placeholder_residual"] += len(page_issues["placeholders"])
+
+        # 2. ri:page title 의 실재 여부
+        for m in _re.finditer(r'<ri:page\s+ri:content-title="([^"]+)"', body):
+            title = m.group(1)
+            if title not in title_to_page:
+                page_issues["unresolved_pages"].append(title)
+        summary["unresolved_page_links"] += len(page_issues["unresolved_pages"])
+
+        # 3. 외부 URL (옵션)
+        if args.check_external:
+            for m in _re.finditer(r'href="(https?://[^"]+)"', body):
+                url = m.group(1)
+                if url in external_seen:
+                    if external_cache.get(url, 200) >= 400:
+                        page_issues["broken_external"].append(url)
+                    continue
+                external_seen.add(url)
+                # HEAD 요청 (간소화 — requests 직접 호출)
+                try:
+                    import requests
+                    rr = requests.head(url, timeout=5, allow_redirects=True)
+                    external_cache[url] = rr.status_code
+                    if rr.status_code >= 400:
+                        page_issues["broken_external"].append(url)
+                except Exception:
+                    external_cache[url] = 0
+                    page_issues["broken_external"].append(url)
+        summary["broken_external"] += len(page_issues["broken_external"])
+
+        if any([page_issues["placeholders"], page_issues["unresolved_pages"],
+                page_issues["broken_external"]]):
+            summary["details"].append(page_issues)
+
+        if i % 50 == 0:
+            log(f"  ... checked {i}/{len(rows)}")
+
+    log(f"링크 점검 완료: checked={summary['checked']}/{summary['total_pages']}")
+    log(f"  placeholder 잔존:   {summary['placeholder_residual']}")
+    log(f"  unresolved page:    {summary['unresolved_page_links']}")
+    log(f"  broken external:    {summary['broken_external']}")
+    log(f"  fetch 실패:         {summary['fetch_failed']}")
+    log(f"  문제 있는 페이지:   {len(summary['details'])}")
+
+    if args.output:
+        import json as _json
+        Path(args.output).write_text(
+            _json.dumps(summary, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        log(f"JSON → {args.output}")
+
+    if args.verbose and summary["details"]:
+        print()
+        print("=== 문제 있는 페이지 ===")
+        for d in summary["details"][:50]:
+            print(f"\n[{d['doku_id']}] page {d['page_id']}")
+            if d["placeholders"]:
+                print(f"  placeholders ({len(d['placeholders'])}): {d['placeholders'][:5]}")
+            if d["unresolved_pages"]:
+                print(f"  unresolved ({len(d['unresolved_pages'])}): {d['unresolved_pages'][:5]}")
+            if d["broken_external"]:
+                print(f"  broken-ext ({len(d['broken_external'])}): {d['broken_external'][:5]}")
+
+    conn.close()
+    return 0
+
+
 def cmd_decrypt(args: argparse.Namespace) -> int:
     """encryptedpasswords cipher 를 복호화.
 
@@ -9666,6 +9807,23 @@ def build_parser() -> argparse.ArgumentParser:
     sp_dec.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
     sp_dec.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
     sp_dec.set_defaults(func=cmd_decrypt)
+
+    sp_lc = sub.add_parser(
+        "link-check",
+        help="Confluence 측 페이지의 링크 정합성 검증 (placeholder 잔존 / "
+        "unresolved page link / 외부 URL HTTP HEAD)",
+    )
+    sp_lc.add_argument("--base-url", default=env_default("CONFLUENCE_BASE_URL"))
+    sp_lc.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
+    sp_lc.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
+    sp_lc.add_argument("--only", help="특정 doku_id 만")
+    sp_lc.add_argument("--limit", type=int, help="처음 N 페이지")
+    sp_lc.add_argument("--check-external", action="store_true",
+                        help="외부 URL HTTP HEAD 검사 (느림 — 캐싱)")
+    sp_lc.add_argument("--output", help="결과 JSON 경로")
+    sp_lc.add_argument("--verbose", "-v", action="store_true",
+                        help="문제 페이지 상세 출력 (최대 50개)")
+    sp_lc.set_defaults(func=cmd_link_check)
 
     sp_wiz = sub.add_parser(
         "wizard",
