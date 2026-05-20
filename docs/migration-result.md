@@ -5,6 +5,77 @@ day 의 §0 표. 과거 로그는 그대로 보존.
 
 ---
 
+# Day 5 — 2026-05-20 (변환기 6종 추가 + 1565 페이지 헤더 재포맷 + 508 페이지 갱신)
+
+CL 53121-53269. *대규모 변환기 보강 + 라이브 적용 사이클*.
+
+## §0 라이브 결과 한 줄
+
+- **revision 헤더 재포맷**: 1,565 페이지 (3 <p> → panel + shift+enter, idempotent)
+- **변환기 추가 6종 + 라이브 적용**: monthcal (105 매크로 → 정적 캘린더 표) /
+  Google Calendar iframe (`u:lam:calendar`) / youtube fallback / encryptedpasswords
+  `<decrypt>` → expand + inline code (11건, cipher 100% 보존) / todo 체크박스
+  강화 (mixed/inline → task-list)
+- **plugin-scan 신규 도구**: 7 미설치 식별 → 4 자동 설치 (encrypt / iframe /
+  tagging / discussion). 1569 페이지 데이터 기반.
+- **전체 convert --force + upload**: 1567 변환 / 508 updated / 1167 skipped
+  (content_hash 동일) / 0 failed (단 큰 본문 1건 별도 `u:neoocean:j:2019:09:08`)
+- **신규 도구**: decrypt (AES-256-CBC 복호화) / link-check (placeholder 잔존
+  + unresolved title + external HEAD) / history-rewrite-headers (idempotent
+  헤더 형식 변경)
+- **plugin 자동 설치 sanity check**: plugin.info.txt / syntax.php 등 부재 시
+  거부 — pld-linux 의 RPM spec wrapper 가 정상 plugin 으로 잘못 잡히던 버그 fix.
+
+## §1 신규 변환기 (run.py)
+
+| 함수 | 역할 | 영향 |
+|------|------|------|
+| `_convert_monthcal_fallback` | monthcal 매크로 미설치 fallback → 정적 캘린더 `<table>` (요일 헤더 + 날짜 셀 + namespace dwc-link) | 105 매크로 / 10+ 페이지 |
+| `_convert_youtube_fallback` | `{{youtube>VID}}` 깨진 fallback → Confluence iframe (youtube embed) | 본 인스턴스 0건 (사용자 데이터엔 정상 hyperlink) |
+| `_convert_google_calendar_iframe` | Google Calendar `<iframe>` 또는 escape 된 텍스트 → Confluence iframe 매크로 | 1 페이지 |
+| `_convert_encrypted_passwords` | `<decrypt>cipher</decrypt>` escape 텍스트 → Confluence expand + inline code (cipher 보존) | 11건 / 5 페이지 |
+| `_convert_todos` 강화 | mixed ul / li 안 todo + 텍스트 / inline → task-list (single-task) / 또는 unicode 글리프 | 5,285 `<todo>` 매크로 영향 |
+| `_revision_header(fmt=)` | 8 형식 (none/panel/info/note/tip/warning/quote/table/paragraphs) — 기본 panel + shift+enter | 1,565 페이지 |
+
+## §2 신규 명령
+
+| 명령 | 역할 |
+|------|------|
+| `plugin-scan` | 페이지 본문 스캔 → 매크로/태그 사용 → 미설치 플러그인 식별. `--install` 로 자동 설치 (PLUGIN_DOWNLOADS 매핑 22종) |
+| `decrypt` | encryptedpasswords cipher 복호화 (OpenSSL AES-256-CBC + EVP_BytesToKey MD5). `-p PASS --cipher / --page / --confluence-id` |
+| `link-check` | Confluence 측 페이지의 (1) dwc-link 잔존 (2) unresolved page title (3) external URL HEAD |
+| `history-rewrite-headers` | 이미 업로드된 페이지의 revision 헤더만 새 형식으로 재PUT. 기존 모양 자동 감지·strip |
+
+## §3 결정적 발견
+
+- **Confluence Cloud Database API**: 컬럼/row endpoint 미공개 (Day 4 발견 재확인)
+- **plugin 자동 설치의 잘못된 패키지 식별**: pld-linux/dokuwiki-plugin-encryptedpasswords
+  는 RPM spec 만 — 정상 dokuwiki plugin 아님. `_dev_install_plugins` 에 sanity
+  check 추가 (plugin.info.txt / syntax.php 등 marker 파일 필수)
+- **encryptedpasswords cipher 형식**: gibberish-aes.js + OpenSSL AES-256-CBC +
+  EVP_BytesToKey(MD5, 1 iter) — Python `decrypt_encryptedpasswords` 구현으로
+  복호화 가능 (round-trip 테스트 10건 통과)
+- **Convert --force 버그**: UPLOADED status 페이지 누락 → 변환기 변경 후 재변환
+  안 됨. fix 적용.
+
+## §4 테스트
+
+164 → 169+ 통과. 신규 케이스:
+- test_revision_header.py (21): 8 형식 + strip 회귀
+- test_calendar.py (14): monthcal 5 / Google Calendar iframe 4 / encrypt 5
+- test_decrypt.py (10): KDF + round-trip + invalid password
+- test_link_check.py (4): 정규식 패턴
+- tests/conftest.py: pytest 공통 fixture (project_root / convert / make_dokuwiki)
+
+## §5 코드 정리
+
+- 모듈 docstring 에 코드 섹션 인덱스 (`# §` anchor)
+- 섹션 헤더 표준화 (20곳)
+- `_add_confluence_creds_args` / `_add_confluence_space_args` 로 argparse
+  boilerplate -38%
+
+---
+
 # Day 4 — 2026-05-19 (struct → native+properties 라이브 적용)
 
 snapshot 페이지 4개로만 있던 struct 데이터를 *Confluence 측에서도

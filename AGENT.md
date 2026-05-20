@@ -76,7 +76,11 @@ discover  →  render  →  convert  →  upload  →  rewrite-links
 | | `struct-*` | meta/struct.sqlite3 → native (Database 쉘 + Page Properties + Report + bound 페이지 임베드) |
 | | `rewrite-oversized*` | 100MB 초과 첨부 / 본문 한도 거부 폴백 |
 | | `audit` | Confluence 측 다시 받아 비교 |
-| | `verify build/import/status` | 사용자 시각 검수 큐 + Phase 3 자동 사전 거름 |
+| | `verify build/import/status` | 사용자 시각 검수 큐 + Phase 3 자동 사전 거름 + Phase 4 (`--with-all-extra-signals`) |
+| | `plugin-scan [--install]` | 데이터에서 사용 매크로 → 미설치 플러그인 식별 (dokuwiki 동작 무관) |
+| | `decrypt -p PASS ...` | encryptedpasswords cipher 복호화 (AES-256-CBC) |
+| | `link-check [--check-external]` | Confluence 측 placeholder / unresolved title / 외부 URL |
+| | `history-rewrite-headers --header-format X` | 헤더 형식만 교체 (panel/info/note/quote/table/paragraphs/none) |
 | | `report` / `report-publish` | 통계 / Confluence 페이지 자동 발행 |
 
 전체를 한 명령으로: `python run.py wizard` (14 단계 step-by-step).
