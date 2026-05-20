@@ -241,8 +241,9 @@ def test_todo_pure_ul_to_task_list() -> None:
     assert "완료" in out and "미완" in out
 
 
-def test_todo_mixed_falls_back_to_text_marker() -> None:
-    """todo + 트레일링 텍스트 -> [x]/[ ] 텍스트 폴백."""
+def test_todo_mixed_li_uses_task_list_with_extra_text() -> None:
+    """todo + 트레일링 텍스트가 한 li 안에 — todo 부분만 task-list 로 wrap,
+    나머지 텍스트는 li 에 그대로 보존 (Confluence 체크박스 기능 활용)."""
     html = (
         "<ul>"
         '<li><div class="li"><span class="todo">'
@@ -252,8 +253,51 @@ def test_todo_mixed_falls_back_to_text_marker() -> None:
         "</ul>"
     )
     out = _convert(html)
-    assert "[ ] A" in out
+    # task-list 가 들어감 (텍스트 마커 폴백 아님)
+    assert "<ac:task-list>" in out
+    assert "<ac:task-status>incomplete</ac:task-status>" in out
+    # todo body
+    assert ">A<" in out or "A</ac:task-body>" in out
+    # 트레일링 텍스트도 보존
+    assert "추가 텍스트" in out
+    # 텍스트 마커는 사용 안 함
+    assert "[ ] A" not in out
+
+
+def test_todo_mixed_ul_each_todo_li_to_task_list() -> None:
+    """mixed <ul> — todo li 와 일반 li 가 섞임. todo li 만 task-list 로 변환."""
+    html = (
+        "<ul>"
+        '<li><div class="li">일반 항목 1</div></li>'
+        '<li><div class="li"><span class="todo">'
+        '<input class="todocheckbox" type="checkbox" checked="checked"/>'
+        '<span class="todoinnertext">할일</span></span></div></li>'
+        '<li><div class="li">일반 항목 2</div></li>'
+        "</ul>"
+    )
+    out = _convert(html)
+    # 일반 li 는 그대로 ul 안
+    assert "일반 항목 1" in out
+    assert "일반 항목 2" in out
+    # todo li 는 task-list 로
+    assert "<ac:task-list>" in out
+    assert "<ac:task-status>complete</ac:task-status>" in out
+    assert "할일" in out
+
+
+def test_todo_inline_outside_li_uses_unicode() -> None:
+    """li 밖의 inline todo — Confluence 가 inline task-list 불가 → unicode 글리프."""
+    html = (
+        '<p>중간에 <span class="todo">'
+        '<input class="todocheckbox" type="checkbox"/>'
+        '<span class="todoinnertext">할일</span></span> 후속</p>'
+    )
+    out = _convert(html)
+    # task-list 없음
     assert "<ac:task-list>" not in out
+    # unicode 체크박스 글리프
+    assert "☐" in out or "☑" in out
+    assert "할일" in out
 
 
 def test_void_elements_self_closed() -> None:

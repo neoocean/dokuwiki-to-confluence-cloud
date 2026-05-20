@@ -842,6 +842,59 @@ def _convert_monthcal_fallback(soup) -> None:
             a.replace_with(new_node)
 
 
+def _convert_encrypted_passwords(soup) -> None:
+    """`<decrypt>cipher</decrypt>` / `<encrypt>cipher</encrypt>` 를 Confluence
+    expand 매크로 + inline code 로 변환.
+
+    encryptedpasswords plugin 의 cipher text 는 *그대로 보존* 해야 복호화
+    가능 — 단 평문 노출 방지를 위해 expand (접어두기) 안에 배치, 코드 형식.
+
+    두 케이스:
+    A. encryptedpasswords plugin 활성: DokuWiki 가 plugin syntax 처리 결과를
+       특정 element 로 출력 (보통 <code class="enc"> 또는 비슷). 본 함수는
+       *fallback escape 텍스트만* 처리하므로 plugin 활성이면 통과.
+    B. plugin 미활성 (현 상태): DokuWiki 가 `<decrypt>...</decrypt>` 를 unknown
+       tag 로 escape → 본문에 `&lt;decrypt&gt;cipher&lt;/decrypt&gt;` 텍스트.
+       bs4 는 이 escape 를 풀어서 텍스트 노드로 인식.
+    """
+    import re as _re
+    from bs4 import BeautifulSoup as _BS, NavigableString
+
+    pattern = _re.compile(r"<(decrypt|encrypt)>([^<>]+)</\1>")
+
+    def _expand_macro(tag: str, cipher: str) -> str:
+        import html as _h
+        # cipher 그대로 보존 (decrypt 시 사용). escape 만.
+        cipher_esc = _h.escape(cipher)
+        return (
+            '<ac:structured-macro ac:name="expand">'
+            '<ac:parameter ac:name="title">'
+            '🔒 encryptedpasswords (클릭해서 펼치기)'
+            '</ac:parameter>'
+            '<ac:rich-text-body>'
+            f'<p><code>&lt;{tag}&gt;{cipher_esc}&lt;/{tag}&gt;</code></p>'
+            '</ac:rich-text-body>'
+            '</ac:structured-macro>'
+        )
+
+    # 텍스트 노드를 walk 해 <decrypt>...</decrypt> 패턴 매치 시 노드 교체
+    for text_node in list(soup.find_all(string=True)):
+        if not isinstance(text_node, NavigableString):
+            continue
+        s = str(text_node)
+        if "<decrypt>" not in s and "<encrypt>" not in s:
+            continue
+        if not pattern.search(s):
+            continue
+        # 패턴 매치 — 새 노드들로 split
+        new_html = pattern.sub(
+            lambda m: _expand_macro(m.group(1), m.group(2)), s,
+        )
+        # parser 가 위치에 inject
+        wrapper = _BS(f"<span>{new_html}</span>", "html.parser")
+        text_node.replace_with(*list(wrapper.span.children))
+
+
 def _calendar_iframe_macro(src: str, width: str = "750", height: str = "500") -> str:
     import html as _h
     return (
@@ -1092,12 +1145,17 @@ def _convert_visual_residue(soup) -> None:
 
 def _convert_todos(soup) -> None:
     """
-    DokuWiki todo plugin 출력을 Confluence task-list / 텍스트 마커로 변환.
+    DokuWiki todo plugin 출력을 Confluence task-list (체크박스) 로 변환.
 
     Step 1: <ul> 의 모든 직접 <li> 가 단일 pure todo (li 의 텍스트와 todo
             span 의 텍스트가 동일) 이면 <ul> 전체를 <ac:task-list> 로 치환.
-            Confluence 의 task-list 는 block-level 이라 안전한 위치에만 둠.
-    Step 2: 남은 모든 todo span → `[x] 텍스트` / `[ ] 텍스트` 인라인 마커.
+    Step 2: <ul> 안의 mixed list — todo + 비-todo li 가 섞임. 각 todo li 만
+            *그 li 안에 단일 task-list* 로 wrap (Confluence 가 li 안의
+            block task-list 받음). 비-todo li 는 그대로.
+    Step 3: <li> 안에 todo 가 있지만 추가 텍스트도 있음 (`[x] do thing — note`).
+            todo span 만 task-list 로 wrap, 나머지 li 텍스트는 그대로.
+    Step 4: 부모 li 가 *전혀 없는* 인라인 todo — Confluence 는 인라인
+            task-list 불가 → unicode 글리프 (☑ / ☐) 로 교체.
     """
     counter = [0]
 
@@ -1105,6 +1163,13 @@ def _convert_todos(soup) -> None:
         counter[0] += 1
         return counter[0]
 
+    def _make_task_list_with_one(todo) -> "object":
+        checked, text = _todo_checked_and_text(todo)
+        task_list = soup.new_tag("ac:task-list")
+        task_list.append(_build_ac_task(soup, _next_id(), checked, text))
+        return task_list
+
+    # Step 1: pure todo <ul> (모든 li 가 단일 todo + li 본문 == todo 본문)
     for ul in list(soup.find_all("ul")):
         lis = ul.find_all("li", recursive=False)
         if not lis:
@@ -1129,11 +1194,50 @@ def _convert_todos(soup) -> None:
             task_list.append(_build_ac_task(soup, _next_id(), checked, text))
         ul.replace_with(task_list)
 
-    # 남은 todo 들은 인라인 텍스트 마커로
+    # Step 2 & 3: 남은 모든 todo span 처리
     for todo in list(soup.find_all("span", class_="todo")):
-        checked, text = _todo_checked_and_text(todo)
-        prefix = "[x] " if checked else "[ ] "
-        todo.replace_with(prefix + text)
+        # 부모 chain 에서 가장 가까운 li 또는 block 컨테이너 찾기
+        li_ancestor = None
+        cur = todo.parent
+        while cur is not None and getattr(cur, "name", None) is not None:
+            if cur.name == "li":
+                li_ancestor = cur
+                break
+            if cur.name in ("ac:task-list", "ac:task", "ac:task-body",
+                            "code", "pre", "ac:plain-text-body"):
+                # 이미 task-list 안 또는 코드 안 — 건드리지 않음
+                li_ancestor = "skip"
+                break
+            cur = cur.parent
+
+        if li_ancestor == "skip":
+            continue
+
+        if li_ancestor is None:
+            # 부모 li 없음 — inline todo. Confluence 는 inline task-list 불가
+            # → unicode 글리프로
+            checked, text = _todo_checked_and_text(todo)
+            glyph = "☑" if checked else "☐"
+            todo.replace_with(f"{glyph} {text}")
+            continue
+
+        li = li_ancestor
+        # li 본문 = todo 본문이면 (Step 1 에서 잡혔어야 하지만 안 잡힌 케이스 —
+        # mixed ul) → li 전체를 task-list 로 교체할 수 있도록 single-task
+        # task-list 로 wrap, li 내부에 박음.
+        li_text = li.get_text(strip=True)
+        todo_text = todo.get_text(strip=True)
+        if li_text == todo_text:
+            # li 내용이 정확히 이 todo 하나 — li 안의 모든 children 을
+            # 단일 task-list 로 교체
+            task_list = _make_task_list_with_one(todo)
+            li.clear()
+            li.append(task_list)
+        else:
+            # li 안에 todo + 다른 텍스트 — todo span 만 task-list 로 교체,
+            # li 의 나머지 텍스트는 보존. 다만 task-list 가 block 이라
+            # 시각적으로 줄바꿈이 생김.
+            todo.replace_with(_make_task_list_with_one(todo))
 
 
 def _convert_html_to_storage(
@@ -1194,6 +1298,9 @@ def _convert_html_to_storage(
 
     # 1.412) youtube 플러그인 미설치 fallback -> Confluence iframe 매크로 (youtube embed)
     _convert_youtube_fallback(soup)
+
+    # 1.414) encryptedpasswords (<decrypt>...</decrypt>) → expand + inline code
+    _convert_encrypted_passwords(soup)
 
     # 1.415) Google Calendar iframe -> Confluence iframe 매크로
     _convert_google_calendar_iframe(soup)
@@ -5774,7 +5881,8 @@ PLUGIN_DOWNLOADS: dict[str, str | None] = {
     "monthcal":   None,   # 변환기가 정적 표로 처리 (_convert_monthcal_fallback)
     "youtube":    None,   # 변환기가 Confluence iframe macro 로 처리
     "iframe":     "https://github.com/Chris--S/dokuwiki-plugin-iframe/archive/refs/heads/master.tar.gz",
-    "encrypt":    "https://github.com/pld-linux/dokuwiki-plugin-encryptedpasswords/archive/refs/heads/master.tar.gz",
+    "encrypt":    "https://github.com/ssahara/dw-plugin-encryptedpasswords/archive/refs/heads/master.tar.gz",
+    "encryptedpasswords": "https://github.com/ssahara/dw-plugin-encryptedpasswords/archive/refs/heads/master.tar.gz",
     "html":       None,   # 보안 위험 — 수동 설치만 권장
     "davcal":     None,   # 패키지 형식 다양 — 수동
     "box":        None,   # 다양한 fork — 수동
@@ -6179,7 +6287,22 @@ def _dev_install_plugins(dokuwiki_root: Path, plugins: list[str]) -> dict:
             if not subs:
                 result["failed"].append(f"{name} (압축 내부 디렉터리 없음)")
                 continue
-            shutil.move(str(subs[0]), str(plugin_dir))
+            cand = subs[0]
+            # Sanity check — 정상 DokuWiki plugin 인지 확인.
+            # plugin.info.txt 또는 syntax.php / action.php / admin.php 중 하나는
+            # 반드시 있어야 함. 없으면 RPM spec 등 잘못된 패키지일 가능성.
+            has_plugin_marker = any(
+                (cand / fn).exists() for fn in
+                ("plugin.info.txt", "syntax.php", "action.php", "admin.php",
+                 "renderer.php", "helper.php")
+            )
+            if not has_plugin_marker:
+                files_preview = ", ".join(sorted(p.name for p in cand.iterdir())[:5])
+                result["failed"].append(
+                    f"{name} (정상 plugin 아님 — plugin.info.txt/syntax.php 등 부재; 내용: {files_preview})"
+                )
+                continue
+            shutil.move(str(cand), str(plugin_dir))
             result["installed"].append(name)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -6233,6 +6356,135 @@ def _dev_wait_healthy(timeout: int = DEV_HEALTH_TIMEOUT) -> bool:
             pass
         time.sleep(1)
     return False
+
+
+def _evp_bytes_to_key(password: bytes, salt: bytes,
+                       key_len: int = 32, iv_len: int = 16) -> tuple[bytes, bytes]:
+    """OpenSSL EVP_BytesToKey with MD5, 1 iteration — encryptedpasswords plugin
+    (gibberish-aes.js) 의 KDF 와 호환."""
+    import hashlib
+    dtot = b""
+    d = b""
+    while len(dtot) < key_len + iv_len:
+        d = hashlib.md5(d + password + salt).digest()
+        dtot += d
+    return dtot[:key_len], dtot[key_len:key_len + iv_len]
+
+
+def decrypt_encryptedpasswords(cipher_b64: str, password: str) -> str:
+    """encryptedpasswords plugin 의 cipher (base64-encoded OpenSSL AES-256-CBC)
+    를 password 로 복호화.
+
+    Format: base64("Salted__" + 8-byte salt + AES-256-CBC ciphertext)
+    KDF: EVP_BytesToKey(MD5, 1 iter, key=32, iv=16)
+    Padding: PKCS7
+    """
+    import base64
+    try:
+        from Crypto.Cipher import AES  # type: ignore
+    except ImportError:
+        raise RuntimeError(
+            "pycryptodome 미설치 — `pip install pycryptodome` 후 재시도"
+        )
+    raw = base64.b64decode(cipher_b64.strip())
+    if not raw.startswith(b"Salted__"):
+        raise ValueError("Invalid format — 'Salted__' prefix 부재 (OpenSSL AES 형식 아님)")
+    salt = raw[8:16]
+    ct = raw[16:]
+    if len(ct) % 16 != 0:
+        raise ValueError(f"Cipher length not multiple of 16 ({len(ct)})")
+    key, iv = _evp_bytes_to_key(password.encode("utf-8"), salt)
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    pt = cipher.decrypt(ct)
+    # PKCS7 unpad
+    pad = pt[-1]
+    if pad < 1 or pad > 16:
+        raise ValueError("복호화 실패 — password 가 맞지 않습니다 (PKCS7 padding 오류)")
+    return pt[:-pad].decode("utf-8", errors="replace")
+
+
+def cmd_decrypt(args: argparse.Namespace) -> int:
+    """encryptedpasswords cipher 를 복호화.
+
+    사용법:
+      python run.py decrypt --password PASS CIPHER_B64
+      python run.py decrypt --password PASS --page DOKU_ID    # 페이지의 모든 cipher
+      python run.py decrypt --password PASS --confluence-id PAGE_ID  # Confluence 페이지의 모든 cipher
+    """
+    import getpass
+    import re as _re
+
+    password = args.password
+    if password is None:
+        password = getpass.getpass("Password: ")
+    if not password:
+        log("password 필요")
+        return 2
+
+    targets: list[tuple[str, str]] = []  # (label, cipher_b64)
+
+    if args.cipher:
+        for c in args.cipher:
+            targets.append(("(cli)", c))
+    if args.page:
+        # state.db 의 pages.raw_xhtml_path 또는 storage_path 에서 추출
+        conn = db_connect(args.db)
+        row = conn.execute(
+            "SELECT raw_xhtml_path, storage_path FROM pages WHERE doku_id=?",
+            (args.page,),
+        ).fetchone()
+        if not row:
+            log(f"페이지 없음: {args.page}")
+            return 2
+        text = ""
+        if row[0] and Path(row[0]).is_file():
+            text = Path(row[0]).read_text(encoding="utf-8", errors="ignore")
+        elif row[1] and Path(row[1]).is_file():
+            text = Path(row[1]).read_text(encoding="utf-8", errors="ignore")
+        # `<decrypt>cipher</decrypt>` 또는 escape `&lt;decrypt&gt;...&lt;/decrypt&gt;` 또는
+        # `<encrypt>cipher</encrypt>` 모두 처리
+        for m in _re.finditer(
+            r"(?:<|&lt;)(?:decrypt|encrypt)(?:>|&gt;)([A-Za-z0-9+/=]+)(?:<|&lt;)/(?:decrypt|encrypt)(?:>|&gt;)",
+            text,
+        ):
+            targets.append((args.page, m.group(1)))
+    if args.confluence_id:
+        if not args.email or not args.api_token:
+            log("Confluence 페이지에서 복호화하려면 자격증명 필요")
+            return 2
+        session = _confluence_session(args)
+        if session is None:
+            return 2
+        base = args.base_url.rstrip("/")
+        r = _request_with_retry(
+            session, "GET", f"{base}/api/v2/pages/{args.confluence_id}",
+            params={"body-format": "storage"},
+        )
+        if r is None or r.status_code >= 400:
+            log("GET 실패")
+            return 2
+        body = (r.json().get("body") or {}).get("storage", {}).get("value", "") or ""
+        for m in _re.finditer(
+            r"(?:<|&lt;)(?:decrypt|encrypt)(?:>|&gt;)([A-Za-z0-9+/=]+)(?:<|&lt;)/(?:decrypt|encrypt)(?:>|&gt;)",
+            body,
+        ):
+            targets.append((f"page:{args.confluence_id}", m.group(1)))
+
+    if not targets:
+        log("복호화 대상 없음 — --cipher / --page / --confluence-id 중 하나 지정")
+        return 2
+
+    ok = fail = 0
+    for label, cipher in targets:
+        try:
+            plain = decrypt_encryptedpasswords(cipher, password)
+            print(f"[{label}] {cipher[:30]}...  →  {plain}")
+            ok += 1
+        except Exception as e:
+            print(f"[{label}] {cipher[:30]}...  →  실패: {e}")
+            fail += 1
+    log(f"decrypt 완료: ok={ok} fail={fail}")
+    return 0 if fail == 0 else 1
 
 
 def cmd_plugin_scan(args: argparse.Namespace) -> int:
@@ -9400,6 +9652,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp_ps.add_argument("--install-into", help="자동 설치 대상 디렉터리 override")
     sp_ps.set_defaults(func=cmd_plugin_scan)
+
+    sp_dec = sub.add_parser(
+        "decrypt",
+        help="encryptedpasswords plugin 의 cipher (AES-256-CBC) 복호화 "
+        "— pycryptodome 필요. password 와 cipher 받아 평문 출력",
+    )
+    sp_dec.add_argument("--password", "-p", help="복호화 비밀번호 (생략 시 stdin getpass)")
+    sp_dec.add_argument("cipher", nargs="*", help="base64-encoded cipher 1+ (생략 시 --page 또는 --confluence-id)")
+    sp_dec.add_argument("--page", help="state.db 의 페이지 (raw/storage 본문에서 모든 cipher 추출 + 복호화)")
+    sp_dec.add_argument("--confluence-id", help="Confluence 페이지 ID — 본문 GET 후 모든 cipher 복호화")
+    sp_dec.add_argument("--base-url", default=env_default("CONFLUENCE_BASE_URL"))
+    sp_dec.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
+    sp_dec.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
+    sp_dec.set_defaults(func=cmd_decrypt)
 
     sp_wiz = sub.add_parser(
         "wizard",

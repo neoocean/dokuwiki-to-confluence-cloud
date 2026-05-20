@@ -133,3 +133,50 @@ def test_calendar_iframe_extracts_width_height() -> None:
     out = _convert(html)
     assert 'ac:name="width">900</ac:parameter>' in out
     assert 'ac:name="height">600</ac:parameter>' in out
+
+
+# ─── encryptedpasswords ─────────────────────────────────────────
+
+
+def test_encrypt_decrypt_to_expand() -> None:
+    html = "<p>password: &lt;decrypt&gt;U2FsdGVkX1/abc=&lt;/decrypt&gt;</p>"
+    out = _convert(html)
+    assert 'ac:name="expand"' in out
+    # cipher 그대로 보존
+    assert "U2FsdGVkX1/abc=" in out
+    # inline code 형식
+    assert "<code>" in out
+    # 태그도 그대로 (escape) — 복호화 시 사용
+    assert "&lt;decrypt&gt;" in out and "&lt;/decrypt&gt;" in out
+
+
+def test_encrypt_tag_variant() -> None:
+    html = "<p>x &lt;encrypt&gt;CIPHER&lt;/encrypt&gt; y</p>"
+    out = _convert(html)
+    assert 'ac:name="expand"' in out
+    assert "CIPHER" in out
+    assert "&lt;encrypt&gt;" in out
+
+
+def test_encrypt_multiple_in_page() -> None:
+    html = (
+        "<p>a &lt;decrypt&gt;c1&lt;/decrypt&gt; b</p>"
+        "<p>c &lt;decrypt&gt;c2&lt;/decrypt&gt; d</p>"
+    )
+    out = _convert(html)
+    assert out.count('ac:name="expand"') == 2
+    assert "c1" in out and "c2" in out
+
+
+def test_encrypt_no_match_left_alone() -> None:
+    html = "<p>plain text without decrypt</p>"
+    out = _convert(html)
+    assert 'ac:name="expand"' not in out
+
+
+def test_encrypt_preserves_surrounding_text() -> None:
+    html = "<p>before &lt;decrypt&gt;CIPHER&lt;/decrypt&gt; after</p>"
+    out = _convert(html)
+    assert "before" in out
+    assert "after" in out
+    assert "CIPHER" in out
