@@ -304,13 +304,37 @@ SENTENCE_DIVERGED / ARTIFACT_LOSS / CODE_DIVERGED / HEADING_DIVERGED.
 가능 (`--with-vision` 은 잔여 모호 케이스에만 사용). 18 케이스 테스트
 추가 (sentence/artifact/code/heading/link 5개 헬퍼).
 
-### Phase 4 (제안서 — 미적용) — 시각 비교 자동화 추가 후보
+### Phase 4 (적용 완료) — 시각 비교 추가 자동 신호 7개
 
-타일 분할 PHash / chrome 마스킹 후 픽셀 diff / per-요소 캡쳐 비교 / bbox
-tree LCS / storage AST diff / 구조화된 vision 프롬프트 등 8 가지 후보.
-권장 우선순위 1-3순위 (제안 1/2/5) + 임계값/통합 지점/테스트 계획 모두
-[`visual-comparison-proposal.md`](visual-comparison-proposal.md) 에 정리.
-채택 결정 후 본 문서의 Phase 4 로 흡수 예정.
+`verify build` 에 추가 옵션 플래그 — 비전 호출 전 더 많은 결정론적
+신호 (검수 카드 `.metrics-vc` 세 번째 줄에 표시):
+
+| 플래그 | 신호 | 의존성 | 표시 |
+|--------|------|--------|------|
+| `--with-pixel-diff` | 본문 (chrome 마스킹) 픽셀 단위 diff + overlay PNG | Pillow | `pixel N.N%` |
+| `--with-tile-phash` | 4×8 격자 phash 거리 + bad-tile overlay PNG | imagehash + Pillow | `타일 K/N` |
+| `--with-element-compare` | bbox (tag+text) 시퀀스 LCS 짝짓기 | (Playwright bbox 추출) | `요소 LCS r` |
+| `--with-ocr` | OCR 백업 텍스트 비교 (sentence_align 재사용) | pytesseract + tesseract | `OCR r` |
+| `--with-bbox-lcs` | 블록 LCS + 상대 너비 차이 | (bbox) | `레이아웃 r` |
+| `--with-storage-ast` | DokuWiki HTML / Confluence storage canonical 트리 LCS | bs4 | `AST r` |
+| `--with-color-hist` | 색상 histogram cosine similarity | Pillow | `색상 sim` |
+| `--with-all-extra-signals` | 위 7가지 모두 활성 | 모든 의존성 | 전부 |
+
+자동으로:
+- main-content 영역만 capture (chrome 제외) — `_DWK_MAIN_SELECTORS` /
+  `_CNF_MAIN_SELECTORS` 후보 selector 들 중 첫 매칭
+- bbox 메타 (`page.evaluate`) 추출 — `--with-element-compare` 또는
+  `--with-bbox-lcs` 시
+- pixel diff / tile-phash 의 overlay PNG 는 verify-screenshots/ 에 저장 → 검수
+  카드 `<details>` 안에 표시
+
+구현: `run.py` 의 `_vc_*` 헬퍼 9개 (`_vc_pixel_diff` / `_vc_tile_phash` /
+`_vc_element_compare` / `_vc_ocr_compare` / `_vc_bbox_lcs_compare` /
+`_vc_canonical_tree` + `_vc_canonical_tree_diff` / `_vc_color_hist` /
+`_vc_compute_all` dispatcher). 21 unit test 추가 (tests/test_visual_signals.py)
+— Pillow / imagehash / pytesseract 의존 케이스는 importorskip.
+
+설계 근거 / 임계값 / 권장 우선순위는 [`visual-comparison-proposal.md`](visual-comparison-proposal.md).
 
 ### Phase 5 (선택, 미적용) — 검수자 협업
 

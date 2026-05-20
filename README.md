@@ -434,6 +434,17 @@ python run.py verify build --sample 50 \
 export ANTHROPIC_API_KEY=...
 python run.py verify build --sample 50 --with-screenshots --with-vision
 
+# Phase 4 시각 비교 추가 신호 7가지 (모두 활성)
+python run.py verify build --sample 50 --with-screenshots --with-all-extra-signals
+# 개별로:
+#   --with-pixel-diff      chrome 마스킹 후 본문 픽셀 diff + overlay PNG (Pillow)
+#   --with-tile-phash      4×8 타일 분할 PHash + bad-tile overlay (imagehash + Pillow)
+#   --with-element-compare bbox 시퀀스 LCS 짝짓기
+#   --with-bbox-lcs        bbox tree LCS + 상대 너비 차이
+#   --with-storage-ast     DokuWiki HTML / Confluence storage canonical 트리 LCS
+#   --with-color-hist      색상 histogram cosine similarity
+#   --with-ocr             OCR 백업 텍스트 비교 (pytesseract + tesseract)
+
 # 브라우저에서 OK/NG/DEFER 분류 → 'JSON 다운로드'
 python run.py verify import ~/Downloads/decisions.json
 
@@ -661,8 +672,8 @@ WAL 모드라 동시 read 는 OK 지만 long-running write 가 있으면 lock.
     ├── migration-result.md — Day 1-4 운영 로그
     ├── element-mapping.md  — DokuWiki → Confluence 요소 매트릭스
     ├── plugin-validation.md — 플러그인 동작 검증
-    ├── visual-audit.md     — 시각 검수 자동화 (Phase 1+2+3)
-    ├── visual-comparison-proposal.md — 시각 비교 추가 자동화 8 후보 (Phase 4 제안서)
+    ├── visual-audit.md     — 시각 검수 자동화 (Phase 1+2+3+4 구현 완료)
+    ├── visual-comparison-proposal.md — 시각 비교 추가 자동화 8 후보 (1-7 채택, 8 보류)
     ├── struct-migration.md — struct → Confluence Database
     ├── history-migration.md — 과거 리비전 이전
     ├── oversized-attachments.md — 100MB+ 첨부 폴백
@@ -680,7 +691,7 @@ WAL 모드라 동시 read 는 OK 지만 long-running write 가 있으면 lock.
 | **struct → Confluence 페이지/Database** | ✅ native 모드 라이브 (4 schema, 1,213 row + 4 Database 쉘 + 208 bound 임베드) | `docs/struct-migration.md` |
 | **과거 리비전 (~37k)** | ✅ 50% 라이브 (영구 제약 도달) | `docs/history-migration.md` |
 | **공간 비-마이그레이션 정리** | ✅ 1,465 휴지통 | `docs/migration-result.md §2.5` |
-| **시각 검수 자동화** | ✅ Phase 1+2+3 (DOM 큐 + iframe + 첨부 점검 + Playwright + AI vision + 5개 자동 신호) | `docs/visual-audit.md` |
+| **시각 검수 자동화** | ✅ Phase 1+2+3+4 (DOM 큐 + iframe + 첨부 점검 + Playwright + AI vision + 5 자동 신호 + 7 시각 비교 신호: pixel-diff/tile-phash/element-compare/OCR/bbox-LCS/storage-AST/color-hist) | `docs/visual-audit.md` |
 | **wizard + report-publish** | ✅ 14 단계 step-by-step + 결과 보고서 자동 발행 | `docs/runbook.md §0` |
 | **data-only bootstrap** | ✅ DokuWiki core + 플러그인 자동 설치 | `docs/runbook.md §0-A` |
 

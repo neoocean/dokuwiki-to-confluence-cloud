@@ -1,14 +1,19 @@
 # 시각 비교 자동화 제안 (visual-comparison-proposal)
 
 DokuWiki 렌더 페이지 ↔ Confluence 이전 페이지의 *시각적 동등성* 검증을
-한 단계 더 자동화하기 위한 제안 모음. 본 도구는 이미 [visual-audit
-Phase 1-3](visual-audit.md) 가 구축되어 있어 — 그 위에 *남은 갭* 을
-메우는 방향으로 정리.
+한 단계 더 자동화하기 위한 제안 모음.
 
-본 문서는 **제안서** 다. 즉시 구현이 아니라 채택 / 후순위 / 폐기 결정의
-근거. 본 인스턴스의 라이브 마이그레이션은 이미 Phase 1-3 + 사람 검수로
-완료되어 있어, 본 제안의 가치는 *다음 인스턴스* 또는 *재마이그레이션*
-에 더 큼.
+> **2026-05-20 업데이트**: §2 의 제안 1-7 모두 **구현 완료** (Phase 4).
+> 검수 카드의 `.metrics-vc` 줄에 신호 표시. CLI 옵션 / 헬퍼 함수 /
+> 21 unit test 모두 포함. 제안 8 (AI vision 구조화) 은 보류. 자세한
+> 적용 매트릭스는 [`visual-audit.md` Phase 4](visual-audit.md).
+
+본 도구는 이미 [visual-audit Phase 1-3](visual-audit.md) 가 구축되어
+있어 — 그 위에 *남은 갭* 을 메우는 방향으로 정리.
+
+본 문서는 *원래는* 제안서였으나 채택 후 구현 완료. 본 인스턴스의 라이브
+마이그레이션은 이미 Phase 1-3 + 사람 검수로 완료되어 있어, 본 제안의
+가치는 *다음 인스턴스* 또는 *재마이그레이션* 에 더 큼.
 
 ---
 
@@ -256,22 +261,39 @@ vision_structured.images_intact == NG  → 이미지
 
 | # | 항목 | 결정 |
 |---|------|------|
-| 1 | 제안 1/2/5 를 본 인스턴스 *재마이그레이션* 에 적용할 가치? | **유보** — 현 인스턴스는 이미 마이그레이션 완료 + 사람 검수 끝. 다음 인스턴스나 큰 변환기 fix 시 검토. |
-| 2 | 제안 8 (vision 구조화) 단독 도입? | **선택** — anthropic 키만 있으면 의존성 변동 없음. 작은 PR 로 즉시 적용 가능. |
-| 3 | 제안 6 (storage AST diff) 가치? | **유보** — canonical form 정의가 복잡. 변환기 변경 시 동작 검증에는 유용하지만 verify 큐 의 보조 신호로는 ROI 낮음. |
-| 4 | 임계값을 어디서 튜닝? | 본 인스턴스의 verify_decisions (현재 모두 비어있음 — 사람이 처음 검수할 때 임계값 정해야) |
+| 1 | 제안 1/2/5 를 본 인스턴스 *재마이그레이션* 에 적용할 가치? | **채택 + 구현** (2026-05-20). 제안 1-7 모두 구현. CLI 플래그 + 카드 표시 + 21 unit test. 본 인스턴스 재마이그레이션 시 즉시 활용 가능. |
+| 2 | 제안 8 (vision 구조화) 단독 도입? | **보류** — 현재 Phase 2 vision 으로 충분. 필요 시 추가. |
+| 3 | 제안 6 (storage AST diff) 가치? | **채택 + 구현**. wrap_info/macro:info 매핑까지 canonical 정규화 — 변환기 변경 후 검증에도 유용. |
+| 4 | 임계값을 어디서 튜닝? | 카드의 ok/warn/bad 색상 임계값 (visual-audit.md Phase 4 표 참고). 본 인스턴스의 verify_decisions 누적되면 ROC 분석으로 재조정. |
 
 ---
 
 ## 8. 다음 단계
 
-본 문서가 *제안서* 인 만큼 즉시 구현은 없음. 채택 결정이 떨어진 항목만
-다음 사이클에서:
+§7 의 채택 결정 이후, **2026-05-20** 에 §2 의 제안 1-7 모두 구현 완료.
+남은 단계:
 
-1. 채택 결정 (위 §7) → 해당 제안의 PR 계획 작성
-2. 합성 fixture 로 unit test 먼저 (구현 전 명세 고정)
-3. 실 corpus (본 인스턴스 1,675 페이지) 에 sample=200 으로 적용 → ROC
-4. 임계값 결정 + 문서 (visual-audit.md Phase 4 로 흡수)
+1. ✅ 합성 fixture 로 unit test (21 케이스, tests/test_visual_signals.py)
+2. ⏳ 실 corpus 적용 → ROC — 본 인스턴스 재마이그레이션 시 또는 다른
+   인스턴스 적용 시
+3. ⏳ 임계값 ROC 분석 후 미세 조정 — verify_decisions 가 누적되어야 가능
+4. ⏳ 제안 8 (vision 구조화) 도입 결정 — 잔여 모호 페이지 비율 측정 후
+
+CLI 사용:
+
+```sh
+# 권장 (7가지 모두 활성)
+python run.py verify build --sample 100 --with-confluence-view \
+    --with-attachment-check --with-screenshots --with-all-extra-signals
+
+# 의존성 절약 (이미지 기반 제외)
+python run.py verify build --sample 100 --with-confluence-view \
+    --with-storage-ast --with-element-compare --with-bbox-lcs
+
+# OCR 만 추가 (글자 이미지 많은 인스턴스)
+pip install pytesseract && brew install tesseract
+python run.py verify build --sample 100 --with-screenshots --with-ocr
+```
 
 ---
 

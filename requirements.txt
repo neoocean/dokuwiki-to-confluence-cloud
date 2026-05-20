@@ -2,3 +2,15 @@ requests>=2.32
 requests-toolbelt>=1.0
 beautifulsoup4>=4.12
 lxml>=5.2
+
+# 옵션: verify build 의 시각 검수 (Phase 2 + Phase 4 일부) 사용 시
+# Pillow>=10.0
+# imagehash>=4.3
+# playwright>=1.40
+
+# 옵션: AI vision 비교 (--with-vision)
+# anthropic>=0.40
+
+# 옵션: OCR (--with-ocr)
+# pytesseract>=0.3.10
+# 별도 시스템 패키지 필요: macOS `brew install tesseract`, Linux `apt install tesseract-ocr`

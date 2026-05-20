@@ -6002,6 +6002,17 @@ def _verify_check_attachments(
     return (ok, len(rows))
 
 
+# DokuWiki / Confluence Cloud 의 본문 영역 selector 후보 (순차 시도).
+_DWK_MAIN_SELECTORS = ("#dokuwiki__content", ".dokuwiki .page", "#content", "main")
+_CNF_MAIN_SELECTORS = (
+    '[data-test-id="content-body"]',
+    "#main-content",
+    "#content",
+    '[role="main"]',
+    ".wiki-content",
+)
+
+
 def _verify_capture_screenshots(
     queue: list[dict],
     out_dir: Path,
@@ -6009,12 +6020,20 @@ def _verify_capture_screenshots(
     confluence_base: str,
     confluence_email: str,
     confluence_token: str,
+    *,
+    capture_main_only: bool = False,
+    extract_bbox: bool = False,
 ) -> dict[str, dict]:
     """Playwright + ImageHash 가 설치돼 있을 때만 동작. 양측 페이지를
     헤드리스 Chromium 으로 풀 렌더 → PNG → phash. 결과는 doku_id → dict.
 
     의존성이 없으면 빈 dict 반환 + 안내 로그. 외부 네트워크/큰 의존성
     이므로 디폴트 off.
+
+    capture_main_only=True: chrome 제외한 본문 영역만 별도 PNG (`.dwk.main.png`
+    / `.cnf.main.png`) 추가 캡쳐.
+    extract_bbox=True: 블록 (h1-h6/p/table/img/pre/ul/ol) 의 bbox + text 를
+    `bboxes_dwk` / `bboxes_cnf` 키로 결과에 추가.
     """
     try:
         from playwright.sync_api import sync_playwright  # type: ignore
@@ -6041,6 +6060,37 @@ def _verify_capture_screenshots(
         ).decode()
         confluence_auth_header = f"Basic {token}"
 
+    bbox_js = """
+        () => Array.from(document.querySelectorAll(
+            'h1,h2,h3,h4,h5,h6,p,table,img,pre,ul,ol'
+        )).filter(e => {
+            const r = e.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+        }).map(e => {
+            const r = e.getBoundingClientRect();
+            return {
+                tag: e.tagName.toLowerCase(),
+                x: r.left + window.scrollX,
+                y: r.top + window.scrollY,
+                w: r.width,
+                h: r.height,
+                text: (e.innerText || '').slice(0, 60).trim()
+            };
+        })
+    """
+
+    def _try_capture_main(p, selectors, dst_path):
+        """selector 후보 중 첫 매칭 element 만 screenshot. 실패 시 None."""
+        for sel in selectors:
+            try:
+                loc = p.locator(sel).first
+                if loc.count() > 0:
+                    loc.screenshot(path=str(dst_path))
+                    return sel
+            except Exception:
+                continue
+        return None
+
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
         ctx = browser.new_context(
@@ -6054,8 +6104,13 @@ def _verify_capture_screenshots(
         for i, q in enumerate(queue, 1):
             doku_id = q["doku_id"]
             page_id = q["confluence_page_id"]
-            d_path = out_dir / f"{doku_id.replace(':','_')}.dwk.png"
-            c_path = out_dir / f"{doku_id.replace(':','_')}.cnf.png"
+            stem = doku_id.replace(':', '_')
+            d_path = out_dir / f"{stem}.dwk.png"
+            c_path = out_dir / f"{stem}.cnf.png"
+            d_main_path = out_dir / f"{stem}.dwk.main.png"
+            c_main_path = out_dir / f"{stem}.cnf.main.png"
+            d_bboxes: list[dict] = []
+            c_bboxes: list[dict] = []
             try:
                 if dokuwiki_base:
                     page.goto(
@@ -6063,6 +6118,13 @@ def _verify_capture_screenshots(
                         timeout=15000, wait_until="networkidle",
                     )
                     page.screenshot(path=str(d_path), full_page=True)
+                    if capture_main_only:
+                        _try_capture_main(page, _DWK_MAIN_SELECTORS, d_main_path)
+                    if extract_bbox:
+                        try:
+                            d_bboxes = page.evaluate(bbox_js) or []
+                        except Exception:
+                            d_bboxes = []
             except Exception as e:
                 log(f"  [dwk fail] {doku_id}: {e}")
             try:
@@ -6072,6 +6134,13 @@ def _verify_capture_screenshots(
                         timeout=20000, wait_until="networkidle",
                     )
                     page.screenshot(path=str(c_path), full_page=True)
+                    if capture_main_only:
+                        _try_capture_main(page, _CNF_MAIN_SELECTORS, c_main_path)
+                    if extract_bbox:
+                        try:
+                            c_bboxes = page.evaluate(bbox_js) or []
+                        except Exception:
+                            c_bboxes = []
             except Exception as e:
                 log(f"  [cnf fail] {doku_id}: {e}")
 
@@ -6090,15 +6159,422 @@ def _verify_capture_screenshots(
             results[doku_id] = {
                 "dokuwiki_png": str(d_path) if d_path.is_file() else None,
                 "confluence_png": str(c_path) if c_path.is_file() else None,
+                "dokuwiki_main_png": str(d_main_path) if d_main_path.is_file() else None,
+                "confluence_main_png": str(c_main_path) if c_main_path.is_file() else None,
                 "phash_dokuwiki": str(ph_d) if ph_d else None,
                 "phash_confluence": str(ph_c) if ph_c else None,
                 "similarity": similarity,
+                "bboxes_dwk": d_bboxes,
+                "bboxes_cnf": c_bboxes,
             }
             if i % 10 == 0:
                 log(f"  screenshot {i}/{len(queue)}")
         browser.close()
 
     return results
+
+
+# ─── visual-comparison Phase 4 후보 (docs/visual-comparison-proposal.md) ───
+
+def _vc_pil_open(path):
+    try:
+        from PIL import Image  # type: ignore
+    except ImportError:
+        return None
+    try:
+        return Image.open(path).convert("RGB")
+    except Exception:
+        return None
+
+
+def _vc_resize_match(img_a, img_b):
+    """양측을 같은 너비로 normalize (작은 쪽 너비 기준). 비율 유지."""
+    from PIL import Image  # type: ignore
+    w = min(img_a.width, img_b.width)
+    if img_a.width != w:
+        img_a = img_a.resize((w, int(img_a.height * w / img_a.width)), Image.LANCZOS)
+    if img_b.width != w:
+        img_b = img_b.resize((w, int(img_b.height * w / img_b.width)), Image.LANCZOS)
+    # 짧은 쪽 높이로 자름 (양측 모두 같은 크기)
+    h = min(img_a.height, img_b.height)
+    img_a = img_a.crop((0, 0, w, h))
+    img_b = img_b.crop((0, 0, w, h))
+    return img_a, img_b
+
+
+def _vc_pixel_diff(
+    img_a_path: str, img_b_path: str, *, threshold: int = 32,
+    out_overlay: str | None = None,
+) -> dict:
+    """제안 1: 양측 PNG 의 픽셀 단위 diff (Pillow ImageChops.difference).
+    threshold 미만 차이는 잡음으로 처리.
+    반환: {"diff_ratio": float, "width": int, "height": int, "overlay": str|None}
+    """
+    try:
+        from PIL import Image, ImageChops  # type: ignore
+    except ImportError:
+        return {"error": "Pillow 미설치"}
+    a = _vc_pil_open(img_a_path)
+    b = _vc_pil_open(img_b_path)
+    if a is None or b is None:
+        return {"error": "이미지 로드 실패"}
+    a, b = _vc_resize_match(a, b)
+    diff = ImageChops.difference(a, b)
+    # 픽셀별 max(R,G,B) > threshold 인 픽셀 수 — RGB bytes 로 빠르게
+    raw = diff.tobytes()  # length = w*h*3
+    n_changed = 0
+    for i in range(0, len(raw), 3):
+        if raw[i] > threshold or raw[i+1] > threshold or raw[i+2] > threshold:
+            n_changed += 1
+    total = a.width * a.height
+    ratio = n_changed / total if total else 0.0
+
+    overlay_path = None
+    if out_overlay:
+        # 빨간색 overlay (변경 픽셀만 표시)
+        mask = diff.convert("L").point(lambda p: 255 if p > threshold else 0)
+        red = Image.new("RGB", a.size, (255, 0, 0))
+        overlay = Image.composite(red, a, mask)
+        overlay.save(out_overlay, "PNG")
+        overlay_path = out_overlay
+
+    return {
+        "diff_ratio": round(ratio, 4),
+        "width": a.width,
+        "height": a.height,
+        "overlay": overlay_path,
+    }
+
+
+def _vc_tile_phash(
+    img_a_path: str, img_b_path: str, *, rows: int = 8, cols: int = 4,
+    bad_threshold: int = 16, out_overlay: str | None = None,
+) -> dict:
+    """제안 2: N×M 격자 분할 후 타일별 phash 거리.
+    반환: {"max_distance", "mean_distance", "n_bad_tiles", "matrix", "overlay"}
+    """
+    try:
+        import imagehash  # type: ignore
+        from PIL import Image, ImageDraw  # type: ignore
+    except ImportError:
+        return {"error": "imagehash/Pillow 미설치"}
+    a = _vc_pil_open(img_a_path)
+    b = _vc_pil_open(img_b_path)
+    if a is None or b is None:
+        return {"error": "이미지 로드 실패"}
+    a, b = _vc_resize_match(a, b)
+    tw = a.width // cols
+    th = a.height // rows
+    if tw == 0 or th == 0:
+        return {"error": "이미지가 격자보다 작음"}
+    matrix: list[list[int]] = []
+    bad_tiles: list[tuple[int, int]] = []
+    max_d = 0
+    total_d = 0
+    n_tiles = 0
+    for r in range(rows):
+        row_d: list[int] = []
+        for c in range(cols):
+            box = (c * tw, r * th, (c + 1) * tw, (r + 1) * th)
+            ta = a.crop(box)
+            tb = b.crop(box)
+            d = imagehash.phash(ta) - imagehash.phash(tb)
+            row_d.append(d)
+            max_d = max(max_d, d)
+            total_d += d
+            n_tiles += 1
+            if d >= bad_threshold:
+                bad_tiles.append((r, c))
+        matrix.append(row_d)
+    mean_d = total_d / max(n_tiles, 1)
+
+    overlay_path = None
+    if out_overlay and bad_tiles:
+        overlay = a.copy()
+        draw = ImageDraw.Draw(overlay, "RGBA")
+        for (r, c) in bad_tiles:
+            box = (c * tw, r * th, (c + 1) * tw, (r + 1) * th)
+            draw.rectangle(box, outline=(255, 0, 0, 255), width=3, fill=(255, 0, 0, 60))
+        overlay.save(out_overlay, "PNG")
+        overlay_path = out_overlay
+
+    return {
+        "max_distance": max_d,
+        "mean_distance": round(mean_d, 2),
+        "n_bad_tiles": len(bad_tiles),
+        "n_tiles": n_tiles,
+        "matrix": matrix,
+        "overlay": overlay_path,
+    }
+
+
+def _vc_element_compare(bboxes_a: list[dict], bboxes_b: list[dict]) -> dict:
+    """제안 3: bboxes_a / bboxes_b 의 (tag, text) 시퀀스 LCS 짝짓기.
+
+    실제 요소 캡쳐는 capture 단계의 부담이 커서 (요소 수 × 페이지 수) — 본
+    함수는 bbox 메타만 비교. 텍스트가 같은 짝은 'matched' 로 카운트.
+    """
+    import difflib
+    a_keys = [f"{b['tag']}:{b.get('text','').strip()[:40]}" for b in bboxes_a]
+    b_keys = [f"{b['tag']}:{b.get('text','').strip()[:40]}" for b in bboxes_b]
+    if not a_keys and not b_keys:
+        return {"d_n": 0, "c_n": 0, "matched": 0, "missing": 0, "added": 0, "ratio": 1.0}
+    sm = difflib.SequenceMatcher(a=a_keys, b=b_keys, autojunk=False)
+    matched = 0
+    missing = added = 0
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            matched += i2 - i1
+        elif tag in ("delete", "replace"):
+            missing += i2 - i1
+        if tag in ("insert", "replace"):
+            added += j2 - j1
+    return {
+        "d_n": len(a_keys),
+        "c_n": len(b_keys),
+        "matched": matched,
+        "missing": missing,
+        "added": added,
+        "ratio": round(sm.ratio(), 3),
+    }
+
+
+def _vc_ocr_text(img_path: str) -> str:
+    """제안 4: pytesseract 로 텍스트 추출. 실패 시 빈 문자열."""
+    try:
+        import pytesseract  # type: ignore
+        from PIL import Image  # type: ignore
+    except ImportError:
+        return ""
+    try:
+        return pytesseract.image_to_string(Image.open(img_path), lang="kor+eng")
+    except Exception:
+        return ""
+
+
+def _vc_ocr_compare(d_img_path: str, c_img_path: str) -> dict:
+    """양측 이미지에서 OCR 추출한 텍스트를 sentence_align 으로 비교."""
+    d_text = _vc_ocr_text(d_img_path)
+    c_text = _vc_ocr_text(c_img_path)
+    if not d_text and not c_text:
+        return {"error": "OCR 실패 또는 pytesseract 미설치"}
+    align = _sentence_align(d_text, c_text)
+    align["d_chars"] = len(d_text)
+    align["c_chars"] = len(c_text)
+    return align
+
+
+def _vc_bbox_lcs_compare(bboxes_a: list[dict], bboxes_b: list[dict]) -> dict:
+    """제안 5: 양측 블록 시퀀스 LCS + 짝지어진 블록의 상대 너비/높이 비율 비교.
+
+    페이지 너비로 normalize 한 후 (양측 페이지 너비가 다를 수 있으니),
+    너비 비율의 평균 절대 차이를 계산.
+    """
+    import difflib
+    if not bboxes_a or not bboxes_b:
+        return {"d_n": len(bboxes_a), "c_n": len(bboxes_b), "lcs_ratio": 0.0,
+                "matched": 0, "mean_width_diff": 0.0}
+    # 페이지 너비 = bbox max(x+w)
+    w_a = max((b["x"] + b["w"]) for b in bboxes_a) or 1
+    w_b = max((b["x"] + b["w"]) for b in bboxes_b) or 1
+    a_keys = [f"{b['tag']}:{b.get('text','').strip()[:40]}" for b in bboxes_a]
+    b_keys = [f"{b['tag']}:{b.get('text','').strip()[:40]}" for b in bboxes_b]
+    sm = difflib.SequenceMatcher(a=a_keys, b=b_keys, autojunk=False)
+    width_diffs: list[float] = []
+    matched = 0
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag != "equal":
+            continue
+        for k in range(i2 - i1):
+            ba = bboxes_a[i1 + k]
+            bb = bboxes_b[j1 + k]
+            rel_a = ba["w"] / w_a
+            rel_b = bb["w"] / w_b
+            width_diffs.append(abs(rel_a - rel_b))
+            matched += 1
+    mean_width_diff = (sum(width_diffs) / len(width_diffs)) if width_diffs else 0.0
+    return {
+        "d_n": len(bboxes_a),
+        "c_n": len(bboxes_b),
+        "lcs_ratio": round(sm.ratio(), 3),
+        "matched": matched,
+        "mean_width_diff": round(mean_width_diff, 3),
+    }
+
+
+def _vc_canonical_tree(html_or_xml: str, *, is_storage: bool) -> list:
+    """제안 6: bs4 → canonical 노드 리스트 [(depth, tag, text_snippet)].
+
+    구조 비교용 — attribute 제거, dokuwiki chrome / Confluence chrome 제거,
+    매크로는 ac:* / wrap 클래스를 일반화 (note/info/tip/warning 등 매핑).
+    """
+    from bs4 import BeautifulSoup, Comment
+    soup = BeautifulSoup(html_or_xml, "html.parser")
+    # 노이즈 제거
+    for tag in ("script", "style", "link", "meta", "noscript", "iframe",
+                "form", "input", "head", "button", "select"):
+        for t in soup.find_all(tag):
+            t.decompose()
+    for c in soup.find_all(string=lambda x: isinstance(x, Comment)):
+        c.extract()
+    if not is_storage:
+        for sid in ("dokuwiki__site", "dokuwiki__top", "dokuwiki__header",
+                    "dokuwiki__footer", "dokuwiki__pagetools",
+                    "dokuwiki__usertools", "dokuwiki__sitetools"):
+            for t in soup.find_all(id=sid):
+                t.decompose()
+        for a in soup.find_all("a", class_="secedit"):
+            a.decompose()
+        for div in soup.find_all("div", class_="toc"):
+            div.decompose()
+
+    # tag 정규화 — dokuwiki wrap_info → info, ac:structured-macro[name=info] → info
+    def norm_tag(el) -> str:
+        name = (el.name or "").lower()
+        if name in ("ac:structured-macro",):
+            macro = el.get("ac:name") or el.get("ac:name", "")
+            if macro:
+                return f"macro:{macro}"
+            return "macro:?"
+        if name == "div":
+            classes = el.get("class") or []
+            if any(c in ("wrap_info", "wrap_help") for c in classes):
+                return "macro:info"
+            if any(c == "wrap_tip" for c in classes):
+                return "macro:tip"
+            if any(c in ("wrap_important", "wrap_note") for c in classes):
+                return "macro:note"
+            if any(c in ("wrap_alert", "wrap_warning", "wrap_danger") for c in classes):
+                return "macro:warning"
+            if any(c in ("wrap_box", "wrap_round") for c in classes):
+                return "macro:panel"
+            return "div"
+        # ri:page / ri:attachment / ri:database 무시 — 부모 ac:link 가 대표
+        return name
+
+    keep = {"h1", "h2", "h3", "h4", "h5", "h6", "p", "table", "tr", "td", "th",
+            "ul", "ol", "li", "img", "pre", "code", "blockquote", "a",
+            "div", "macro:info", "macro:tip", "macro:note", "macro:warning",
+            "macro:panel", "macro:code", "macro:details", "macro:detailssummary",
+            "ac:image", "ac:link", "ac:task-list", "ac:task"}
+
+    out: list[tuple[int, str, str]] = []
+
+    def walk(el, depth: int) -> None:
+        t = norm_tag(el)
+        if t in keep:
+            txt = ""
+            try:
+                txt = el.get_text(" ", strip=True)[:60]
+            except Exception:
+                pass
+            out.append((depth, t, txt))
+            depth += 1
+        for child in el.children:
+            if getattr(child, "name", None):
+                walk(child, depth)
+
+    # body 또는 root
+    root = soup.body if soup.body else soup
+    for c in root.children:
+        if getattr(c, "name", None):
+            walk(c, 0)
+    return out
+
+
+def _vc_canonical_tree_diff(tree_a: list, tree_b: list) -> dict:
+    """제안 6: canonical tree → 시퀀스 LCS distance.
+
+    노드를 (depth, tag) 키로 줄세워 difflib SequenceMatcher 적용. 본격적인
+    tree edit distance 가 아니라 시퀀스 거리지만 *대표 신호* 로 충분.
+    """
+    import difflib
+    a_keys = [f"{d}:{t}" for d, t, _ in tree_a]
+    b_keys = [f"{d}:{t}" for d, t, _ in tree_b]
+    if not a_keys and not b_keys:
+        return {"d_n": 0, "c_n": 0, "ratio": 1.0, "missing": 0, "added": 0}
+    sm = difflib.SequenceMatcher(a=a_keys, b=b_keys, autojunk=False)
+    missing = added = 0
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag in ("delete", "replace"):
+            missing += i2 - i1
+        if tag in ("insert", "replace"):
+            added += j2 - j1
+    return {
+        "d_n": len(a_keys),
+        "c_n": len(b_keys),
+        "ratio": round(sm.ratio(), 3),
+        "missing": missing,
+        "added": added,
+    }
+
+
+def _vc_color_hist(img_a_path: str, img_b_path: str) -> dict:
+    """제안 7: 색상 histogram cosine similarity. RGB 각 256-bin.
+
+    반환: {"cosine": float (0-1), "rms_diff": float}
+    """
+    try:
+        from PIL import Image  # type: ignore
+    except ImportError:
+        return {"error": "Pillow 미설치"}
+    a = _vc_pil_open(img_a_path)
+    b = _vc_pil_open(img_b_path)
+    if a is None or b is None:
+        return {"error": "이미지 로드 실패"}
+    ha = a.histogram()  # 768 = 256*3
+    hb = b.histogram()
+    if len(ha) != len(hb):
+        # 다른 모드 (RGBA 등) — RGB 만 사용
+        ha = ha[:768]
+        hb = hb[:768]
+    import math
+    na = math.sqrt(sum(v * v for v in ha))
+    nb = math.sqrt(sum(v * v for v in hb))
+    if na == 0 or nb == 0:
+        return {"cosine": 0.0, "rms_diff": 0.0}
+    dot = sum(a * b for a, b in zip(ha, hb))
+    cos = dot / (na * nb)
+    # 정규화한 후 RMS
+    sa = sum(ha) or 1
+    sb = sum(hb) or 1
+    rms = math.sqrt(sum(((a / sa) - (b / sb)) ** 2 for a, b in zip(ha, hb)) / len(ha))
+    return {"cosine": round(cos, 4), "rms_diff": round(rms, 5)}
+
+
+def _vc_compute_all(
+    d_full_png: str | None, c_full_png: str | None,
+    d_main_png: str | None, c_main_png: str | None,
+    bboxes_dwk: list, bboxes_cnf: list,
+    raw_html: str, storage_xml: str,
+    *,
+    overlay_dir: Path | None = None, stem: str = "",
+    enabled: dict[str, bool] | None = None,
+) -> dict:
+    """7개 신호 중 enabled 인 것만 한 번에 계산. 결과 dict 반환."""
+    en = enabled or {}
+    out: dict = {}
+    main_a = d_main_png or d_full_png
+    main_b = c_main_png or c_full_png
+    if en.get("pixel_diff") and main_a and main_b:
+        overlay = str(overlay_dir / f"{stem}.pxdiff.png") if overlay_dir else None
+        out["pixel_diff"] = _vc_pixel_diff(main_a, main_b, out_overlay=overlay)
+    if en.get("tile_phash") and main_a and main_b:
+        overlay = str(overlay_dir / f"{stem}.tile.png") if overlay_dir else None
+        out["tile_phash"] = _vc_tile_phash(main_a, main_b, out_overlay=overlay)
+    if en.get("element_compare"):
+        out["element_compare"] = _vc_element_compare(bboxes_dwk, bboxes_cnf)
+    if en.get("ocr") and main_a and main_b:
+        out["ocr"] = _vc_ocr_compare(main_a, main_b)
+    if en.get("bbox_lcs"):
+        out["bbox_lcs"] = _vc_bbox_lcs_compare(bboxes_dwk, bboxes_cnf)
+    if en.get("storage_ast") and raw_html and storage_xml:
+        d_tree = _vc_canonical_tree(raw_html, is_storage=False)
+        c_tree = _vc_canonical_tree(storage_xml, is_storage=True)
+        out["storage_ast"] = _vc_canonical_tree_diff(d_tree, c_tree)
+    if en.get("color_hist") and main_a and main_b:
+        out["color_hist"] = _vc_color_hist(main_a, main_b)
+    return out
 
 
 def _verify_ai_compare(
@@ -6322,11 +6798,79 @@ def _verify_render_metrics_row(metrics: dict) -> str:
             f'<span class="metric metric-bad" title="자동 추정 NG 사유">자동 NG: {_h.escape(auto_ng)}</span>'
         )
 
+    # Phase 4 추가 시각 비교 신호
+    vc = metrics.get("vc") or {}
+    vc_cells = []
+    pd = vc.get("pixel_diff") or {}
+    if "diff_ratio" in pd:
+        ratio = pd["diff_ratio"]
+        cls = "metric-ok" if ratio < 0.05 else ("metric-warn" if ratio < 0.15 else "metric-bad")
+        vc_cells.append(
+            f'<span class="metric {cls}" title="픽셀 diff (chrome 마스킹 후)">'
+            f'pixel {ratio*100:.1f}%</span>'
+        )
+    tp = vc.get("tile_phash") or {}
+    if "max_distance" in tp:
+        cls = "metric-ok" if tp.get("n_bad_tiles", 0) == 0 else (
+            "metric-warn" if tp.get("n_bad_tiles", 0) <= 2 else "metric-bad"
+        )
+        n = tp.get("n_bad_tiles", 0)
+        nt = tp.get("n_tiles", 0)
+        title = f"max={tp['max_distance']} mean={tp['mean_distance']} bad={n}/{nt}"
+        vc_cells.append(
+            f'<span class="metric {cls}" title="{title}">타일 {n}/{nt}</span>'
+        )
+    ec = vc.get("element_compare") or {}
+    if ec.get("d_n", 0) > 0 or ec.get("c_n", 0) > 0:
+        r = ec.get("ratio", 0)
+        cls = "metric-ok" if r >= 0.85 else ("metric-warn" if r >= 0.7 else "metric-bad")
+        ec_title = f"elements d={ec.get('d_n', 0)} c={ec.get('c_n', 0)} matched={ec.get('matched', 0)}"
+        vc_cells.append(
+            f'<span class="metric {cls}" title="{ec_title}">요소 LCS {r:.2f}</span>'
+        )
+    oc = vc.get("ocr") or {}
+    if oc.get("sentence_ratio") is not None:
+        r = oc["sentence_ratio"]
+        cls = "metric-ok" if r >= 0.85 else ("metric-warn" if r >= 0.6 else "metric-bad")
+        vc_cells.append(
+            f'<span class="metric {cls}" title="OCR 문장 정렬 (이미지 텍스트 비교)">'
+            f'OCR {r:.2f}</span>'
+        )
+    bl = vc.get("bbox_lcs") or {}
+    if bl.get("d_n", 0) > 0 or bl.get("c_n", 0) > 0:
+        r = bl.get("lcs_ratio", 0)
+        wd = bl.get("mean_width_diff", 0)
+        cls = "metric-ok" if r >= 0.85 and wd < 0.15 else (
+            "metric-warn" if r >= 0.7 else "metric-bad"
+        )
+        title = f"bbox LCS d={bl['d_n']} c={bl['c_n']} matched={bl.get('matched',0)} mean_w_diff={wd}"
+        vc_cells.append(
+            f'<span class="metric {cls}" title="{title}">레이아웃 {r:.2f}</span>'
+        )
+    sa = vc.get("storage_ast") or {}
+    if sa.get("d_n", 0) > 0 or sa.get("c_n", 0) > 0:
+        r = sa.get("ratio", 0)
+        cls = "metric-ok" if r >= 0.85 else ("metric-warn" if r >= 0.7 else "metric-bad")
+        title = f"storage AST d={sa['d_n']} c={sa['c_n']} missing={sa['missing']} added={sa['added']}"
+        vc_cells.append(
+            f'<span class="metric {cls}" title="{title}">AST {r:.2f}</span>'
+        )
+    ch = vc.get("color_hist") or {}
+    if "cosine" in ch:
+        cos = ch["cosine"]
+        cls = "metric-ok" if cos >= 0.95 else ("metric-warn" if cos >= 0.85 else "metric-bad")
+        vc_cells.append(
+            f'<span class="metric {cls}" title="색상 histogram cosine sim">'
+            f'색상 {cos:.3f}</span>'
+        )
+
     parts_html = []
     if cells:
         parts_html.append('<div class="metrics">' + "".join(cells) + "</div>")
     if auto_cells:
         parts_html.append('<div class="metrics metrics-auto">' + "".join(auto_cells) + "</div>")
+    if vc_cells:
+        parts_html.append('<div class="metrics metrics-vc">' + "".join(vc_cells) + "</div>")
     return "".join(parts_html)
 
 
@@ -6721,11 +7265,25 @@ def cmd_verify_build(args: argparse.Namespace) -> int:
             if i % 20 == 0:
                 log(f"  attachment check {i}/{len(queue)}")
 
+    # Phase 4 옵션 결합
+    extra_all = getattr(args, "with_all_extra_signals", False)
+    vc_enabled = {
+        "pixel_diff":      extra_all or getattr(args, "with_pixel_diff", False),
+        "tile_phash":      extra_all or getattr(args, "with_tile_phash", False),
+        "element_compare": extra_all or getattr(args, "with_element_compare", False),
+        "ocr":             extra_all or getattr(args, "with_ocr", False),
+        "bbox_lcs":        extra_all or getattr(args, "with_bbox_lcs", False),
+        "storage_ast":     extra_all or getattr(args, "with_storage_ast", False),
+        "color_hist":      extra_all or getattr(args, "with_color_hist", False),
+    }
+    needs_main_capture = any(vc_enabled[k] for k in ("pixel_diff", "tile_phash", "ocr", "color_hist"))
+    needs_bbox = any(vc_enabled[k] for k in ("element_compare", "bbox_lcs"))
+
     # Playwright 스크린샷 + phash (옵션)
     screenshot_map: dict[str, dict] = {}
-    if args.with_screenshots:
-        out_dir = Path(args.output).parent if args.output else Path(".")
-        shots_dir = out_dir / "verify-screenshots"
+    out_dir_for_shots = Path(args.output).parent if args.output else Path(".")
+    shots_dir = out_dir_for_shots / "verify-screenshots"
+    if args.with_screenshots or needs_main_capture or needs_bbox:
         log(f"Playwright 스크린샷 시작 → {shots_dir} ({len(queue)} 페이지)")
         screenshot_map = _verify_capture_screenshots(
             queue, shots_dir,
@@ -6733,7 +7291,50 @@ def cmd_verify_build(args: argparse.Namespace) -> int:
             confluence_base=args.base_url,
             confluence_email=args.email or "",
             confluence_token=args.api_token or "",
+            capture_main_only=needs_main_capture,
+            extract_bbox=needs_bbox,
         )
+
+    # Phase 4 신호 계산 (페이지별)
+    vc_map: dict[str, dict] = {}
+    if any(vc_enabled.values()):
+        log(f"Phase 4 시각 비교 신호 계산: {[k for k,v in vc_enabled.items() if v]}")
+        for i, q in enumerate(queue, 1):
+            doku_id = q["doku_id"]
+            sh = screenshot_map.get(doku_id, {})
+            stem = doku_id.replace(":", "_")
+            # raw_html / storage_xml 로드 (storage_ast 용)
+            raw_html = ""
+            storage_xml = ""
+            row = conn.execute(
+                "SELECT raw_xhtml_path, storage_path FROM pages WHERE doku_id=?",
+                (doku_id,),
+            ).fetchone()
+            if row:
+                rp, sp = row
+                if rp and Path(rp).is_file():
+                    try:
+                        raw_html = Path(rp).read_text(encoding="utf-8", errors="ignore")
+                    except OSError:
+                        pass
+                if sp and Path(sp).is_file():
+                    try:
+                        storage_xml = Path(sp).read_text(encoding="utf-8", errors="ignore")
+                    except OSError:
+                        pass
+            vc_map[doku_id] = _vc_compute_all(
+                d_full_png=sh.get("dokuwiki_png"),
+                c_full_png=sh.get("confluence_png"),
+                d_main_png=sh.get("dokuwiki_main_png"),
+                c_main_png=sh.get("confluence_main_png"),
+                bboxes_dwk=sh.get("bboxes_dwk") or [],
+                bboxes_cnf=sh.get("bboxes_cnf") or [],
+                raw_html=raw_html, storage_xml=storage_xml,
+                overlay_dir=shots_dir, stem=stem,
+                enabled=vc_enabled,
+            )
+            if i % 20 == 0:
+                log(f"  Phase 4 신호 {i}/{len(queue)}")
 
     # AI vision 비교 (옵션, 스크린샷 필수)
     vision_map: dict[str, dict] = {}
@@ -6748,6 +7349,12 @@ def cmd_verify_build(args: argparse.Namespace) -> int:
             )
 
     reviewer = args.reviewer or args.email or "anonymous"
+    # vc_map 을 metrics_map 에 합쳐 카드 렌더링이 접근 가능하게
+    for doku_id, sig in vc_map.items():
+        if doku_id in metrics_map:
+            metrics_map[doku_id]["vc"] = sig
+        else:
+            metrics_map[doku_id] = {"rows": [], "vc": sig}
     html = _verify_render_html(
         queue, confluence_bodies, base_view_url, reviewer,
         metrics_map=metrics_map,
@@ -7812,6 +8419,39 @@ def build_parser() -> argparse.ArgumentParser:
         "--dokuwiki-base-url",
         default=env_default("DOKUWIKI_BASE_URL"),
         help="--with-screenshots 사용 시 dokuwiki HTTP base",
+    )
+    # Phase 4 (visual-comparison-proposal.md) — 시각 비교 추가 신호 7가지
+    sp_verify_build.add_argument(
+        "--with-pixel-diff", action="store_true",
+        help="(Phase 4 #1) chrome 마스킹 후 본문 픽셀 diff — Pillow 필요, with-screenshots 권장",
+    )
+    sp_verify_build.add_argument(
+        "--with-tile-phash", action="store_true",
+        help="(Phase 4 #2) 4×8 타일 분할 PHash → hotspot — imagehash+Pillow",
+    )
+    sp_verify_build.add_argument(
+        "--with-element-compare", action="store_true",
+        help="(Phase 4 #3) 블록 시퀀스 LCS 짝짓기 — bbox 메타 비교",
+    )
+    sp_verify_build.add_argument(
+        "--with-ocr", action="store_true",
+        help="(Phase 4 #4) OCR 백업 텍스트 비교 — pytesseract+tesseract 바이너리 필요",
+    )
+    sp_verify_build.add_argument(
+        "--with-bbox-lcs", action="store_true",
+        help="(Phase 4 #5) bbox tree LCS + 상대 너비 비교 — Playwright bbox 필요",
+    )
+    sp_verify_build.add_argument(
+        "--with-storage-ast", action="store_true",
+        help="(Phase 4 #6) raw HTML / Confluence storage canonical 트리 LCS",
+    )
+    sp_verify_build.add_argument(
+        "--with-color-hist", action="store_true",
+        help="(Phase 4 #7) 색상 histogram cosine similarity — Pillow",
+    )
+    sp_verify_build.add_argument(
+        "--with-all-extra-signals", action="store_true",
+        help="(Phase 4) 위 7가지 시각 비교 추가 신호 모두 활성",
     )
     sp_verify_build.add_argument(
         "--base-url",
