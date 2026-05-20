@@ -648,10 +648,17 @@ WAL 모드라 동시 read 는 OK 지만 long-running write 가 있으면 lock.
 | 사후 처리 | `rewrite-oversized` | 100MB+ 첨부 → note 매크로 |
 |  | `rewrite-oversized-pages` | 본문 거부 페이지 → skeleton + zip |
 | history | `history-discover/render/convert/upload/status` | attic 인덱싱 → ?rev= 캐시 → storage + 헤더 → 시간순 PUT replay |
+|  | `history-convert --header-format {panel\|info\|note\|quote\|table\|paragraphs\|none}` | revision 헤더 형식 (기본 panel + shift+enter) |
+|  | `history-rewrite-headers --header-format X` | 이미 업로드된 페이지의 헤더만 새 형식으로 재PUT |
 | struct | `struct-discover/convert/upload/embed-on-bound-pages/status` | sqlite 인덱싱 → snapshot/properties/native 변환 → 라이브 |
 | 시각 검수 | `verify build [--with-screenshots] [--with-vision] [--with-attachment-check]` | DOM 큐 + Phase 2 옵션 + Phase 3 자동 신호 |
+|  | `verify build --with-all-extra-signals` | Phase 4 시각 비교 7개 신호 (pixel-diff / tile-phash / 등) |
 |  | `verify import <decisions.json>` | 결정 반영 |
 |  | `verify status` | 진행 요약 |
+| 링크 점검 | `link-check [--check-external] [--only X] [--limit N] [--verbose]` | Confluence 측 placeholder 잔존 / unresolved page link / 외부 URL HEAD |
+| 보안 | `decrypt -p PASS CIPHER` | encryptedpasswords cipher (AES-256-CBC) 복호화 — pycryptodome 필요 |
+|  | `decrypt -p PASS --page DOKU_ID` | state.db 페이지의 모든 cipher 일괄 복호화 |
+|  | `decrypt -p PASS --confluence-id N` | Confluence 페이지의 모든 cipher 일괄 복호화 |
 | 보고서 | `report-publish` | state.db 통계를 Confluence 페이지로 발행/갱신 |
 
 각 명령의 상세 옵션은 `python run.py <command> --help`.
