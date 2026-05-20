@@ -216,66 +216,76 @@ CREATE TABLE IF NOT EXISTS struct_references (
 """
 
 
+# 메인 파이프라인의 핵심 테이블 — pages / attachments / links / meta.
+# 별도 트랙 DDL (HISTORY_SCHEMA_DDL / STRUCT_SCHEMA_DDL — 위쪽 정의,
+# VERIFY_DECISIONS_DDL / WIZARD_DDL — 각자의 섹션에서 정의) 와 함께
+# db_init 에서 한 번에 적용. 모두 CREATE TABLE IF NOT EXISTS — 멱등.
+MAIN_SCHEMA_DDL = """
+CREATE TABLE IF NOT EXISTS pages (
+    doku_id TEXT PRIMARY KEY,
+    src_path TEXT NOT NULL,
+    namespace TEXT NOT NULL,
+    parent_doku_id TEXT,
+    is_namespace_index INTEGER NOT NULL DEFAULT 0,
+    title TEXT,
+    raw_xhtml_path TEXT,
+    storage_path TEXT,
+    content_hash TEXT,
+    confluence_page_id TEXT,
+    confluence_version INTEGER,
+    doku_last_change TEXT,
+    status TEXT NOT NULL,
+    last_error TEXT,
+    discovered_at TEXT NOT NULL,
+    rendered_at TEXT,
+    converted_at TEXT,
+    uploaded_at TEXT,
+    last_checked_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS pages_status_idx ON pages(status);
+CREATE INDEX IF NOT EXISTS pages_namespace_idx ON pages(namespace);
+
+CREATE TABLE IF NOT EXISTS attachments (
+    page_doku_id TEXT NOT NULL,
+    media_id TEXT NOT NULL,
+    src_path TEXT,
+    size INTEGER,
+    sha256 TEXT,
+    confluence_attachment_id TEXT,
+    confluence_page_id TEXT,
+    status TEXT NOT NULL,
+    last_error TEXT,
+    uploaded_at TEXT,
+    PRIMARY KEY (page_doku_id, media_id)
+);
+
+CREATE INDEX IF NOT EXISTS attachments_status_idx ON attachments(status);
+
+CREATE TABLE IF NOT EXISTS links (
+    src_doku_id TEXT NOT NULL,
+    placeholder TEXT NOT NULL,
+    target_doku_id TEXT NOT NULL,
+    resolved INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (src_doku_id, placeholder)
+);
+
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+"""
+
+
 def db_init(conn: sqlite3.Connection) -> None:
+    """state.db 의 모든 schema 생성 (멱등). 메인 + history + struct.
+
+    verify_decisions / wizard_state 는 각각 _ensure_verify_schema /
+    _wizard_init 가 lazy 적용 — 그 명령을 처음 호출할 때만.
+    """
+    conn.executescript(MAIN_SCHEMA_DDL)
     conn.executescript(HISTORY_SCHEMA_DDL)
     conn.executescript(STRUCT_SCHEMA_DDL)
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS pages (
-            doku_id TEXT PRIMARY KEY,
-            src_path TEXT NOT NULL,
-            namespace TEXT NOT NULL,
-            parent_doku_id TEXT,
-            is_namespace_index INTEGER NOT NULL DEFAULT 0,
-            title TEXT,
-            raw_xhtml_path TEXT,
-            storage_path TEXT,
-            content_hash TEXT,
-            confluence_page_id TEXT,
-            confluence_version INTEGER,
-            doku_last_change TEXT,
-            status TEXT NOT NULL,
-            last_error TEXT,
-            discovered_at TEXT NOT NULL,
-            rendered_at TEXT,
-            converted_at TEXT,
-            uploaded_at TEXT,
-            last_checked_at TEXT
-        );
-
-        CREATE INDEX IF NOT EXISTS pages_status_idx ON pages(status);
-        CREATE INDEX IF NOT EXISTS pages_namespace_idx ON pages(namespace);
-
-        CREATE TABLE IF NOT EXISTS attachments (
-            page_doku_id TEXT NOT NULL,
-            media_id TEXT NOT NULL,
-            src_path TEXT,
-            size INTEGER,
-            sha256 TEXT,
-            confluence_attachment_id TEXT,
-            confluence_page_id TEXT,
-            status TEXT NOT NULL,
-            last_error TEXT,
-            uploaded_at TEXT,
-            PRIMARY KEY (page_doku_id, media_id)
-        );
-
-        CREATE INDEX IF NOT EXISTS attachments_status_idx ON attachments(status);
-
-        CREATE TABLE IF NOT EXISTS links (
-            src_doku_id TEXT NOT NULL,
-            placeholder TEXT NOT NULL,
-            target_doku_id TEXT NOT NULL,
-            resolved INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (src_doku_id, placeholder)
-        );
-
-        CREATE TABLE IF NOT EXISTS meta (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        );
-        """
-    )
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
         (str(SCHEMA_VERSION),),
