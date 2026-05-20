@@ -855,6 +855,45 @@ def _calendar_iframe_macro(src: str, width: str = "750", height: str = "500") ->
     )
 
 
+_YOUTUBE_FALLBACK_RES = [
+    # `{{youtube>VIDEO_ID}}` plugin 미설치 시 DokuWiki 가 보통:
+    # /_media/youtube/VIDEO_ID 형식의 깨진 media 링크로 fallback
+    re.compile(r"^/_media/youtube/([A-Za-z0-9_\-]+)"),
+    re.compile(r"^https?://(?:www\.)?youtube\.com/watch\?v=([A-Za-z0-9_\-]+)"),
+    re.compile(r"^https?://youtu\.be/([A-Za-z0-9_\-]+)"),
+]
+
+
+def _convert_youtube_fallback(soup) -> None:
+    """YouTube embed 후보 (`{{youtube>VID}}` 미설치 fallback, youtube.com/watch
+    링크, youtu.be 링크) 를 Confluence iframe 매크로 (youtube embed) 로 교체.
+
+    fallback 깨진 media 링크 (`/_media/youtube/VID` 형식) — 부모 <p> 째 교체.
+    일반 hyperlink (youtube.com/watch?v=...) — 그대로 두고 가시성 위해 변경
+    안 함 (사용자가 의도적으로 텍스트 링크일 수도).
+    본 함수는 *fallback 매크로 잔재* 만 처리.
+    """
+    from bs4 import BeautifulSoup as _BS
+    import re as _re
+
+    for a in list(soup.find_all("a", href=True)):
+        href = str(a.get("href", ""))
+        m = _YOUTUBE_FALLBACK_RES[0].match(href)
+        if not m:
+            continue
+        # 부모 <p> 안의 단일 <a> 가 깨진 fallback 모양 → 매크로 교체
+        parent = a.parent
+        vid = m.group(1)
+        macro = _calendar_iframe_macro(
+            f"https://www.youtube.com/embed/{vid}",
+            width="640", height="360",
+        )
+        if parent and parent.name == "p" and len(parent.find_all("a")) == 1:
+            parent.replace_with(_BS(macro, "html.parser"))
+        else:
+            a.replace_with(_BS(macro, "html.parser"))
+
+
 def _convert_google_calendar_iframe(soup) -> None:
     """`<iframe src="https://calendar.google.com/...">` 를 Confluence iframe
     매크로로. 두 케이스 처리:
@@ -1152,6 +1191,9 @@ def _convert_html_to_storage(
 
     # 1.41) monthcal 플러그인 미설치 fallback 링크 -> 정적 캘린더 표
     _convert_monthcal_fallback(soup)
+
+    # 1.412) youtube 플러그인 미설치 fallback -> Confluence iframe 매크로 (youtube embed)
+    _convert_youtube_fallback(soup)
 
     # 1.415) Google Calendar iframe -> Confluence iframe 매크로
     _convert_google_calendar_iframe(soup)
@@ -5727,12 +5769,12 @@ PLUGIN_DOWNLOADS: dict[str, str | None] = {
     "include":    "https://github.com/dokufreaks/plugin-include/archive/refs/heads/master.tar.gz",
     "pagelist":   "https://github.com/dokufreaks/plugin-pagelist/archive/refs/heads/master.tar.gz",
     "tag":        "https://github.com/dokufreaks/plugin-tag/archive/refs/heads/master.tar.gz",
-    "tagging":    "https://github.com/cosmocode/dokuwiki-plugin-tagging/archive/refs/heads/main.tar.gz",
+    "tagging":    "https://github.com/cosmocode/tagging/archive/refs/heads/master.tar.gz",
     "sqlite":     "https://github.com/cosmocode/dokuwiki-plugin-sqlite/archive/refs/heads/master.tar.gz",
-    "monthcal":   "https://github.com/c5o/dokuwiki-plugin-monthcal/archive/refs/heads/master.tar.gz",
-    "youtube":    "https://github.com/anonymous-from-the-think-tank/youtube/archive/refs/heads/master.tar.gz",
-    "iframe":     "https://github.com/dokuwiki-iframe/iframe/archive/refs/heads/master.tar.gz",
-    "encrypt":    "https://github.com/splitbrain/dokuwiki-plugin-encrypted/archive/refs/heads/master.tar.gz",
+    "monthcal":   None,   # 변환기가 정적 표로 처리 (_convert_monthcal_fallback)
+    "youtube":    None,   # 변환기가 Confluence iframe macro 로 처리
+    "iframe":     "https://github.com/Chris--S/dokuwiki-plugin-iframe/archive/refs/heads/master.tar.gz",
+    "encrypt":    "https://github.com/pld-linux/dokuwiki-plugin-encryptedpasswords/archive/refs/heads/master.tar.gz",
     "html":       None,   # 보안 위험 — 수동 설치만 권장
     "davcal":     None,   # 패키지 형식 다양 — 수동
     "box":        None,   # 다양한 fork — 수동
