@@ -690,7 +690,7 @@ def _todo_checked_and_text(todo) -> tuple[bool, str]:
     return checked, text
 
 
-def _build_ac_task(soup, task_id: int, checked: bool, text: str):
+def _build_ac_task(soup, task_id: int, checked: bool, text: str) -> "Tag":
     """Confluence <ac:task> 엘리먼트 빌드."""
     task = soup.new_tag("ac:task")
     tid = soup.new_tag("ac:task-id")
@@ -1921,7 +1921,7 @@ def _apply_page_labels(session, base_url: str, page_id: str, labels: list[str]) 
         log(f"    label 적용 실패 (page {page_id}): {resp.status_code if resp else 'no resp'}")
 
 
-def _confluence_session(args: argparse.Namespace):
+def _confluence_session(args: argparse.Namespace) -> "requests.Session | None":
     """인증된 requests.Session 반환. 자격증명/base_url 누락 시 None."""
     import requests
 
@@ -1943,7 +1943,7 @@ def _confluence_session(args: argparse.Namespace):
     return s
 
 
-def _request_with_retry(session, method: str, url: str, **kwargs):
+def _request_with_retry(session, method: str, url: str, **kwargs) -> "requests.Response | None":
     """429/5xx 에 대해 지수 백오프. 6회 시도 후 마지막 응답 반환."""
     import requests
 
@@ -3893,7 +3893,7 @@ def cmd_struct_discover(args: argparse.Namespace) -> int:
 _WIKI_LINK_RE = re.compile(r"^\[\[\s*([^\|\]]+?)\s*(?:\|\s*(.*?)\s*)?\]\]$")
 
 
-def _struct_resolve_page(conn, locator: str):
+def _struct_resolve_page(conn, locator: str) -> tuple[str, str] | None:
     """DokuWiki page id (or [[id|label]]) → (confluence_page_id, title)."""
     if not locator:
         return None
@@ -3920,7 +3920,7 @@ def _struct_resolve_page(conn, locator: str):
     return None
 
 
-def _struct_resolve_attachment(conn, locator: str):
+def _struct_resolve_attachment(conn, locator: str) -> tuple[str, str, str] | None:
     """media_id → (confluence_attachment_id, confluence_page_id, filename)."""
     if not locator:
         return None
@@ -4490,7 +4490,7 @@ def _struct_put_page(session, base, page_id: str, *, title: str, storage: str) -
     return bool(r and r.status_code < 400)
 
 
-def _struct_post_page(session, base, space_id: str, parent_id: str, *, title: str, storage: str, sid: int, pid: int | None = None):
+def _struct_post_page(session, base, space_id: str, parent_id: str, *, title: str, storage: str, sid: int, pid: int | None = None) -> str | None:
     """새 페이지 POST. title 충돌 시 자동 disambiguate."""
     payload = {
         "spaceId": space_id,
@@ -4547,7 +4547,7 @@ def _struct_build_index_xml(
     )
 
 
-def _struct_rewrite_index(conn, sid: int, tbl: str, mode: str, out_dir: Path, base_url: str = "", space_key: str = ""):
+def _struct_rewrite_index(conn, sid: int, tbl: str, mode: str, out_dir: Path, base_url: str = "", space_key: str = "") -> None:
     cols = conn.execute(
         "SELECT colref, name, dokuwiki_class FROM struct_columns WHERE sid=? ORDER BY sort",
         (sid,),
@@ -5102,7 +5102,7 @@ def _extract_visible_text(html_or_xml: str) -> str:
     return _re.sub(r"\s+", " ", text).strip()
 
 
-def _confluence_get_page_body(session, base_url, page_id, body_format="storage"):
+def _confluence_get_page_body(session, base_url, page_id, body_format: str = "storage") -> str | None:
     """Confluence v2 페이지의 body 를 받음.
 
     body_format: storage / view / atlas_doc_format / export_view ...
@@ -5570,7 +5570,7 @@ def _compare_features(d_feats: dict, c_feats: dict) -> tuple[list[dict], bool]:
     return mismatches, has_crit
 
 
-def _diff_page(conn, session, base_url, doku_id, body_format="storage"):
+def _diff_page(conn, session, base_url, doku_id, body_format: str = "storage") -> dict:
     """단일 페이지 비교. (status, dokuwiki_chars, confluence_chars,
     text_match, summary) 반환."""
     row = conn.execute(
@@ -7432,7 +7432,7 @@ def _verify_capture_screenshots(
         })
     """
 
-    def _try_capture_main(p, selectors, dst_path):
+    def _try_capture_main(p, selectors, dst_path) -> str | None:
         """selector 후보 중 첫 매칭 element 만 screenshot. 실패 시 None."""
         for sel in selectors:
             try:
@@ -7562,7 +7562,7 @@ def _verify_capture_screenshots(
 
 # ─── visual-comparison Phase 4 후보 (docs/visual-comparison-proposal.md) ───
 
-def _vc_pil_open(path):
+def _vc_pil_open(path) -> "Image.Image | None":
     try:
         from PIL import Image  # type: ignore
     except ImportError:
@@ -7573,7 +7573,7 @@ def _vc_pil_open(path):
         return None
 
 
-def _vc_resize_match(img_a, img_b):
+def _vc_resize_match(img_a, img_b) -> tuple["Image.Image", "Image.Image"]:
     """양측을 같은 너비로 normalize (작은 쪽 너비 기준). 비율 유지."""
     from PIL import Image  # type: ignore
     w = min(img_a.width, img_b.width)
@@ -8936,7 +8936,7 @@ def _wizard_init(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def _wizard_get(conn, step_key: str):
+def _wizard_get(conn, step_key: str) -> tuple | None:
     return conn.execute(
         "SELECT status, started_at, finished_at, summary, error FROM wizard_state WHERE step_key=?",
         (step_key,),
@@ -9272,7 +9272,7 @@ def _has_table(conn, name: str) -> bool:
 
 def _wizard_build_report_body(conn) -> str:
     """state.db 의 핵심 카운트를 모아 Confluence storage XML 본문 생성."""
-    def q1(sql, default=0):
+    def q1(sql: str, default: int = 0) -> int:
         try:
             r = conn.execute(sql).fetchone()
             return r[0] if r and r[0] is not None else default
