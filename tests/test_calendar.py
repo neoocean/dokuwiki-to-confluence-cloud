@@ -101,6 +101,36 @@ def test_calendar_iframe_real_tag() -> None:
     assert "calendar.google.com" in out
 
 
+def test_youtube_vid_only_paragraph() -> None:
+    """`{{youtube>VID}}` 완전 깨진 fallback — VID 만 단독 paragraph 로 노출.
+    11자 base64-ish → Confluence iframe 매크로로 자동 변환."""
+    html = "<p>NEbzsV6qzQ0</p>"
+    out = _convert(html)
+    assert 'ac:name="iframe"' in out
+    assert "youtube.com/embed/NEbzsV6qzQ0" in out
+
+
+def test_youtube_vid_only_paragraph_with_dash_underscore() -> None:
+    """url-safe base64 alphabet — `-` 와 `_` 포함."""
+    html = "<p>YeZ-iUdoa_0</p>"
+    out = _convert(html)
+    assert "youtube.com/embed/YeZ-iUdoa_0" in out
+
+
+def test_youtube_vid_no_false_positive_short_text() -> None:
+    """11자 미만 — VID 아님, 변환 안 됨."""
+    html = "<p>short</p>"
+    out = _convert(html)
+    assert "youtube.com/embed" not in out
+
+
+def test_youtube_vid_no_false_positive_with_inline_element() -> None:
+    """<p> 안에 인라인 element 가 있으면 VID-only 아님."""
+    html = "<p>NEbzsV6qzQ0 <a href='x'>link</a></p>"
+    out = _convert(html)
+    assert "youtube.com/embed" not in out
+
+
 def test_calendar_iframe_escaped_text() -> None:
     """html 플러그인 미활성 — iframe 이 escape 되어 텍스트로 + URL 만 auto-link."""
     html = (

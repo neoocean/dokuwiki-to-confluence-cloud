@@ -1062,6 +1062,12 @@ _YOUTUBE_FALLBACK_RES = [
     re.compile(r"^https?://youtu\.be/([A-Za-z0-9_\-]+)"),
 ]
 
+# `{{youtube>VID}}` 가 완전히 깨져 VID 만 단독 <p> 로 렌더된 케이스:
+#   <p>NEbzsV6qzQ0</p>
+# 11자 base64-ish (RFC 4648 url-safe alphabet, 64^11 = 7×10^19) — 우연히
+# 다른 의미의 11자 텍스트가 단독 paragraph 일 가능성 매우 낮음.
+_YOUTUBE_VID_ONLY_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
 
 def _convert_youtube_fallback(soup) -> None:
     """YouTube embed 후보 (`{{youtube>VID}}` 미설치 fallback, youtube.com/watch
@@ -1089,6 +1095,23 @@ def _convert_youtube_fallback(soup) -> None:
             parent.replace_with(_BS(macro, "html.parser"))
         else:
             a.replace_with(_BS(macro, "html.parser"))
+
+    # 새 케이스: <p> 안에 11자 base64-ish 텍스트만 — `{{youtube>VID}}` plugin
+    # 완전 미설치 시 DokuWiki 가 VID 만 본문 노출. 우연 충돌 가능성 매우 낮음
+    # — 64^11 ≈ 7×10^19. 페이지 본문에 11자 단독 텍스트가 다른 의미일 확률은
+    # 무시 가능.
+    for p in list(soup.find_all("p")):
+        # 직접 자식이 element 가 아닌 (텍스트만 + br 정도)
+        if any(getattr(c, "name", None) and c.name not in ("br",) for c in p.children):
+            continue
+        txt = (p.get_text() or "").strip()
+        if not _YOUTUBE_VID_ONLY_RE.fullmatch(txt):
+            continue
+        macro = _calendar_iframe_macro(
+            f"https://www.youtube.com/embed/{txt}",
+            width="640", height="360",
+        )
+        p.replace_with(_BS(macro, "html.parser"))
 
 
 def _convert_google_calendar_iframe(soup) -> None:
@@ -10223,7 +10246,9 @@ PLUGIN_RENDER_INVARIANTS: dict[str, dict] = {
     },
     "wrap": {
         "source_re": re.compile(r"<WRAP\b|<wrap\b"),
-        "rendered_required": re.compile(r'<div[^>]*class="wrap_|<em[^>]*class="wrap_'),
+        "rendered_required": re.compile(
+            r'<(?:div|em|span)[^>]*class="[^"]*\bwrap_'
+        ),
         "fix_hint": "wrap plugin 설치.",
     },
     "iframe_plugin": {  # Chris--S iframe plugin (별개 — {{url>...}} syntax)
@@ -10401,30 +10426,40 @@ def _audit_3way_signal_S1(
 
 _S2_ESCAPE_RE = re.compile(r"&lt;([a-zA-Z][a-zA-Z0-9_-]+)\b")
 
+# S2 신호 — *known plugin 매크로* 이름 매치만 위반. 임의 텍스트 (`<trkpt>`,
+# `<Event>` 등 GPX/게임 데이터 본문) 는 false positive 회피.
+_S2_KNOWN_PLUGIN_TAGS = {
+    "html", "iframe", "decrypt", "encrypt", "todo", "wrap", "WRAP",
+    "monthcal", "datatable", "datatemplatelist", "youtube", "include",
+    "section", "page", "tagblock", "struct", "schema", "schema_assignments",
+    "tag", "code-block",
+}
+
 
 def _audit_3way_signal_S2(rendered: str) -> list[dict]:
-    """S2 — rendered 본문에 `&lt;TAG&gt;` escape 텍스트 노출. plugin 미해석
-    시그니처."""
-    # 본문 텍스트 노드만 — html 구조 안 (속성값 등) 제외 위해 단순 정규식 OK
+    """S2 — rendered 본문에 *known plugin 이름* 의 `&lt;TAG&gt;` escape 노출.
+
+    *임의 텍스트* (GPX 의 trkpt/ele, 게임 데이터 Event/Roster 등) 는
+    false positive — known plugin 이름 list 와 매치되는 경우만 위반.
+    """
     matches = _S2_ESCAPE_RE.findall(rendered)
     if not matches:
         return []
     from collections import Counter
     counter = Counter(matches)
-    # 흔한 false-positive 제거 (HTML 자체 tag)
-    noise = {"a", "p", "br", "img", "span", "div", "li", "ul", "ol", "table",
-             "tr", "td", "th", "code", "pre", "em", "strong", "i", "b"}
-    filtered = {k: v for k, v in counter.items() if k.lower() not in noise}
-    if not filtered:
+    # known plugin 이름과 매치 (대소문자 무관)
+    plugin_matches = {k: v for k, v in counter.items()
+                      if k.lower() in {t.lower() for t in _S2_KNOWN_PLUGIN_TAGS}}
+    if not plugin_matches:
         return []
-    top = sorted(filtered.items(), key=lambda x: -x[1])[:5]
+    top = sorted(plugin_matches.items(), key=lambda x: -x[1])[:5]
     return [{
         "signal": "S2.escape_text_exposed",
         "tags": top,
         "responsibility": "source",
         "severity": "medium",
-        "fix_hint": "rendered 에 매크로 escape 텍스트 노출 — plugin 미해석 의심. "
-                    "S1 결과와 함께 검토.",
+        "fix_hint": "rendered 에 plugin 매크로 escape 텍스트 노출 — plugin "
+                    "미해석 의심. S1 결과와 함께 검토.",
     }]
 
 
@@ -10556,25 +10591,29 @@ def _audit_3way_analyze(
     """
     violations: list[dict] = []
 
-    # 화이트리스트 — 페이지가 monthcal_fallback 변환기에 의해 처리됐는지 검출
+    # 화이트리스트 — 페이지가 변환기에 의해 fallback 처리됐는지 검출
     intent: set[str] = set()
-    if rendered and confluence:
-        # _convert_monthcal_fallback 의 시그니처 — 변환기가 정적 표 생성
-        # (dwc-monthcal 클래스 등 — 변환기 본문 안 표 마커)
-        # 본 단계에선 간단히 source 의 monthcal marker 가 있고 confluence 가
-        # 정적 표 (caption 일치) 면 intent 로 분류.
+    if confluence:
+        # _convert_monthcal_fallback — source 의 monthcal marker + confluence 의
+        # 요일 헤더 표
         if re.search(r"~~monthcal\b|\{\{calendar:", source or ""):
             if re.search(r'<th[^>]*>(?:일|월|화|수|목|금|토)</th>', confluence):
                 intent.add("monthcal_fallback")
-                # S1.monthcal 위반은 화이트리스트 — 별도 violation 추가 안 함
+        # _convert_youtube_fallback (VID-only paragraph 포함) — source 에
+        # {{youtube>VID}} + confluence 에 youtube iframe macro
+        if re.search(r"\{\{youtube>", source or ""):
+            if re.search(r'<ri:url[^>]*ri:value="[^"]*youtube\.com', confluence):
+                intent.add("youtube_fallback")
 
     # S 그룹 (S↔D)
     if source is not None and rendered is not None:
         source_clean = _audit_3way_strip_source_noise(source)
         s1 = _audit_3way_signal_S1(source_clean, rendered)
-        # monthcal_fallback 화이트리스트 시 S1.monthcal 도 제거
+        # 화이트리스트 — 변환기가 처리한 fallback 은 S1 위반에서 제외
         if "monthcal_fallback" in intent:
             s1 = [v for v in s1 if v.get("plugin") != "monthcal"]
+        if "youtube_fallback" in intent:
+            s1 = [v for v in s1 if v.get("plugin") != "youtube"]
         violations.extend(s1)
         violations.extend(_audit_3way_signal_S2(rendered))
 
