@@ -9806,6 +9806,64 @@ def _compare_rewrite_attachment_urls(
     return pattern.sub(repl, view_html)
 
 
+def _compare_view_body_limitation_note(view_html: str) -> str:
+    """Confluence view body 가 *placeholder 만* 보여주는 매크로 (iframe / video
+    embed 등) 만 들어있는 페이지면 안내 텍스트 반환. 비교 갤러리에서 빈
+    이미지로 오해 방지."""
+    import re as _re_local
+    text_only = _re_local.sub(r"<[^>]+>", "", view_html).strip()
+    if len(text_only) > 50:
+        return ""
+    if "conf-macro" not in view_html and "structured-macro" not in view_html:
+        return ""
+    # macro placeholder 만 있고 텍스트 거의 없음
+    note = (
+        '<div style="background:#fff3cd;border:1px solid #ffc107;'
+        'padding:12px;margin:0 0 16px 0;border-radius:4px;color:#664d03;">'
+        '<strong>안내:</strong> 본 페이지는 iframe / 임베드 매크로 위주로 구성됨. '
+        'Confluence view body API 가 이 매크로를 빈 placeholder 박스로만 응답하는 '
+        '한계 — 실제 Confluence 페이지에서는 정상 렌더링됨.'
+        '</div>'
+    )
+    return note
+
+
+def _compare_clip_oversize(png_path: Path) -> None:
+    """캡쳐 PNG 의 (1) 흰색 빈 영역 trim + (2) CAPTURE_MAX_HEIGHT_PX 초과 시 clip.
+
+    full_page=True 는 *scrollable page 전체* 캡쳐하지만 콘텐츠가 viewport
+    보다 작으면 *viewport 크기* 로 캡쳐돼 아래쪽에 큰 빈 영역. PIL ImageChops
+    로 흰 배경 (255,255,255) 과 다른 영역의 bbox 만 남김.
+
+    그 후 height 가 12000px 초과면 위쪽만 남기는 추가 clip — 거대 페이지
+    (이미지 100+) 가 첨부 100MB 한도 초과 회피.
+    """
+    try:
+        from PIL import Image, ImageChops  # type: ignore
+    except ImportError:
+        return
+    try:
+        img = Image.open(png_path).convert("RGB")
+        # (1) 흰 배경 trim — body 콘텐츠 영역만
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        diff = ImageChops.difference(img, bg)
+        bbox = diff.getbbox()
+        if bbox:
+            # 아래/오른쪽에 약간의 padding 보존 (시각적 여유)
+            x0, y0, x1, y1 = bbox
+            x0 = max(0, x0 - 8)
+            y0 = max(0, y0 - 8)
+            x1 = min(img.width, x1 + 8)
+            y1 = min(img.height, y1 + 8)
+            img = img.crop((x0, y0, x1, y1))
+        # (2) height clip (거대 페이지)
+        if img.height > CAPTURE_MAX_HEIGHT_PX:
+            img = img.crop((0, 0, img.width, CAPTURE_MAX_HEIGHT_PX))
+        img.save(png_path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _compare_capture_screenshots(
     candidates: list[tuple[str, str, str, str, int]],
     out_dir: Path,
@@ -9868,14 +9926,11 @@ def _compare_capture_screenshots(
             try:
                 url_d = f"{dokuwiki_base.rstrip('/')}/doku.php?id={doku_id}"
                 page_d.goto(url_d, wait_until="networkidle", timeout=30_000)
-                # Confluence 측과 동일 clip (12000px) — 양측 비교 시 동일 영역.
-                h = page_d.evaluate(
-                    "() => Math.max(document.body.scrollHeight, "
-                    "document.documentElement.scrollHeight)"
-                )
-                cap_h = min(int(h), CAPTURE_MAX_HEIGHT_PX)
-                page_d.set_viewport_size({"width": CAPTURE_VIEWPORT_W, "height": cap_h})
-                page_d.screenshot(path=str(dwk_path), full_page=False)
+                # full_page=True 면 Playwright 가 콘텐츠 영역만 정확히 캡쳐 — 빈
+                # viewport 영역 노출 없음. 단 거대 페이지 (이미지 100+ 88000px)
+                # 는 첨부 100MB 한도 초과 위험 → 캡쳐 후 PIL crop 으로 clip.
+                page_d.screenshot(path=str(dwk_path), full_page=True)
+                _compare_clip_oversize(dwk_path)
             except Exception as e:  # noqa: BLE001
                 log(f"    DokuWiki 캡쳐 실패: {e}")
                 dwk_path = None  # type: ignore
@@ -9898,6 +9953,12 @@ def _compare_capture_screenshots(
                         view_html, cid, confluence_origin,
                         confluence_email, confluence_token,
                     )
+                    # Confluence view body 는 iframe / 일부 매크로를 빈 placeholder
+                    # 박스로만 렌더. 비교 갤러리에서 빈 이미지로 오해되지 않도록
+                    # *안내 텍스트* injection — 실제 페이지에선 정상 작동.
+                    placeholder_note = _compare_view_body_limitation_note(view_html)
+                    if placeholder_note:
+                        view_html = placeholder_note + view_html
                     html = (
                         '<!doctype html><html><head><meta charset="utf-8">'
                         f'<base href="{confluence_origin}/">'
@@ -9919,19 +9980,20 @@ def _compare_capture_screenshots(
                     )
                     # networkidle 로 모든 <img>/외부 리소스 fetch 완료까지 기다림.
                     # 캡쳐 인증은 ctx_c 의 extra_http_headers 가 처리.
-                    page_c.set_content(html, wait_until="networkidle", timeout=45_000)
+                    try:
+                        page_c.set_content(html, wait_until="networkidle", timeout=45_000)
+                    except Exception as e:  # noqa: BLE001
+                        # networkidle timeout — 외부 리소스 일부 미완. 그래도 캡쳐
+                        # 진행 (대부분 콘텐츠는 이미 렌더됨). 로깅만.
+                        log(f"    [WARN] {doku_id}: set_content 일부 timeout — 캡쳐 계속: {e}")
                     # 폰트/이미지 마저 layout settle 위한 짧은 대기
                     page_c.wait_for_timeout(1_500)
-                    # 극단적으로 긴 페이지 (이미지 100+ → 88000px 등) 는 첨부 100MB 한도
-                    # 초과 + 비교 갤러리 비대화 위험. viewport 를 동적 조절해 12000px 까지만
-                    # 캡쳐 (full_page=False 로 clip). 일반 페이지엔 영향 없음.
-                    h = page_c.evaluate(
-                        "() => Math.max(document.body.scrollHeight, "
-                        "document.documentElement.scrollHeight)"
-                    )
-                    cap_h = min(int(h), CAPTURE_MAX_HEIGHT_PX)
-                    page_c.set_viewport_size({"width": CAPTURE_VIEWPORT_W, "height": cap_h})
-                    page_c.screenshot(path=str(cnf_path), full_page=False)
+                    # full_page=True 가 *콘텐츠 영역만* 정확히 캡쳐 (viewport 무관).
+                    # set_viewport_size 동적 조절은 빈 영역 노출 위험 (작은
+                    # 콘텐츠 + 큰 viewport). full_page=True 가 더 정확.
+                    # 거대 페이지는 PIL 로 clip.
+                    page_c.screenshot(path=str(cnf_path), full_page=True)
+                    _compare_clip_oversize(cnf_path)
                 else:
                     log(f"    Confluence GET {r.status_code}: {r.text[:150]}")
                     cnf_path = None  # type: ignore
