@@ -494,6 +494,12 @@ python run.py compare-publish --no-recapture  # 기존 PNG 재사용 (본문만 
 
 ## 사용 시나리오 (Recipes)
 
+> 본 절은 *빠른 lookup* 용 (명령 + 1~2줄 설명). 자세한 사용법은:
+> - [`docs/wizard-walkthrough.md`](docs/wizard-walkthrough.md) — wizard
+>   8 시나리오 + 실제 콘솔 출력 (Happy path / Ctrl+C 재개 / 실패 복구 등)
+> - [`docs/runbook.md`](docs/runbook.md) — 라이브 운영 단계별 절차 +
+>   체크리스트 (Confluence 키 도착 후 안전 실행)
+
 ### A. 처음부터 끝까지 — wizard 한 줄
 
 ```sh
