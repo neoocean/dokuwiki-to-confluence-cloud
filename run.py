@@ -33,29 +33,35 @@ DokuWiki 가 렌더링한 최종 XHTML 을 받아 Confluence storage format 으�
   wizard                       대화형 14 단계 (중단/재개 안전)
   report-publish               state.db 통계 → Confluence 페이지 자동 발행
 
-## 코드 섹션 인덱스 (grep anchor — '# §' 로 시작)
+## 코드 섹션 인덱스 (grep anchor — `grep -n '# §' run.py`)
 
-  § 유틸 / DB                    line ~40
-  § S1 Discover                  line ~250
-  § S2 Render                    line ~420
-  § S3 Convert (변환기 본체)      line ~540
-       _convert_*_callouts/footnotes/todos/smileys/visual_residue
-       _convert_monthcal_fallback / _convert_youtube_fallback
-       _convert_google_calendar_iframe / _convert_encrypted_passwords
-       _convert_html_to_storage   (메인 entry)
-  § S4-6 Upload                  line ~1750
-  § S7 Rewrite-links             line ~2470
-  § history-* track              line ~2700
-  § struct-* track               line ~3550
-  § rewrite-oversized-pages      line ~4570
-  § rewrite-oversized            line ~4730
-  § audit                        line ~4890
-  § report / preview / lint      line ~5630
-  § dev (컨테이너 + plugin-scan) line ~5860
-  § verify (시각 검수 + Phase 4) line ~6820
-  § wizard / report-publish      line ~8740
-  § decrypt / link-check         line ~6390
-  § argparse                     line ~9370 (메인 진입점)
+코드가 진화해도 line 번호가 어긋날 수 있어 *anchor 키워드만* 명시. 위치는
+`grep` 로 찾을 것 — 단일 source of truth.
+
+  § 유틸                                — 유틸 (now_iso/hashing/log)
+  § DB                                  — sqlite 연결 + meta + schema DDL
+  § S1 Discover                         — `pages/*.txt` 트리 인벤토리
+  § S2 Render                           — DokuWiki ?do=export_xhtmlbody 캐시
+  § S3 Convert (변환기 본체)            — XHTML → Confluence storage XML
+       `_convert_*_callouts/footnotes/todos/smileys/visual_residue`
+       `_convert_monthcal_fallback / _convert_youtube_fallback`
+       `_convert_google_calendar_iframe / _convert_encrypted_passwords`
+       `_convert_html_to_storage` (메인 entry, 변환 파이프라인 표 포함)
+  § S4-6 Upload                         — 페이지 + 첨부 PUT/POST
+  § S7 Rewrite-links                    — placeholder → ri:page 2-pass
+  § history-* track                     — attic 리비전 + meta/.changes
+  § struct-* track                      — struct.sqlite3 → Database 쉘 + properties
+  § rewrite-oversized-pages             — 본문 한도 거부 페이지 skeleton 폴백
+  § rewrite-oversized                   — 100MB+ 첨부 note 박스 폴백
+  § audit                               — Confluence 본문 받아 비교
+  § report / preview / lint             — 통계 / 미리보기 / XML lint
+  § dev (컨테이너 + plugin-scan)        — 로컬 DokuWiki + plugin 자동설치
+  § verify (시각 검수 + Phase 4)        — DOM/screenshot 비교 + AI vision
+  § decrypt / link-check                — encryptedpasswords + 링크 정합성
+  § compare-publish                     — 양측 스크린샷 + 비교 갤러리 발행
+  § wizard / report-publish             — 대화형 orchestration + 결과 보고
+  § argparse                            — `_build_*_subcommands` 9 helper +
+                                          `build_parser` orchestrator (메인 진입점)
 """
 
 from __future__ import annotations
@@ -6589,6 +6595,7 @@ def _evp_bytes_to_key(password: bytes, salt: bytes,
     return dtot[:key_len], dtot[key_len:key_len + iv_len]
 
 
+# § decrypt / link-check (encryptedpasswords + Confluence 측 링크 정합성)
 def decrypt_encryptedpasswords(cipher_b64: str, password: str) -> str:
     """encryptedpasswords plugin 의 cipher (base64-encoded OpenSSL AES-256-CBC)
     를 password 로 복호화.
@@ -9520,6 +9527,7 @@ def cmd_wizard(args: argparse.Namespace) -> int:
     return 0
 
 
+# § compare-publish (DokuWiki/Confluence 양측 스크린샷 + 비교 갤러리 발행)
 def _compare_select_candidates(
     conn: sqlite3.Connection,
     *,
