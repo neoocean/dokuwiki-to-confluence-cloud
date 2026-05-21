@@ -9,7 +9,7 @@ day 의 §0 표. 과거 로그는 그대로 보존.
 
 CL 53121-53269. *대규모 변환기 보강 + 라이브 적용 사이클*.
 
-## §0 라이브 결과 한 줄
+## Day 5 §0 라이브 결과 한 줄
 
 - **revision 헤더 재포맷**: 1,565 페이지 (3 <p> → panel + shift+enter, idempotent)
 - **변환기 추가 6종 + 라이브 적용**: monthcal (105 매크로 → 정적 캘린더 표) /
@@ -26,7 +26,7 @@ CL 53121-53269. *대규모 변환기 보강 + 라이브 적용 사이클*.
 - **plugin 자동 설치 sanity check**: plugin.info.txt / syntax.php 등 부재 시
   거부 — pld-linux 의 RPM spec wrapper 가 정상 plugin 으로 잘못 잡히던 버그 fix.
 
-## §1 신규 변환기 (run.py)
+## Day 5 §1 신규 변환기 (run.py)
 
 | 함수 | 역할 | 영향 |
 |------|------|------|
@@ -38,7 +38,7 @@ CL 53121-53269. *대규모 변환기 보강 + 라이브 적용 사이클*.
 | `_convert_todos` 강화 | mixed ul / li 안 todo + 텍스트 / inline → task-list (single-task) / 또는 unicode 글리프 | 5,285 `<todo>` 매크로 영향 |
 | `_revision_header(fmt=)` | 8 형식 (none/panel/info/note/tip/warning/quote/table/paragraphs) — 기본 panel + shift+enter | 1,565 페이지 |
 
-## §2 신규 명령
+## Day 5 §2 신규 명령
 
 | 명령 | 역할 |
 |------|------|
@@ -48,7 +48,7 @@ CL 53121-53269. *대규모 변환기 보강 + 라이브 적용 사이클*.
 | `history-rewrite-headers` | 이미 업로드된 페이지의 revision 헤더만 새 형식으로 재PUT. 기존 모양 자동 감지·strip |
 | `compare-publish` | 주요 페이지의 DokuWiki/Confluence 양측 풀-페이지 스크린샷을 캡쳐해 Confluence 루트 페이지 하위에 비교 갤러리 발행/갱신. 10 카테고리 자동 selection (메인/iframe/encrypt/표/이미지/info·note·warning/매크로 다양/코드/대용량) + per-category count (`sample/8`) 로 `--sample 20` 같은 큰 갤러리도 지원 |
 
-## §3 결정적 발견
+## Day 5 §3 결정적 발견
 
 - **Confluence Cloud Database API**: 컬럼/row endpoint 미공개 (Day 4 발견 재확인)
 - **plugin 자동 설치의 잘못된 패키지 식별**: pld-linux/dokuwiki-plugin-encryptedpasswords
@@ -60,7 +60,7 @@ CL 53121-53269. *대규모 변환기 보강 + 라이브 적용 사이클*.
 - **Convert --force 버그**: UPLOADED status 페이지 누락 → 변환기 변경 후 재변환
   안 됨. fix 적용.
 
-## §4 테스트
+## Day 5 §4 테스트
 
 164 → 169+ 통과. 신규 케이스:
 - test_revision_header.py (21): 8 형식 + strip 회귀
@@ -69,7 +69,7 @@ CL 53121-53269. *대규모 변환기 보강 + 라이브 적용 사이클*.
 - test_link_check.py (4): 정규식 패턴
 - tests/conftest.py: pytest 공통 fixture (project_root / convert / make_dokuwiki)
 
-## §5 코드 정리
+## Day 5 §5 코드 정리
 
 - 모듈 docstring 에 코드 섹션 인덱스 (`# §` anchor)
 - 섹션 헤더 표준화 (20곳)
@@ -92,7 +92,7 @@ CL 53121-53269. *대규모 변환기 보강 + 라이브 적용 사이클*.
   `from __future__ import annotations` 활성 → 외부 import 없는 forward ref 안전
 - 전체 164 tests 무회귀, 모든 helper 분리는 순수 구조 리팩토링 (동작 동일)
 
-## §6 비교 갤러리 + 후속 issue fix 사이클 (Day 5 후반)
+## Day 5 §6 비교 갤러리 + 후속 issue fix 사이클 (Day 5 후반)
 
 사용자 검토 중 발견된 4개 issue 를 한 사이클로 fix:
 
@@ -128,7 +128,7 @@ snapshot 페이지 4개로만 있던 struct 데이터를 *Confluence 측에서�
    "관련 struct 데이터" 패널 추가. 마커 `<!-- struct-embed:start -->` 기준
    idempotent 교체.
 
-## §0 struct 트랙 종료 통계 (Day 4)
+## Day 4 §0 struct 트랙 종료 통계
 
 | 단계 | 결과 |
 |------|------|
@@ -138,7 +138,7 @@ snapshot 페이지 4개로만 있던 struct 데이터를 *Confluence 측에서�
 | `struct-upload --mode native --index-only` (URL 보정 재돌림) | 4 인덱스 PUT (8초) |
 | `struct-embed-on-bound-pages` 라이브 | **208 bound page PUT** + 5 unresolved skip (DokuWiki 페이지 미존재) — `<h2>관련 struct 데이터</h2>` sentinel 로 idempotent 보장 |
 
-## §1 데이터 모델
+## Day 4 §1 데이터 모델
 
 ```
 공간 루트
@@ -156,7 +156,7 @@ bound 페이지 (`b:2019-s200d-1`, `b:2019-s200i-1`, …) 본문 끝에 `관련
 struct 데이터` 섹션이 들어가 — brevet_event row 링크 + brevet_course
 체크포인트 링크 + Page Properties Report (CQL 라벨 매칭) 가 함께 표시.
 
-## §2 API 한계 발견 (struct-migration.md §3.1 갱신됨)
+## Day 4 §2 API 한계 발견 (struct-migration.md §3.1 갱신됨)
 
 `struct-upload --probe` 결과 — Confluence Cloud v2 REST 의 Database API 는
 **create/get/delete 의 3가지만 공개**. 컬럼 정의나 row 입력 endpoint 가
@@ -166,7 +166,7 @@ struct 데이터` 섹션이 들어가 — brevet_event row 링크 + brevet_cours
 시 동일 코드 경로 (mode=native) 가 그대로 풀 native 마이그레이션을 수행
 가능 — `confluence_db_id` 가 schema 별로 이미 채워져 있음.
 
-## §3 코드 적용 (CL 53122+)
+## Day 4 §3 코드 적용 (CL 53122+)
 
 | 컴포넌트 | 변경 |
 |----------|------|
@@ -180,7 +180,7 @@ struct 데이터` 섹션이 들어가 — brevet_event row 링크 + brevet_cours
 | `cmd_struct_embed_on_bound_pages` | bound 페이지에 "관련 struct 데이터" 패널 |
 | `tests/test_struct.py` | 27 케이스 (struct 18 + visual-audit Phase 3 자동 신호 9) |
 
-## §4 outstanding
+## Day 4 §4 outstanding
 
 | 항목 | 상태 | 다음 |
 |------|------|------|
@@ -197,7 +197,7 @@ history-render → history-convert → history-upload 본격 실행. 5 라운드
 PUT replay 끝에 약 50% 회복. *큰 페이지의 뒤쪽 rev* 가 Confluence 본문
 parsing 한도로 영구 거부되는 패턴 관측.
 
-## §0 history 트랙 종료 통계
+## Day 3 §0 history 트랙 종료 통계
 
 | 단계 | 결과 |
 |------|------|
@@ -221,7 +221,7 @@ parsing 한도로 영구 거부되는 패턴 관측.
 - 부분 처리 (일부 rev 만 UPLOADED): **46 페이지** (큰 일지 페이지들)
 - 0 처리 (한 rev 도 UPLOADED 안 됨): **63 페이지** (large_body_fallback `u:neoocean:2020` 의 2,895 rev + `p:start` 649 rev + 작은 페이지들 한두 rev)
 
-## §1 큰 페이지 영구 fail 패턴
+## Day 3 §1 큰 페이지 영구 fail 패턴
 
 같은 페이지의 *처음 N rev* 는 통과하지만 그 뒤 rev 가 거부되는 패턴.
 원인 추정: dokuwiki 의 매 edit 마다 본문이 누적되어 *후반 rev*
@@ -242,7 +242,7 @@ storage XML 이 매우 크고 복잡해짐 → Confluence 본문 parsing 한도 
 로 한정. *Confluence 의 본문 한도* 가 본질적 제약이라 더 시도해도
 같은 위치에서 거부됨.
 
-## §2 누적 통계 (Day 3 종료)
+## Day 3 §2 누적 통계 (Day 3 종료)
 
 | 항목 | 값 | Day 2 대비 |
 |------|----|----|
@@ -254,14 +254,14 @@ storage XML 이 매우 크고 복잡해짐 → Confluence 본문 parsing 한도 
 | history page 0 처리 | 63 (`u:neoocean:2020` + `p:start` + 기타) | (라이브 시작) |
 | struct 페이지 | 4 (1,213 rows) | 동일 |
 
-## §3 코드 적용
+## Day 3 §3 코드 적용
 
 이번 라운드는 *추가 코드 변경 없음*. CL 52882 의 history pipeline
 구현이 그대로 사용됨. resume-safe (history_meta.last_replayed_rev_ts)
 + 페이지별 fail 시 break + FAILED → CONVERTED 수동 reset 후 재시도
 패턴이 5 라운드 동안 의도대로 동작.
 
-## §4 outstanding
+## Day 3 §4 outstanding
 
 | 항목 | 상태 | 권장 대응 |
 |------|------|----------|
@@ -269,7 +269,7 @@ storage XML 이 매우 크고 복잡해짐 → Confluence 본문 parsing 한도 
 | `u:neoocean:2020` (large_body_fallback) 의 2,895 rev | **영구** | 본 페이지는 이미 skeleton + zip 첨부 패턴 적용. history 는 zip 안에 보존 가능 (현 구현 미포함). |
 | `p:start` 649 rev (0 처리) | 미진단 | 별도 확인 권장 — 콘텐츠 패턴 거부 가능 |
 
-## §5 다음 단계 (Day 4 후보)
+## Day 3 §5 다음 단계 (Day 4 후보)
 
 - 사후 정리: API 토큰 revoke, `.secrets/confluence.env` 갱신, 로그 archive.
 - 휴지통 1,465 페이지 *영구 purge* 또는 30일 자동 만료 결정.
@@ -284,7 +284,7 @@ storage XML 이 매우 크고 복잡해짐 → Confluence 본문 parsing 한도 
 후속 follow-up 작업 9건 (#4~#12) 자율 진행 + 별도 트랙 일부 실행 +
 공간 안 비-마이그레이션 페이지 1,465건 휴지통 정리.
 
-## §0 누적 통계 (2026-05-19 종료 시점)
+## Day 2 §0 누적 통계 (2026-05-19 종료 시점)
 
 | 항목 | 값 | 변화 |
 |------|----|----|
@@ -300,7 +300,7 @@ storage XML 이 매우 크고 복잡해짐 → Confluence 본문 parsing 한도 
 | 공간 안 current 페이지 | 1,680 | 1,679 (마이그레이션 트리) + 1 (root) |
 | history-render | 진행 중 (3,813 / 37,947 ~10%) | start 22:37 |
 
-## §1 적용된 follow-up (CL 52881, 52882)
+## Day 2 §1 적용된 follow-up (CL 52881, 52882)
 
 | # | 작업 | 결과 |
 |---|------|------|
@@ -314,7 +314,7 @@ storage XML 이 매우 크고 복잡해짐 → Confluence 본문 parsing 한도 
 | #7 | struct pipeline (convert/upload) 구현 | snapshot 모드 라이브 적용 — 4 schema × 1 페이지. properties / native 모드는 stub |
 | #8 | `--users-map` JSON 매핑 flag | `_load_users_map` + `_format_user` (mapped → `<ri:user account-id>` link; unmapped → 텍스트). history-upload 에서 사용 |
 
-## §2 라이브 적용 상세
+## Day 2 §2 라이브 적용 상세
 
 ### 2.1 struct snapshot 4 페이지 (push=4, fail=0)
 
@@ -368,14 +368,14 @@ Confluence 가 본문 POST/PUT 모두 `no resp` 로 거부. C-mode:
 
 대다수가 id prefix `2304*` / `2305*` 대역 — 이전 마이그레이션 시도 잔재. 우리 작업은 `2517*-2520*` 대역.
 
-## §3 코드 변경 (CL 52881 + 52882)
+## Day 2 §3 코드 변경 (CL 52881 + 52882)
 
 | CL | 신규 |
 |----|------|
 | 52881 | `cmd_rewrite_oversized` (B-mode 자동화). `_apply_page_labels` (v1 label API). `_convert_footnotes` 에 anchor 매크로 삽입. `<a rel=tag>` 추출 + `page_tags:<id>` 메타. `_compare_features` 의 `link_total` / `task_total` 합산. `NOISE_CLASS_PREFIXES` 에 `wrap_`. `_convert_html_to_storage` 5-tuple 반환 (page_tags 추가). 22 unit tests still pass. |
 | 52882 | `cmd_rewrite_oversized_pages` (C-mode skeleton + zip). `cmd_history_render/convert/upload` (37k revision pipeline; resume-safe). `cmd_struct_convert/upload` (snapshot/properties/native). `_load_users_map` / `_format_user` (`--users-map` JSON). `_revision_header` (note 매크로). `docs/oversized-pages.md` 신규. 서브커맨드 13 → **22** (4 history + 4 struct + 2 rewrite). 22 unit tests still pass. |
 
-## §4 outstanding (이전 Day 1 §5 이후 변화)
+## Day 2 §4 outstanding (이전 Day 1 §5 이후 변화)
 
 | 이전 § | 항목 | 상태 |
 |--------|------|------|
