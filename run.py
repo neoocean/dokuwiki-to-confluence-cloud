@@ -3463,12 +3463,7 @@ def cmd_history_upload(args: argparse.Namespace) -> int:
 
     *조심*: ~37k API 호출 가능. --limit 또는 --only 권장.
     """
-    if not args.email or not args.api_token:
-        log("자격증명 필요.")
-        for line in CREDENTIAL_HELP.splitlines():
-            log("  " + line)
-        return 2
-
+    # 자격증명/base_url 검증은 _confluence_session 이 처리 — None 시 도움말 출력 + None 반환.
     conn = db_connect(args.db)
     session = _confluence_session(args)
     if session is None:
@@ -3655,12 +3650,7 @@ def cmd_history_rewrite_headers(args: argparse.Namespace) -> int:
     헤더 prepend → PUT. revisions 테이블의 *최신* rev 만 적용 (history 의
     이전 버전들은 새로 history-convert+upload 해야 반영됨).
     """
-    if not args.email or not args.api_token:
-        log("자격증명 필요.")
-        for line in CREDENTIAL_HELP.splitlines():
-            log("  " + line)
-        return 2
-
+    # 자격증명 검증은 _confluence_session 이 처리.
     conn = db_connect(args.db)
     fmt = args.header_format or db_get_meta(conn, "revision_header_fmt") or REVISION_HEADER_DEFAULT
     if fmt not in REVISION_HEADER_FORMATS:
@@ -4519,11 +4509,7 @@ def cmd_struct_upload(args: argparse.Namespace) -> int:
     properties / snapshot 은 storage XML 을 페이지로 생성 (메인
     파이프라인의 cmd_upload 와 유사).
     """
-    if not args.email or not args.api_token:
-        log("자격증명 필요.")
-        for line in CREDENTIAL_HELP.splitlines():
-            log("  " + line)
-        return 2
+    # 자격증명 검증은 _confluence_session 이 처리.
     if not args.space_key or not args.root_page_id:
         log("--space-key / --root-page-id 필요.")
         return 2
@@ -4862,12 +4848,7 @@ def cmd_rewrite_oversized_pages(args: argparse.Namespace) -> int:
     last_error LIKE '%no resp%') 를 skeleton 본문 + 원본 storage XML
     첨부로 처리. 상세: docs/oversized-pages.md (C 모드).
     """
-    if not args.email or not args.api_token:
-        log("자격증명 필요.")
-        for line in CREDENTIAL_HELP.splitlines():
-            log("  " + line)
-        return 2
-
+    # 자격증명 검증은 _confluence_session 이 처리.
     conn = db_connect(args.db)
     session = _confluence_session(args)
     if session is None:
@@ -5782,11 +5763,7 @@ def _diff_page(conn, session, base_url, doku_id, body_format: str = "storage") -
 
 def cmd_audit(args: argparse.Namespace) -> int:
     """업로드된 페이지를 Confluence 에서 다시 받아 dokuwiki raw 와 비교."""
-    if not args.email or not args.api_token:
-        log("audit 은 자격증명 필요.")
-        for line in CREDENTIAL_HELP.splitlines():
-            log("  " + line)
-        return 2
+    # 자격증명 검증은 _confluence_session 이 처리.
 
     conn = db_connect(args.db)
     session = _confluence_session(args)
@@ -10036,11 +10013,7 @@ def cmd_compare_publish(args: argparse.Namespace) -> int:
     자동 후보 선정 (카테고리별 1) 또는 --select 명시 list. 양측을 헤드리스
     Chromium 으로 풀-페이지 캡쳐 → page POST → 첨부 → storage 본문 PUT.
     재실행 시 같은 제목 페이지 update (첨부도 같은 파일명이면 새 버전)."""
-    if not args.email or not args.api_token:
-        log("자격증명 필요.")
-        for line in CREDENTIAL_HELP.splitlines():
-            log("  " + line)
-        return 2
+    # 자격증명 검증은 _confluence_session 이 처리.
     if not args.space_key or not args.root_page_id:
         log("--space-key / --root-page-id 필요.")
         return 2
