@@ -48,7 +48,7 @@ python run.py report-publish
 | `docs/history-migration.md` | 과거 리비전 이전 시나리오 + 라이브 결과 |
 | `docs/oversized-attachments.md` / `oversized-pages.md` | 본문/첨부 한도 초과 폴백 |
 | `dev/dokuwiki-local/docker-compose.yml` | 로컬 DokuWiki 테스트 컨테이너 |
-| `tests/test_*.py` | pytest 회귀 (현재 84 통과) |
+| `tests/test_*.py` | pytest 회귀 (현재 164 통과). 영역별 매핑은 [`tests/README.md`](tests/README.md) |
 | `.secrets/confluence.env` | 자격증명 (커밋 금지) |
 | `.env.example` | 환경 변수 템플릿 (배포 시 .secrets/ 로 복사 후 편집) |
 | `DEPLOY.md` | 다른 머신에 배포할 때의 번들 구성 + 설치 절차 |
