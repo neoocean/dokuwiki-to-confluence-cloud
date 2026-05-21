@@ -9473,6 +9473,417 @@ def cmd_wizard(args: argparse.Namespace) -> int:
     return 0
 
 
+def _compare_select_candidates(
+    conn: sqlite3.Connection,
+    *,
+    sample: int = 8,
+    explicit_ids: list[str] | None = None,
+) -> list[tuple[str, str, str, str, int]]:
+    """비교 갤러리 후보 페이지 선정. 카테고리별 대표 1 페이지씩 + 명시 list 지원.
+
+    각 카테고리당 1 페이지 — 메인 / iframe / encrypt / 표 / 이미지·첨부 /
+    info·note·warning / 매크로 다양 / 코드 매크로 / 최대 본문. 동일 페이지
+    중복 선정 방지. 거대 본문 (>200KB) 은 톡톡 너무 길어 매크로 다양/표 등에선
+    제외 (최대 본문 카테고리는 통과).
+
+    Returns: list of (reason, doku_id, title, confluence_page_id, body_size).
+    """
+    from collections import Counter
+
+    rows = conn.execute(
+        "SELECT doku_id, title, storage_path, confluence_page_id "
+        "FROM pages WHERE confluence_page_id IS NOT NULL AND storage_path IS NOT NULL"
+    ).fetchall()
+    scored: list[tuple[str, str, str, str, int, "Counter[str]"]] = []
+    for d, t, sp, cid in rows:
+        try:
+            body = Path(sp).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        macs: Counter[str] = Counter()
+        for m in re.findall(r'ac:name="([^"]+)"', body):
+            macs[m] += 1
+        macs["_table"] = body.count("<table")
+        macs["_image"] = body.count("<ac:image")
+        macs["_attach"] = body.count("<ri:attachment")
+        macs["_distinct"] = len([k for k in macs if not k.startswith("_")])
+        scored.append((d, t, sp, cid, len(body), macs))
+
+    if explicit_ids:
+        idx = {s[0]: s for s in scored}
+        chosen: list[tuple[str, str, str, str, int]] = []
+        for did in explicit_ids:
+            s = idx.get(did)
+            if s:
+                chosen.append(("명시 (--select)", s[0], s[1], s[3], s[4]))
+            else:
+                log(f"  [WARN] 명시 페이지 미발견 또는 미업로드: {did}")
+        return chosen
+
+    seen: set[str] = set()
+    chosen2: list[tuple[str, str, str, str, int]] = []
+
+    def pick(reason: str, key_fn, filt=None) -> None:
+        cands = [s for s in scored if s[0] not in seen and (filt is None or filt(s))]
+        cands.sort(key=key_fn, reverse=True)
+        if cands:
+            s = cands[0]
+            seen.add(s[0])
+            chosen2.append((reason, s[0], s[1], s[3], s[4]))
+
+    # 중간 크기 (5KB ~ 200KB) — 한 화면에 톡톡 보기 좋음
+    def medium(s):
+        return 5_000 < s[4] < 200_000
+
+    # iframe/encrypt 같은 *특수 매크로* 카테고리는 큰 페이지에 묻혀 있을 수 있어
+    # 작은 페이지를 우선 (-size 키) — 풀 페이지 스크린샷 timeout 회피.
+    pick("메인 (start)",            lambda s: 1,
+         filt=lambda s: s[0] == "start")
+    pick("사용자 시작",              lambda s: 1,
+         filt=lambda s: s[0].endswith(":start") and s[0] != "start" and s[4] > 200)
+    pick("iframe (캘린더/임베드)",  lambda s: -s[4],
+         filt=lambda s: s[5].get("iframe", 0) > 0)
+    pick("encrypted-passwords",     lambda s: -s[4],
+         filt=lambda s: s[5].get("expand", 0) > 0 and medium(s))
+    pick("표 풍부",                  lambda s: s[5]["_table"],
+         filt=lambda s: s[5]["_table"] >= 3 and medium(s))
+    pick("이미지·첨부 다수",         lambda s: s[5]["_image"] + s[5]["_attach"],
+         filt=lambda s: (s[5]["_image"] + s[5]["_attach"]) >= 2 and medium(s))
+    pick("info/note/warning 매크로", lambda s: s[5].get("info", 0) + s[5].get("note", 0) + s[5].get("warning", 0),
+         filt=lambda s: (s[5].get("info", 0) + s[5].get("note", 0) + s[5].get("warning", 0)) > 0 and medium(s))
+    pick("매크로 다양",              lambda s: s[5]["_distinct"],
+         filt=lambda s: s[5]["_distinct"] >= 5 and medium(s))
+    pick("코드 매크로 풍부",         lambda s: s[5].get("code", 0),
+         filt=lambda s: s[5].get("code", 0) >= 3 and medium(s))
+    pick("대용량 본문",              lambda s: s[4])
+
+    return chosen2[:sample]
+
+
+def _compare_capture_screenshots(
+    candidates: list[tuple[str, str, str, str, int]],
+    out_dir: Path,
+    *,
+    dokuwiki_base: str,
+    confluence_base: str,
+    confluence_email: str,
+    confluence_token: str,
+    skip_existing: bool = False,
+) -> dict[str, dict[str, Path | None]]:
+    """양측 풀-페이지 1280px 폭 스크린샷. Playwright 미설치 시 빈 dict.
+
+    Confluence 측은 v2 body-format=view 로 본문 HTML 받아 set_content 로 렌더
+    — Cloud UI 인증 (SSO/cookie) 우회. DokuWiki 측은 실서버 (`?id=...`)."""
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except ImportError:
+        log("Playwright 미설치 — `pip install playwright && "
+            "playwright install chromium` 후 재실행. 스크린샷 건너뜀.")
+        return {}
+    import requests
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results: dict[str, dict[str, Path | None]] = {}
+
+    auth = ""
+    if confluence_email and confluence_token:
+        token = base64.b64encode(f"{confluence_email}:{confluence_token}".encode()).decode()
+        auth = f"Basic {token}"
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        ctx_d = browser.new_context(viewport={"width": 1280, "height": 900})
+        page_d = ctx_d.new_page()
+        ctx_c = browser.new_context(viewport={"width": 1280, "height": 900})
+        page_c = ctx_c.new_page()
+
+        for i, (_reason, doku_id, _title, cid, _sz) in enumerate(candidates, 1):
+            stem = doku_id.replace(":", "_").replace("/", "_")
+            dwk_path = out_dir / f"{stem}.dwk.png"
+            cnf_path = out_dir / f"{stem}.cnf.png"
+
+            if skip_existing and dwk_path.is_file() and cnf_path.is_file():
+                log(f"  [{i}/{len(candidates)}] {doku_id}: 기존 PNG 재사용")
+                results[doku_id] = {"dwk": dwk_path, "cnf": cnf_path}
+                continue
+
+            log(f"  [{i}/{len(candidates)}] {doku_id}: 양측 캡쳐 중...")
+
+            # DokuWiki
+            try:
+                url_d = f"{dokuwiki_base.rstrip('/')}/doku.php?id={doku_id}"
+                page_d.goto(url_d, wait_until="networkidle", timeout=30_000)
+                page_d.screenshot(path=str(dwk_path), full_page=True)
+            except Exception as e:  # noqa: BLE001
+                log(f"    DokuWiki 캡쳐 실패: {e}")
+                dwk_path = None  # type: ignore
+
+            # Confluence — body-format=view 받아 set_content 렌더 (인증 우회)
+            try:
+                r = requests.get(
+                    f"{confluence_base.rstrip('/')}/api/v2/pages/{cid}",
+                    auth=(confluence_email, confluence_token),
+                    params={"body-format": "view"},
+                    timeout=60,
+                )
+                if r.ok:
+                    view_html = r.json().get("body", {}).get("view", {}).get("value", "")
+                    html = (
+                        '<!doctype html><html><head><meta charset="utf-8">'
+                        '<style>'
+                        'body{font-family:-apple-system,Arial,sans-serif;'
+                        'max-width:1100px;margin:0 auto;padding:24px;line-height:1.5;}'
+                        'h1,h2,h3{margin-top:1.2em;}'
+                        'img{max-width:100%;height:auto;}'
+                        'table{border-collapse:collapse;margin:8px 0;}'
+                        'table,th,td{border:1px solid #ccc;padding:6px;}'
+                        'th{background:#f4f5f7;}'
+                        'pre{background:#f4f5f7;padding:8px;border-radius:4px;overflow:auto;}'
+                        'code{background:#f4f5f7;padding:1px 4px;border-radius:3px;}'
+                        'blockquote{border-left:3px solid #ccc;padding-left:12px;color:#555;}'
+                        '.confluence-information-macro{border:1px solid #ddd;border-radius:4px;'
+                        'padding:10px;margin:8px 0;background:#f4f5f7;}'
+                        '</style></head><body>' + view_html + '</body></html>'
+                    )
+                    # iframe 외부 fetch 가 느릴 수 있으니 짧은 timeout
+                    page_c.set_content(html, wait_until="domcontentloaded", timeout=15_000)
+                    page_c.wait_for_timeout(500)
+                    page_c.screenshot(path=str(cnf_path), full_page=True)
+                else:
+                    log(f"    Confluence GET {r.status_code}: {r.text[:150]}")
+                    cnf_path = None  # type: ignore
+            except Exception as e:  # noqa: BLE001
+                log(f"    Confluence 캡쳐 실패: {e}")
+                cnf_path = None  # type: ignore
+
+            results[doku_id] = {
+                "dwk": dwk_path if dwk_path and Path(str(dwk_path)).is_file() else None,
+                "cnf": cnf_path if cnf_path and Path(str(cnf_path)).is_file() else None,
+            }
+        browser.close()
+    return results
+
+
+def _compare_build_storage_body(
+    candidates: list[tuple[str, str, str, str, int]],
+    screenshots: dict[str, dict[str, Path | None]],
+    *,
+    dokuwiki_base: str,
+    confluence_base: str,
+    space_key: str,
+) -> str:
+    """비교 갤러리 Confluence storage XML 빌드. 각 페이지마다 H2 + 양측 링크 +
+    2열 표 (DokuWiki | Confluence) — 이미지는 첨부 참조."""
+    parts: list[str] = []
+    parts.append(
+        '<ac:structured-macro ac:name="info"><ac:rich-text-body>'
+        '<p><strong>DokuWiki ↔ Confluence 마이그레이션 비교 갤러리</strong></p>'
+        '<ul>'
+        f'<li>생성: {now_iso()[:10]}</li>'
+        f'<li>대상 페이지 수: {len(candidates)}</li>'
+        '<li>좌측 = DokuWiki 원본 / 우측 = Confluence 마이그레이션 결과</li>'
+        '<li>이미지는 1280px 폭 풀-페이지 스크린샷 (캡쳐 시점 기준)</li>'
+        '<li>이 페이지는 <code>python run.py compare-publish</code> 로 갱신됩니다</li>'
+        '</ul>'
+        '</ac:rich-text-body></ac:structured-macro>'
+    )
+    parts.append('<p><ac:structured-macro ac:name="toc"/></p>')
+
+    for i, (reason, doku_id, title, cid, size) in enumerate(candidates, 1):
+        s = screenshots.get(doku_id, {})
+        dwk = s.get("dwk")
+        cnf = s.get("cnf")
+        dwk_name = dwk.name if dwk else None
+        cnf_name = cnf.name if cnf else None
+
+        parts.append(f'<h2>{i}. {_h.escape(title or doku_id)}</h2>')
+        parts.append(
+            '<p>'
+            f'<strong>분류:</strong> {_h.escape(reason)} · '
+            f'<strong>doku_id:</strong> <code>{_h.escape(doku_id)}</code> · '
+            f'<strong>본문 크기:</strong> {size:,} bytes'
+            '</p>'
+        )
+
+        dwk_url = f"{dokuwiki_base.rstrip('/')}/doku.php?id={doku_id}"
+        cnf_url = f"{confluence_base.rstrip('/')}/spaces/{space_key}/pages/{cid}"
+        parts.append(
+            '<p>'
+            f'<a href="{_h.escape(dwk_url)}">↗ DokuWiki 원본</a>  ·  '
+            f'<a href="{_h.escape(cnf_url)}">↗ Confluence 페이지</a>'
+            '</p>'
+        )
+
+        td_dwk = (
+            f'<ac:image ac:width="540"><ri:attachment ri:filename="{_h.escape(dwk_name)}"/></ac:image>'
+            if dwk_name else '<p><em>(DokuWiki 캡쳐 실패)</em></p>'
+        )
+        td_cnf = (
+            f'<ac:image ac:width="540"><ri:attachment ri:filename="{_h.escape(cnf_name)}"/></ac:image>'
+            if cnf_name else '<p><em>(Confluence 캡쳐 실패)</em></p>'
+        )
+        parts.append(
+            '<table><colgroup><col style="width: 50.0%;"/><col style="width: 50.0%;"/></colgroup>'
+            '<tbody>'
+            '<tr><th>DokuWiki</th><th>Confluence</th></tr>'
+            f'<tr><td>{td_dwk}</td><td>{td_cnf}</td></tr>'
+            '</tbody></table>'
+        )
+    return "\n".join(parts)
+
+
+def _compare_find_or_create_page(
+    session, base: str, space_id: str, root_page_id: str, title: str
+) -> str | None:
+    """제목으로 페이지 검색 → 있으면 그 id, 없으면 placeholder POST 후 id 반환."""
+    sr = _request_with_retry(
+        session, "GET", f"{base}/api/v2/pages",
+        params={"space-id": space_id, "title": title, "limit": 1},
+    )
+    if sr is not None and sr.status_code < 400:
+        items = sr.json().get("results", [])
+        if items:
+            return items[0].get("id")
+    placeholder = {
+        "spaceId": space_id, "parentId": root_page_id, "title": title,
+        "body": {"representation": "storage", "value": '<p>(준비 중)</p>'},
+    }
+    r = _request_with_retry(session, "POST", f"{base}/api/v2/pages", json=placeholder)
+    if r is None or r.status_code >= 400:
+        log(f"  [FAIL] 페이지 생성: {r.status_code if r else 'no resp'} body={(r.text if r else '')[:200]}")
+        return None
+    return r.json().get("id")
+
+
+def _compare_attach_screenshots(
+    session, base: str, page_id: str,
+    screenshots: dict[str, dict[str, Path | None]],
+) -> tuple[int, int]:
+    """모든 PNG 를 v1 multipart 로 page_id 에 첨부. 같은 파일명 이미 있으면
+    update — Confluence 가 'minorEdit=true' 로 새 버전 만들기. Returns (ok, fail)."""
+    from requests_toolbelt.multipart import encoder as tb_encoder
+
+    ok = fail = 0
+    for paths in screenshots.values():
+        for p in paths.values():
+            if not p or not Path(str(p)).is_file():
+                continue
+            try:
+                with open(p, "rb") as fp:
+                    m = tb_encoder.MultipartEncoder(
+                        fields={
+                            "file": (p.name, fp, "image/png"),
+                            "minorEdit": "true",
+                        }
+                    )
+                    resp = session.post(
+                        f"{base}/rest/api/content/{page_id}/child/attachment",
+                        headers={"X-Atlassian-Token": "no-check", "Content-Type": m.content_type},
+                        data=m,
+                        timeout=120,
+                    )
+                if resp.status_code >= 400 and "same file name" not in (resp.text or "").lower():
+                    log(f"    [ATT-FAIL] {p.name}: {resp.status_code} {resp.text[:150]}")
+                    fail += 1
+                else:
+                    ok += 1
+            except Exception as e:  # noqa: BLE001
+                log(f"    [ATT-EXC] {p.name}: {e}")
+                fail += 1
+    return ok, fail
+
+
+def cmd_compare_publish(args: argparse.Namespace) -> int:
+    """주요 페이지의 DokuWiki / Confluence 스크린샷을 캡쳐해 비교 갤러리를
+    Confluence 루트 페이지 하위에 발행/갱신.
+
+    자동 후보 선정 (카테고리별 1) 또는 --select 명시 list. 양측을 헤드리스
+    Chromium 으로 풀-페이지 캡쳐 → page POST → 첨부 → storage 본문 PUT.
+    재실행 시 같은 제목 페이지 update (첨부도 같은 파일명이면 새 버전)."""
+    if not args.email or not args.api_token:
+        log("자격증명 필요.")
+        for line in CREDENTIAL_HELP.splitlines():
+            log("  " + line)
+        return 2
+    if not args.space_key or not args.root_page_id:
+        log("--space-key / --root-page-id 필요.")
+        return 2
+    if not args.base_url:
+        log("--base-url (CONFLUENCE_BASE_URL) 필요.")
+        return 2
+    dokuwiki_base = args.dokuwiki_base_url or env_default("DOKUWIKI_BASE_URL")
+    if not dokuwiki_base:
+        log("--dokuwiki-base-url (DOKUWIKI_BASE_URL) 필요.")
+        return 2
+
+    conn = db_connect(args.db)
+    session = _confluence_session(args)
+    if session is None:
+        return 2
+    base = args.base_url.rstrip("/")
+
+    explicit = [s.strip() for s in args.select.split(",") if s.strip()] if args.select else None
+    candidates = _compare_select_candidates(conn, sample=args.sample, explicit_ids=explicit)
+    if not candidates:
+        log("후보 페이지 없음 — state.db 에 UPLOADED 페이지가 있는지 확인.")
+        return 1
+
+    log(f"=== compare-publish: {len(candidates)} 페이지 ===")
+    for i, (reason, d, t, cid, sz) in enumerate(candidates, 1):
+        log(f"  [{i}] {reason}: {d} ({t}) — {sz:,} bytes / cid={cid}")
+
+    out_dir = Path(args.out_dir or "compare_screenshots")
+    screenshots = _compare_capture_screenshots(
+        candidates, out_dir,
+        dokuwiki_base=dokuwiki_base,
+        confluence_base=base,
+        confluence_email=args.email,
+        confluence_token=args.api_token,
+        skip_existing=args.no_recapture,
+    )
+    captured_n = sum(1 for s in screenshots.values() if s.get("dwk") and s.get("cnf"))
+    log(f"  캡쳐 완료: 양측 OK={captured_n} / 후보={len(candidates)}")
+
+    if args.dry_run:
+        log("--dry-run: 발행 skip.")
+        return 0
+
+    space_id = _resolve_space_id(session, base, args.space_key)
+    if not space_id:
+        return 1
+
+    title = args.title or f"DokuWiki ↔ Confluence 비교 갤러리 ({len(candidates)} 페이지)"
+    page_id = _compare_find_or_create_page(session, base, space_id, args.root_page_id, title)
+    if not page_id:
+        return 1
+    log(f"  대상 페이지 id={page_id}")
+
+    att_ok, att_fail = _compare_attach_screenshots(session, base, page_id, screenshots)
+    log(f"  첨부 업로드: ok={att_ok} fail={att_fail}")
+
+    body = _compare_build_storage_body(
+        candidates, screenshots,
+        dokuwiki_base=dokuwiki_base, confluence_base=base, space_key=args.space_key,
+    )
+    cur_ver = _get_page_version(session, base, page_id)
+    if cur_ver is None:
+        log("  [FAIL] 현재 version 조회 실패")
+        return 1
+    put_payload = {
+        "id": page_id, "status": "current", "title": title,
+        "body": {"representation": "storage", "value": body},
+        "version": {"number": cur_ver + 1, "message": "compare-publish refresh"},
+    }
+    r = _request_with_retry(session, "PUT", f"{base}/api/v2/pages/{page_id}", json=put_payload)
+    if r is None or r.status_code >= 400:
+        log(f"  [FAIL] PUT: {r.status_code if r else 'no resp'} body={(r.text if r else '')[:300]}")
+        return 1
+
+    log(f"=== 완료: {base}/spaces/{args.space_key}/pages/{page_id} ===")
+    conn.close()
+    return 0
+
+
 def cmd_report_publish(args: argparse.Namespace) -> int:
     """state.db 통계 기반 보고서 페이지 발행/갱신 (wizard 의 마지막 단계 단독 호출)."""
     conn = db_connect(args.db)
@@ -9976,6 +10387,27 @@ def _build_tool_subcommands(sub) -> None:
     sp_lc.add_argument("--verbose", "-v", action="store_true",
                         help="문제 페이지 상세 출력 (최대 50개)")
     sp_lc.set_defaults(func=cmd_link_check)
+
+    sp_cp = sub.add_parser(
+        "compare-publish",
+        help="DokuWiki/Confluence 양측 풀-페이지 스크린샷 + 비교 갤러리 발행/갱신",
+    )
+    _add_confluence_space_args(sp_cp)
+    sp_cp.add_argument("--sample", type=int, default=8,
+                       help="자동 선정 페이지 수 (기본 8). --select 지정 시 무시")
+    sp_cp.add_argument("--select",
+                       help="명시 페이지 list (쉼표 구분 doku_id) — 자동 선정 대체")
+    sp_cp.add_argument("--title",
+                       help="결과 페이지 제목 (기본: 'DokuWiki ↔ Confluence 비교 갤러리 …')")
+    sp_cp.add_argument("--out-dir", default="compare_screenshots",
+                       help="스크린샷 출력 디렉터리 (기본 compare_screenshots/)")
+    sp_cp.add_argument("--no-recapture", action="store_true",
+                       help="기존 PNG 재사용 (캡쳐 skip — 본문/첨부만 재발행)")
+    sp_cp.add_argument("--dry-run", action="store_true",
+                       help="발행 skip, 후보·캡쳐 결과만 출력")
+    sp_cp.add_argument("--dokuwiki-base-url", default=env_default("DOKUWIKI_BASE_URL"),
+                       help="DokuWiki HTTP base URL (스크린샷용)")
+    sp_cp.set_defaults(func=cmd_compare_publish)
 
 
 def _build_wizard_subcommands(sub) -> None:
