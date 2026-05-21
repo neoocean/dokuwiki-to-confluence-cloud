@@ -9843,6 +9843,11 @@ def _compare_clip_oversize(png_path: Path) -> None:
     except ImportError:
         return
     try:
+        # 큰 파일 (>5MB) 은 PIL ImageChops.difference 가 메모리·시간 폭증
+        # — trim skip (그대로 사용). 사용자 발견: u:oh:모든_기록 (13MB+) 가
+        # hang 원인. 5MB 면 일반 페이지엔 영향 없음, 거대 페이지만 보호.
+        if png_path.stat().st_size > 5 * 1024 * 1024:
+            return
         img = Image.open(png_path).convert("RGB")
         # (1) 흰 배경 trim — body 콘텐츠 영역만
         bg = Image.new("RGB", img.size, (255, 255, 255))
@@ -9926,10 +9931,16 @@ def _compare_capture_screenshots(
             try:
                 url_d = f"{dokuwiki_base.rstrip('/')}/doku.php?id={doku_id}"
                 page_d.goto(url_d, wait_until="networkidle", timeout=30_000)
-                # full_page=True 면 Playwright 가 콘텐츠 영역만 정확히 캡쳐 — 빈
-                # viewport 영역 노출 없음. 단 거대 페이지 (이미지 100+ 88000px)
-                # 는 첨부 100MB 한도 초과 위험 → 캡쳐 후 PIL crop 으로 clip.
-                page_d.screenshot(path=str(dwk_path), full_page=True)
+                # viewport clip + full_page=False — 큰 페이지 (수만 px) 의 OOM
+                # 방지. 작은 페이지의 빈 영역은 _compare_clip_oversize 가 PIL
+                # trim 으로 보완.
+                h = page_d.evaluate(
+                    "() => Math.max(document.body.scrollHeight, "
+                    "document.documentElement.scrollHeight)"
+                )
+                cap_h = min(int(h), CAPTURE_MAX_HEIGHT_PX)
+                page_d.set_viewport_size({"width": CAPTURE_VIEWPORT_W, "height": cap_h})
+                page_d.screenshot(path=str(dwk_path), full_page=False)
                 _compare_clip_oversize(dwk_path)
             except Exception as e:  # noqa: BLE001
                 log(f"    DokuWiki 캡쳐 실패: {e}")
@@ -9978,21 +9989,30 @@ def _compare_capture_screenshots(
                         '.conf-macro{padding:6px 0;}'
                         '</style></head><body>' + view_html + '</body></html>'
                     )
-                    # networkidle 로 모든 <img>/외부 리소스 fetch 완료까지 기다림.
-                    # 캡쳐 인증은 ctx_c 의 extra_http_headers 가 처리.
+                    # 첫 시도: networkidle (45초). timeout 시 domcontentloaded
+                    # 로 fallback (외부 리소스 일부 fetch 안 됐어도 캡쳐 진행).
                     try:
-                        page_c.set_content(html, wait_until="networkidle", timeout=45_000)
-                    except Exception as e:  # noqa: BLE001
-                        # networkidle timeout — 외부 리소스 일부 미완. 그래도 캡쳐
-                        # 진행 (대부분 콘텐츠는 이미 렌더됨). 로깅만.
-                        log(f"    [WARN] {doku_id}: set_content 일부 timeout — 캡쳐 계속: {e}")
+                        page_c.set_content(html, wait_until="networkidle", timeout=30_000)
+                    except Exception:
+                        try:
+                            page_c.set_content(html, wait_until="domcontentloaded",
+                                              timeout=15_000)
+                            log(f"    [WARN] {doku_id}: networkidle timeout — "
+                                "domcontentloaded fallback")
+                        except Exception as e:  # noqa: BLE001
+                            log(f"    [WARN] {doku_id}: set_content 실패: {e}")
                     # 폰트/이미지 마저 layout settle 위한 짧은 대기
                     page_c.wait_for_timeout(1_500)
-                    # full_page=True 가 *콘텐츠 영역만* 정확히 캡쳐 (viewport 무관).
-                    # set_viewport_size 동적 조절은 빈 영역 노출 위험 (작은
-                    # 콘텐츠 + 큰 viewport). full_page=True 가 더 정확.
-                    # 거대 페이지는 PIL 로 clip.
-                    page_c.screenshot(path=str(cnf_path), full_page=True)
+                    # viewport clip + full_page=False — 큰 페이지 (수만 px) 의
+                    # OOM 방지. 작은 페이지의 빈 영역은 _compare_clip_oversize
+                    # 가 PIL trim 으로 보완.
+                    h = page_c.evaluate(
+                        "() => Math.max(document.body.scrollHeight, "
+                        "document.documentElement.scrollHeight)"
+                    )
+                    cap_h = min(int(h), CAPTURE_MAX_HEIGHT_PX)
+                    page_c.set_viewport_size({"width": CAPTURE_VIEWPORT_W, "height": cap_h})
+                    page_c.screenshot(path=str(cnf_path), full_page=False)
                     _compare_clip_oversize(cnf_path)
                 else:
                     log(f"    Confluence GET {r.status_code}: {r.text[:150]}")
