@@ -905,28 +905,48 @@ def _convert_monthcal_fallback(soup) -> None:
             a.replace_with(new_node)
 
 
-def _convert_encrypted_passwords(soup) -> None:
-    """`<decrypt>cipher</decrypt>` / `<encrypt>cipher</encrypt>` 를 Confluence
-    expand 매크로 + inline code 로 변환.
+_DECRYPT_RAW_RE = re.compile(
+    r"&lt;(decrypt|encrypt)&gt;(.*?)&lt;/\1&gt;",
+    re.S,
+)
+_DECRYPT_INNER_NOISE_RE = re.compile(
+    r"</?(em|u|strong|i|b|sub|sup|tt|del|ins|span|small|big|s|mark)"
+    r"(?:\s+[^>]*)?>",
+    re.I,
+)
 
-    encryptedpasswords plugin 의 cipher text 는 *그대로 보존* 해야 복호화
-    가능 — 단 평문 노출 방지를 위해 expand (접어두기) 안에 배치, 코드 형식.
 
-    두 케이스:
-    A. encryptedpasswords plugin 활성: DokuWiki 가 plugin syntax 처리 결과를
-       특정 element 로 출력 (보통 <code class="enc"> 또는 비슷). 본 함수는
-       *fallback escape 텍스트만* 처리하므로 plugin 활성이면 통과.
-    B. plugin 미활성 (현 상태): DokuWiki 가 `<decrypt>...</decrypt>` 를 unknown
-       tag 로 escape → 본문에 `&lt;decrypt&gt;cipher&lt;/decrypt&gt;` 텍스트.
-       bs4 는 이 escape 를 풀어서 텍스트 노드로 인식.
+def _preprocess_encrypted_passwords(raw_html: str) -> str:
+    """raw HTML 의 escape 된 `<decrypt>cipher</decrypt>` / `<encrypt>...` 블록을
+    *bs4 파싱 전* 에 직접 Confluence expand + code 매크로로 치환.
+
+    이 단계가 필요한 이유 — cipher 가 multi-line base64 일 때 그 안에 우연히
+    DokuWiki 마크업 시퀀스 (`__`, `//` 등) 가 형성되어 DokuWiki 가 unmatched
+    `<em>` / `<u>` 등 inline tag 를 삽입함. bs4 가 그 inline tag 로 텍스트 노드를
+    split 하면 기존 텍스트-노드 walker `_convert_encrypted_passwords` 가 패턴
+    매치에 실패 → cipher 가 *escape 텍스트로 그대로 본문에 노출* 됨 (보안/가독성
+    문제).
+
+    pre-process 는 escape 텍스트 단계에서 매치하므로 cipher 안 inline tag 영향을
+    받지 않음. 매치된 cipher 는:
+      - inline 마크업 잔재 strip (base64 에 진짜로 들어있지 않음)
+      - whitespace 보존하지만 outer trim
+      - <ac:structured-macro name="expand"> 안 <ac:structured-macro name="code">
+        + CDATA 로 보존 (cipher 원형 그대로 — decrypt 시 사용 가능)
+
+    추가로 매크로 뒤에 비-공백 텍스트가 줄바꿈 없이 이어지는 경우 `\n` 삽입 —
+    Confluence 가 block 매크로 다음 문단을 별개 paragraph 로 인식하도록.
     """
-    from bs4 import BeautifulSoup as _BS, NavigableString
-
-    pattern = _re.compile(r"<(decrypt|encrypt)>([^<>]+)</\1>")
-
-    def _expand_macro(tag: str, cipher: str) -> str:
-        # cipher 그대로 보존 (decrypt 시 사용). escape 만.
-        cipher_esc = _h.escape(cipher)
+    def repl(m: re.Match) -> str:
+        tag = m.group(1)
+        inner = m.group(2)
+        cleaned = _DECRYPT_INNER_NOISE_RE.sub("", inner)
+        cleaned = cleaned.strip()
+        # cipher 안에 있을 수 있는 HTML 엔티티 (`&lt;`, `&amp;` 등) 는 *그대로*
+        # 보존 — bs4 가 텍스트 노드로 인식해 디코드 후 출력. 본 형식은 시각적으로
+        # `<code>&lt;decrypt&gt;cipher&lt;/decrypt&gt;</code>` 로 노출 (cipher
+        # 원형 = decrypt 시 사용 가능).
+        cipher_esc = _h.escape(cleaned)
         return (
             '<ac:structured-macro ac:name="expand">'
             '<ac:parameter ac:name="title">'
@@ -938,22 +958,22 @@ def _convert_encrypted_passwords(soup) -> None:
             '</ac:structured-macro>'
         )
 
-    # 텍스트 노드를 walk 해 <decrypt>...</decrypt> 패턴 매치 시 노드 교체
-    for text_node in list(soup.find_all(string=True)):
-        if not isinstance(text_node, NavigableString):
-            continue
-        s = str(text_node)
-        if "<decrypt>" not in s and "<encrypt>" not in s:
-            continue
-        if not pattern.search(s):
-            continue
-        # 패턴 매치 — 새 노드들로 split
-        new_html = pattern.sub(
-            lambda m: _expand_macro(m.group(1), m.group(2)), s,
-        )
-        # parser 가 위치에 inject
-        wrapper = _BS(f"<span>{new_html}</span>", "html.parser")
-        text_node.replace_with(*list(wrapper.span.children))
+    out = _DECRYPT_RAW_RE.sub(repl, raw_html)
+    # 매크로 종료 바로 뒤에 비-공백 문자가 줄바꿈 없이 붙어 있으면 \n 삽입 — 다음
+    # 단락이 자연스럽게 분리되도록.
+    out = re.sub(r"(</ac:structured-macro>)(\S)", r"\1\n\2", out)
+    return out
+
+
+def _convert_encrypted_passwords(soup) -> None:
+    """`<decrypt>cipher</decrypt>` 변환은 이제 `_preprocess_encrypted_passwords`
+    가 raw HTML 단계에서 처리 — 이 함수는 호출 흐름 보존용 no-op.
+
+    이전 구현 (텍스트 노드 walker) 은 cipher 안에 우연히 형성된 DokuWiki
+    inline 마크업 잔재 (`<em>`, `<u>` 등) 에 의해 텍스트 노드가 split 되면
+    패턴 매치에 실패하는 한계가 있었음. raw HTML 단계의 escape 텍스트에서
+    매치하면 그 영향을 받지 않음."""
+    return
 
 
 def _calendar_iframe_macro(src: str, width: str = "750", height: str = "500") -> str:
@@ -1352,6 +1372,11 @@ def _convert_html_to_storage(
     └─────┴──────────────────────────────────────────────────────┴─────────────────┘
     """
     from bs4 import BeautifulSoup, Comment
+
+    # 0.5) encryptedpasswords escape 텍스트 (multi-line cipher) 를 *파싱 전* 에
+    # 직접 storage 매크로로 치환. cipher 안 inline 마크업 잔재 회피 — 자세한 사유는
+    # _preprocess_encrypted_passwords docstring 참조.
+    raw_html = _preprocess_encrypted_passwords(raw_html)
 
     soup = BeautifulSoup(raw_html, "html.parser")
 
@@ -9560,6 +9585,56 @@ def _compare_select_candidates(
     return chosen2[:sample]
 
 
+def _compare_rewrite_attachment_urls(
+    view_html: str,
+    page_id: str,
+    confluence_origin: str,
+    email: str,
+    token: str,
+) -> str:
+    """view body 안 `<img src=".../wiki/download/attachments/{pid}/{filename}?...">`
+    를 v1 download endpoint URL 로 교체. v1 은 Basic Auth → 302 → media binary
+    로 정상 작동. v2 download URL (`/wiki/download/...`) 은 OAuth 만 받음.
+
+    페이지의 첨부 list 를 한 번 GET 해 filename → attachment_id 매핑.
+    매핑 실패한 src 는 원본 그대로 — 깨진 이미지 아이콘으로 보이지만 본문 손상 없음.
+    """
+    import urllib.parse
+    import requests as _rq
+
+    try:
+        r = _rq.get(
+            f"{confluence_origin}/api/v2/pages/{page_id}/attachments",
+            auth=(email, token), params={"limit": 250}, timeout=30,
+        )
+        if not r.ok:
+            return view_html
+        filename_to_aid = {a.get("title"): a.get("id") for a in r.json().get("results", [])}
+    except Exception:  # noqa: BLE001
+        return view_html
+    if not filename_to_aid:
+        return view_html
+
+    def repl(m: re.Match) -> str:
+        full = m.group(0)
+        src = m.group(2)
+        fn_m = re.search(r"/download/attachments/\d+/([^?]+)", src)
+        if not fn_m:
+            return full
+        filename = urllib.parse.unquote(fn_m.group(1))
+        aid = filename_to_aid.get(filename)
+        if not aid:
+            return full
+        new_src = f"{confluence_origin}/rest/api/content/{page_id}/child/attachment/{aid}/download"
+        return full.replace(src, new_src)
+
+    pattern = re.compile(
+        r'(<img[^>]+src=")([^"]+/download/attachments/\d+/[^"]+)"',
+        re.S,
+    )
+    return pattern.sub(repl, view_html)
+
+
 def _compare_capture_screenshots(
     candidates: list[tuple[str, str, str, str, int]],
     out_dir: Path,
@@ -9594,8 +9669,17 @@ def _compare_capture_screenshots(
         browser = pw.chromium.launch()
         ctx_d = browser.new_context(viewport={"width": 1280, "height": 900})
         page_d = ctx_d.new_page()
-        ctx_c = browser.new_context(viewport={"width": 1280, "height": 900})
+        # Confluence 첨부 이미지 (`/wiki/download/attachments/...`) 는 인증 필요.
+        # ctx 의 extra_http_headers 에 Authorization 추가 → set_content 안 <img>
+        # 가 절대 URL 로 fetch 될 때도 인증 통과.
+        ctx_c = browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            extra_http_headers={"Authorization": auth} if auth else {},
+        )
         page_c = ctx_c.new_page()
+
+        confluence_origin = confluence_base.rstrip("/")
+        # `<base href>` 가 있어야 view body 안 상대 URL 도 정상 resolve.
 
         for i, (_reason, doku_id, _title, cid, _sz) in enumerate(candidates, 1):
             stem = doku_id.replace(":", "_").replace("/", "_")
@@ -9613,7 +9697,14 @@ def _compare_capture_screenshots(
             try:
                 url_d = f"{dokuwiki_base.rstrip('/')}/doku.php?id={doku_id}"
                 page_d.goto(url_d, wait_until="networkidle", timeout=30_000)
-                page_d.screenshot(path=str(dwk_path), full_page=True)
+                # Confluence 측과 동일 clip (12000px) — 양측 비교 시 동일 영역.
+                h = page_d.evaluate(
+                    "() => Math.max(document.body.scrollHeight, "
+                    "document.documentElement.scrollHeight)"
+                )
+                cap_h = min(int(h), 12000)
+                page_d.set_viewport_size({"width": 1280, "height": cap_h})
+                page_d.screenshot(path=str(dwk_path), full_page=False)
             except Exception as e:  # noqa: BLE001
                 log(f"    DokuWiki 캡쳐 실패: {e}")
                 dwk_path = None  # type: ignore
@@ -9621,18 +9712,27 @@ def _compare_capture_screenshots(
             # Confluence — body-format=view 받아 set_content 렌더 (인증 우회)
             try:
                 r = requests.get(
-                    f"{confluence_base.rstrip('/')}/api/v2/pages/{cid}",
+                    f"{confluence_origin}/api/v2/pages/{cid}",
                     auth=(confluence_email, confluence_token),
                     params={"body-format": "view"},
                     timeout=60,
                 )
                 if r.ok:
                     view_html = r.json().get("body", {}).get("view", {}).get("value", "")
+                    # `<img src=".../wiki/download/attachments/{pid}/{filename}?...">` 는
+                    # OAuth 만 받는 endpoint → Basic Auth 실패. v1 endpoint
+                    # (`/rest/api/content/{pid}/child/attachment/{aid}/download`) 는
+                    # Basic Auth → 302 → media binary. 모든 img src 를 rewrite.
+                    view_html = _compare_rewrite_attachment_urls(
+                        view_html, cid, confluence_origin,
+                        confluence_email, confluence_token,
+                    )
                     html = (
                         '<!doctype html><html><head><meta charset="utf-8">'
+                        f'<base href="{confluence_origin}/">'
                         '<style>'
                         'body{font-family:-apple-system,Arial,sans-serif;'
-                        'max-width:1100px;margin:0 auto;padding:24px;line-height:1.5;}'
+                        'max-width:1100px;margin:0 auto;padding:24px;line-height:1.5;color:#222;}'
                         'h1,h2,h3{margin-top:1.2em;}'
                         'img{max-width:100%;height:auto;}'
                         'table{border-collapse:collapse;margin:8px 0;}'
@@ -9643,12 +9743,24 @@ def _compare_capture_screenshots(
                         'blockquote{border-left:3px solid #ccc;padding-left:12px;color:#555;}'
                         '.confluence-information-macro{border:1px solid #ddd;border-radius:4px;'
                         'padding:10px;margin:8px 0;background:#f4f5f7;}'
+                        '.conf-macro{padding:6px 0;}'
                         '</style></head><body>' + view_html + '</body></html>'
                     )
-                    # iframe 외부 fetch 가 느릴 수 있으니 짧은 timeout
-                    page_c.set_content(html, wait_until="domcontentloaded", timeout=15_000)
-                    page_c.wait_for_timeout(500)
-                    page_c.screenshot(path=str(cnf_path), full_page=True)
+                    # networkidle 로 모든 <img>/외부 리소스 fetch 완료까지 기다림.
+                    # 캡쳐 인증은 ctx_c 의 extra_http_headers 가 처리.
+                    page_c.set_content(html, wait_until="networkidle", timeout=45_000)
+                    # 폰트/이미지 마저 layout settle 위한 짧은 대기
+                    page_c.wait_for_timeout(1_500)
+                    # 극단적으로 긴 페이지 (이미지 100+ → 88000px 등) 는 첨부 100MB 한도
+                    # 초과 + 비교 갤러리 비대화 위험. viewport 를 동적 조절해 12000px 까지만
+                    # 캡쳐 (full_page=False 로 clip). 일반 페이지엔 영향 없음.
+                    h = page_c.evaluate(
+                        "() => Math.max(document.body.scrollHeight, "
+                        "document.documentElement.scrollHeight)"
+                    )
+                    cap_h = min(int(h), 12000)
+                    page_c.set_viewport_size({"width": 1280, "height": cap_h})
+                    page_c.screenshot(path=str(cnf_path), full_page=False)
                 else:
                     log(f"    Confluence GET {r.status_code}: {r.text[:150]}")
                     cnf_path = None  # type: ignore
