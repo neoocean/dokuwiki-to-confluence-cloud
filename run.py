@@ -59,6 +59,8 @@ DokuWiki 가 렌더링한 최종 XHTML 을 받아 Confluence storage format 으�
   § verify (시각 검수 + Phase 4)        — DOM/screenshot 비교 + AI vision
   § decrypt / link-check                — encryptedpasswords + 링크 정합성
   § compare-publish                     — 양측 스크린샷 + 비교 갤러리 발행
+  § audit-3way                          — source ↔ rendered ↔ confluence 3-측 invariant
+                                          (docs/3way-audit.md; 사례 A~D 자동 검출)
   § wizard / report-publish             — 대화형 orchestration + 결과 보고
   § argparse                            — `_build_*_subcommands` 9 helper +
                                           `build_parser` orchestrator (메인 진입점)
@@ -10196,7 +10198,525 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
-# § argparse
+# § audit-3way (source ↔ rendered ↔ confluence 3-측 invariant audit)
+#
+# 자세한 시나리오는 docs/3way-audit.md. 본 절은 §6 의 매핑 테이블 +
+# §3 의 신호 함수 + §5 의 명령 구현.
+
+# PLUGIN_RENDER_INVARIANTS (S1 신호용 — S↔D)
+# source 에 marker 가 있는데 rendered 에 결과 element 가 없으면 plugin 누락.
+PLUGIN_RENDER_INVARIANTS: dict[str, dict] = {
+    "htmlok": {
+        # DokuWiki <html>...</html> 또는 <HTML>...</HTML> raw HTML embed
+        "source_re": re.compile(r"</?(html|HTML)>"),
+        "rendered_required": re.compile(r"<iframe\b|<script\b|<embed\b", re.I),
+        "rendered_escape": re.compile(r"&lt;(html|HTML|iframe|script)\b"),
+        "fix_hint": "saggi-dw/dokuwiki-plugin-htmlok 설치 + "
+                    "$conf['plugin']['htmlok']['htmlok'] = 1 활성. "
+                    "DokuWiki Jack Jackrum 부터 <html> core 제거됨.",
+    },
+    "monthcal": {
+        "source_re": re.compile(r"~~monthcal\b|\{\{calendar:"),
+        "rendered_required": re.compile(r'<table[^>]*class="[^"]*monthcal'),
+        "fix_hint": "monthcal plugin 설치 — 또는 _convert_monthcal_fallback 가 "
+                    "정적 표 처리 (변환기 측, INTENDED_TRANSFORMATIONS 화이트리스트).",
+    },
+    "wrap": {
+        "source_re": re.compile(r"<WRAP\b|<wrap\b"),
+        "rendered_required": re.compile(r'<div[^>]*class="wrap_|<em[^>]*class="wrap_'),
+        "fix_hint": "wrap plugin 설치.",
+    },
+    "iframe_plugin": {  # Chris--S iframe plugin (별개 — {{url>...}} syntax)
+        "source_re": re.compile(r"\{\{url>"),
+        "rendered_required": re.compile(r"<iframe\b"),
+        "fix_hint": "Chris--S/dokuwiki-plugin-iframe 설치 + 활성.",
+    },
+    "todo": {
+        "source_re": re.compile(r"<todo\b"),
+        "rendered_required": re.compile(
+            r'<input[^>]*type="checkbox|<ul[^>]*class="(?:todo|plugin_todo)'
+        ),
+        "fix_hint": "todo plugin 설치.",
+    },
+    "include": {
+        "source_re": re.compile(r"\{\{(?:section|page)>|~~INCLUDE\b"),
+        "rendered_required": re.compile(r'class="plugin_include'),
+        "fix_hint": "include plugin 설치.",
+    },
+    "struct": {
+        "source_re": re.compile(r"---- *datatable\b|<datatemplatelist\b"),
+        "rendered_required": re.compile(r'class="(?:plugin_struct|struct_table)'),
+        "fix_hint": "struct plugin 설치. "
+                    "마이그레이션 시 별도 트랙 (docs/struct-migration.md).",
+    },
+    "youtube": {
+        "source_re": re.compile(r"\{\{youtube>"),
+        "rendered_required": re.compile(r'<iframe[^>]*src="[^"]*youtu'),
+        "fix_hint": "youtube plugin 설치 — 또는 _convert_youtube_fallback 가 "
+                    "fallback 변환기 (INTENDED_TRANSFORMATIONS 화이트리스트).",
+    },
+    "encryptedpasswords": {
+        "source_re": re.compile(r"<(?:decrypt|encrypt)>"),
+        "rendered_required": re.compile(
+            r'<span[^>]*class="encryptedpasswords"|&lt;(?:decrypt|encrypt)&gt;'
+        ),
+        "fix_hint": "encryptedpasswords plugin 설치 (dir name = encryptedpasswords/) "
+                    "또는 _preprocess_encrypted_passwords 가 escape 케이스 처리.",
+    },
+}
+
+
+# DOKUWIKI_TO_CONFLUENCE_MACROS (D1 신호용 — D↔C)
+# rendered 의 element 가 confluence 의 매크로/element 로 매핑되어야.
+DOKUWIKI_TO_CONFLUENCE_MACROS: list[dict] = [
+    {
+        "name": "wrap_info",
+        "rendered_re": re.compile(r'<div[^>]*class="[^"]*wrap_info'),
+        "confluence_re": re.compile(r'<ac:structured-macro[^>]*ac:name="info"'),
+        "fix_hint": "_convert_wrap_callouts 의 wrap_info → info 매핑.",
+    },
+    {
+        "name": "wrap_tip",
+        "rendered_re": re.compile(r'<div[^>]*class="[^"]*wrap_tip'),
+        "confluence_re": re.compile(r'<ac:structured-macro[^>]*ac:name="tip"'),
+        "fix_hint": "_convert_wrap_callouts 의 wrap_tip → tip.",
+    },
+    {
+        "name": "wrap_note",
+        "rendered_re": re.compile(r'<div[^>]*class="[^"]*wrap_(?:note|important)'),
+        "confluence_re": re.compile(r'<ac:structured-macro[^>]*ac:name="note"'),
+        "fix_hint": "_convert_wrap_callouts 의 wrap_note/important → note.",
+    },
+    {
+        "name": "wrap_warning",
+        "rendered_re": re.compile(
+            r'<div[^>]*class="[^"]*wrap_(?:warning|alert|danger)'
+        ),
+        "confluence_re": re.compile(r'<ac:structured-macro[^>]*ac:name="warning"'),
+        "fix_hint": "_convert_wrap_callouts 의 wrap_warning/alert/danger → warning.",
+    },
+    {
+        "name": "google_calendar_iframe",
+        "rendered_re": re.compile(r'<iframe[^>]*src="[^"]*calendar\.google'),
+        "confluence_re": re.compile(r'<ac:structured-macro[^>]*ac:name="iframe"'),
+        "fix_hint": "_convert_google_calendar_iframe.",
+    },
+    {
+        "name": "encryptedpasswords_expand",
+        "rendered_re": re.compile(r'<span[^>]*class="encryptedpasswords"'),
+        "confluence_re": re.compile(r'<ac:structured-macro[^>]*ac:name="expand"'),
+        "fix_hint": "_convert_encrypted_passwords (plugin 활성 케이스).",
+    },
+    {
+        "name": "todo_checkbox",
+        "rendered_re": re.compile(r'<input[^>]*type="checkbox"'),
+        "confluence_re": re.compile(
+            r'<ac:task-list\b|<ac:placeholder[^>]*ac:type="checkbox"|\[\s*[xX ]?\s*\]'
+        ),
+        "fix_hint": "_convert_todos — mixed/inline todo 는 [x]/[ ] 텍스트 폴백 (의도).",
+        "intent_always": "todo_inline_text",  # INTENDED 화이트리스트 자동 적용
+    },
+]
+
+
+# INTENDED_TRANSFORMATIONS — 변환기의 의도된 변형 (화이트리스트). 신호 매칭 시
+# 이 케이스로 분류되면 violation 으로 보고하지 않음.
+INTENDED_TRANSFORMATIONS: dict[str, str] = {
+    "monthcal_fallback":
+        "monthcal → 정적 <table> (_convert_monthcal_fallback). source 측 plugin "
+        "누락이어도 변환기가 처리하면 OK.",
+    "smiley_to_emoji":
+        "smiley <img> → unicode emoji (_convert_smileys). image 카운트 mismatch 정상.",
+    "youtube_fallback":
+        "fallback /_media/youtube/<id> → iframe embed (_convert_youtube_fallback).",
+    "todo_inline_text":
+        "inline / mixed todo → [x]/[ ] 텍스트 (보수적). checkbox element 없음 정상.",
+}
+
+
+def _audit_3way_load_source(doku_id: str, dwdata_root: Path) -> str | None:
+    """dokuwiki source `.txt` 본문 읽기. 미존재 시 None.
+
+    doku_id `a:b:c` → `<dwdata>/pages/a/b/c.txt`."""
+    parts = doku_id.split(":")
+    src_path = dwdata_root / "pages"
+    for p in parts:
+        src_path = src_path / p
+    src_path = src_path.with_suffix(".txt")
+    if not src_path.is_file():
+        return None
+    try:
+        return src_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+
+
+def _audit_3way_strip_source_noise(source: str) -> str:
+    """source 의 *코드 블록* 과 *주석* 제거 후 반환 — 매크로 marker 검색 시 거짓
+    양성 회피.
+
+    DokuWiki 의 코드 블록: `<code>...</code>` 또는 `%%...%%` 또는 `''...''`.
+    주석: HTML 식 `<!-- ... -->`.
+    """
+    s = source
+    # HTML 주석
+    s = re.sub(r"<!--.*?-->", "", s, flags=re.S)
+    # <code>...</code> 블록
+    s = re.sub(r"<code[^>]*>.*?</code>", "", s, flags=re.S | re.I)
+    # <file>...</file> 블록 (DokuWiki 의 file syntax)
+    s = re.sub(r"<file[^>]*>.*?</file>", "", s, flags=re.S | re.I)
+    # %%...%% (noformat / nowiki)
+    s = re.sub(r"%%.*?%%", "", s, flags=re.S)
+    # ''...'' (monospace inline) — 잘못 잡힐 위험 있어 보수적으로 skip
+    return s
+
+
+def _audit_3way_signal_S1(
+    source_clean: str, rendered: str
+) -> list[dict]:
+    """S1 — plugin marker / rendered element 부재. source 에 marker 있고
+    rendered 에 결과 element 없으면 plugin 누락 의심.
+
+    Returns list of violation dicts.
+    """
+    out: list[dict] = []
+    for plugin, table_entry in PLUGIN_RENDER_INVARIANTS.items():
+        src_re = table_entry["source_re"]
+        if not src_re.search(source_clean):
+            continue
+        if table_entry["rendered_required"].search(rendered):
+            continue
+        # 매크로가 escape 텍스트로 노출됐는지 (강한 시그니처)
+        esc_re = table_entry.get("rendered_escape")
+        severity = "high" if (esc_re and esc_re.search(rendered)) else "medium"
+        out.append({
+            "signal": "S1.plugin_render_missing",
+            "plugin": plugin,
+            "responsibility": "source",
+            "severity": severity,
+            "fix_hint": table_entry["fix_hint"],
+        })
+    return out
+
+
+_S2_ESCAPE_RE = re.compile(r"&lt;([a-zA-Z][a-zA-Z0-9_-]+)\b")
+
+
+def _audit_3way_signal_S2(rendered: str) -> list[dict]:
+    """S2 — rendered 본문에 `&lt;TAG&gt;` escape 텍스트 노출. plugin 미해석
+    시그니처."""
+    # 본문 텍스트 노드만 — html 구조 안 (속성값 등) 제외 위해 단순 정규식 OK
+    matches = _S2_ESCAPE_RE.findall(rendered)
+    if not matches:
+        return []
+    from collections import Counter
+    counter = Counter(matches)
+    # 흔한 false-positive 제거 (HTML 자체 tag)
+    noise = {"a", "p", "br", "img", "span", "div", "li", "ul", "ol", "table",
+             "tr", "td", "th", "code", "pre", "em", "strong", "i", "b"}
+    filtered = {k: v for k, v in counter.items() if k.lower() not in noise}
+    if not filtered:
+        return []
+    top = sorted(filtered.items(), key=lambda x: -x[1])[:5]
+    return [{
+        "signal": "S2.escape_text_exposed",
+        "tags": top,
+        "responsibility": "source",
+        "severity": "medium",
+        "fix_hint": "rendered 에 매크로 escape 텍스트 노출 — plugin 미해석 의심. "
+                    "S1 결과와 함께 검토.",
+    }]
+
+
+def _audit_3way_signal_D1(
+    rendered: str, confluence: str, intent_whitelist: set[str] | None = None,
+) -> list[dict]:
+    """D1 — rendered 의 매크로 element 카운트 vs confluence 의 매크로 카운트
+    mismatch.
+
+    *변환에서 손실* (rendered > confluence) 만 위반. *추가* (confluence
+    > rendered) 는 변환기가 정상적으로 만들어내는 부속 매크로 (revision
+    header / 첨부 요약 panel 등) 가능성이 더 큼 → 위반 안 함.
+
+    entry 의 `intent_always` 있으면 INTENDED_TRANSFORMATIONS 화이트리스트
+    자동 적용 (예: todo_checkbox 의 inline 격하).
+    """
+    out: list[dict] = []
+    intent = intent_whitelist or set()
+    for entry in DOKUWIKI_TO_CONFLUENCE_MACROS:
+        name = entry["name"]
+        # 화이트리스트 자동 적용
+        if entry.get("intent_always") in INTENDED_TRANSFORMATIONS:
+            continue
+        if name in intent:
+            continue
+        rendered_count = len(entry["rendered_re"].findall(rendered))
+        confluence_count = len(entry["confluence_re"].findall(confluence))
+        if rendered_count == 0 and confluence_count == 0:
+            continue
+        if rendered_count <= confluence_count:
+            # 변환 시 추가는 정상 (revision header 등). 손실만 위반.
+            continue
+        out.append({
+            "signal": "D1.macro_count_loss",
+            "macro": name,
+            "rendered_count": rendered_count,
+            "confluence_count": confluence_count,
+            "loss": rendered_count - confluence_count,
+            "responsibility": "converter",
+            "severity": "high",
+            "fix_hint": entry["fix_hint"],
+        })
+    return out
+
+
+# wrap 의 *알려진* 의미 클래스. 이 외 wrap_X 는 *unknown* — color/layout 추정.
+_WRAP_KNOWN_CLASSES = {
+    "wrap_info", "wrap_tip", "wrap_note", "wrap_important",
+    "wrap_alert", "wrap_warning", "wrap_danger",
+    "wrap_em", "wrap_hi", "wrap_box", "wrap_round",
+    "wrap_left", "wrap_right", "wrap_center", "wrap_indent",
+    "wrap_clear", "wrap_safari", "wrap_help",
+}
+_WRAP_CLASS_RE = re.compile(r'<div[^>]*class="([^"]*wrap_[a-z]+[^"]*)"')
+
+
+def _audit_3way_signal_D2(rendered: str, confluence: str) -> list[dict]:
+    """D2 — 색상 wrap → 코드블록 오변환 (사용자 발견 사례 D).
+
+    rendered 에 *unknown* wrap 클래스 (예: wrap_color) 가 있는데 confluence 에
+    code 매크로가 비정상적으로 많으면 변환기가 wrap → code 로 잘못 매핑한 의심.
+    """
+    found_unknown_wraps = []
+    for cls_attr in _WRAP_CLASS_RE.findall(rendered):
+        classes = cls_attr.split()
+        for c in classes:
+            if c.startswith("wrap_") and c not in _WRAP_KNOWN_CLASSES:
+                found_unknown_wraps.append(c)
+    if not found_unknown_wraps:
+        return []
+    code_count = confluence.count('ac:name="code"')
+    pre_count = rendered.count("<pre>") + rendered.count('<pre ')
+    code_excess = code_count - pre_count
+    if code_excess > 0:
+        return [{
+            "signal": "D2.wrap_color_to_code_misroute",
+            "unknown_wraps": list(set(found_unknown_wraps))[:10],
+            "code_excess": code_excess,
+            "responsibility": "converter",
+            "severity": "high",
+            "fix_hint": "_convert_wrap_callouts 의 unknown wrap_class fallback — "
+                        "code 로 가지 말고 panel 또는 일반 div 로.",
+        }]
+    return []
+
+
+def _audit_3way_signal_D3(rendered: str, confluence: str) -> list[dict]:
+    """D3 — 이미지 cluster 분리 (사용자 발견 사례 C).
+
+    rendered 의 `<p>` 안에 `<img>` 3+ 인라인 그룹이 confluence 에서 별도
+    block 으로 분리됐는지. 간단 휴리스틱.
+    """
+    # rendered: <p>...<img/>...<img/>...<img/>...</p> 패턴 (3+ img in one p)
+    rendered_clusters = 0
+    for p_match in re.finditer(r"<p\b[^>]*>(.*?)</p>", rendered, re.S):
+        body = p_match.group(1)
+        if body.count("<img") >= 3:
+            rendered_clusters += 1
+    if rendered_clusters == 0:
+        return []
+    # confluence: <p>...<ac:image>...<ac:image>...<ac:image>...</p>
+    confluence_clusters = 0
+    for p_match in re.finditer(r"<p\b[^>]*>(.*?)</p>", confluence, re.S):
+        body = p_match.group(1)
+        if body.count("<ac:image") >= 3:
+            confluence_clusters += 1
+    if confluence_clusters < rendered_clusters:
+        return [{
+            "signal": "D3.image_cluster_split",
+            "rendered_clusters": rendered_clusters,
+            "confluence_clusters": confluence_clusters,
+            "responsibility": "converter",
+            "severity": "medium",
+            "fix_hint": "img 인라인 group 보존 — Confluence 에서도 같은 <p> 안 "
+                        "또는 ac:layout 으로 그룹 유지.",
+        }]
+    return []
+
+
+def _audit_3way_analyze(
+    doku_id: str,
+    source: str | None,
+    rendered: str | None,
+    confluence: str | None,
+) -> dict:
+    """3-측 데이터로 신호 S1/S2/D1/D2/D3 모두 계산 후 종합.
+
+    Returns dict — {doku_id, violations: [...], severity_counts: {...}}.
+    """
+    violations: list[dict] = []
+
+    # 화이트리스트 — 페이지가 monthcal_fallback 변환기에 의해 처리됐는지 검출
+    intent: set[str] = set()
+    if rendered and confluence:
+        # _convert_monthcal_fallback 의 시그니처 — 변환기가 정적 표 생성
+        # (dwc-monthcal 클래스 등 — 변환기 본문 안 표 마커)
+        # 본 단계에선 간단히 source 의 monthcal marker 가 있고 confluence 가
+        # 정적 표 (caption 일치) 면 intent 로 분류.
+        if re.search(r"~~monthcal\b|\{\{calendar:", source or ""):
+            if re.search(r'<th[^>]*>(?:일|월|화|수|목|금|토)</th>', confluence):
+                intent.add("monthcal_fallback")
+                # S1.monthcal 위반은 화이트리스트 — 별도 violation 추가 안 함
+
+    # S 그룹 (S↔D)
+    if source is not None and rendered is not None:
+        source_clean = _audit_3way_strip_source_noise(source)
+        s1 = _audit_3way_signal_S1(source_clean, rendered)
+        # monthcal_fallback 화이트리스트 시 S1.monthcal 도 제거
+        if "monthcal_fallback" in intent:
+            s1 = [v for v in s1 if v.get("plugin") != "monthcal"]
+        violations.extend(s1)
+        violations.extend(_audit_3way_signal_S2(rendered))
+
+    # D 그룹 (D↔C)
+    if rendered is not None and confluence is not None:
+        violations.extend(_audit_3way_signal_D1(rendered, confluence, intent))
+        violations.extend(_audit_3way_signal_D2(rendered, confluence))
+        violations.extend(_audit_3way_signal_D3(rendered, confluence))
+
+    # severity 카운트
+    counts = {"source_high": 0, "source_medium": 0,
+              "converter_high": 0, "converter_medium": 0,
+              "converter_low": 0, "inconclusive": 0}
+    for v in violations:
+        key = f"{v['responsibility']}_{v['severity']}"
+        if key in counts:
+            counts[key] += 1
+    return {
+        "doku_id": doku_id,
+        "violations": violations,
+        "severity_counts": counts,
+        "intent": list(intent),
+    }
+
+
+def cmd_audit_3way(args: argparse.Namespace) -> int:
+    """audit-3way: source ↔ rendered ↔ confluence 3-측 invariant audit.
+
+    각 페이지의 dokuwiki source (.txt) + rendered (raw/*.html) + confluence
+    storage (storage/*.xml) 를 받아 docs/3way-audit.md §3 의 신호 (S1/S2 +
+    D1/D2/D3) 모두 계산 후 violation 분류 (source vs converter).
+
+    state.db 변경 없음 (read-only). 출력은 JSON 또는 stdout.
+    """
+    conn = db_connect(args.db)
+
+    # 대상 페이지 선정
+    if args.only:
+        rows = conn.execute(
+            "SELECT doku_id FROM pages WHERE doku_id=?", (args.only,)
+        ).fetchall()
+    elif args.sample:
+        rows = conn.execute(
+            "SELECT doku_id FROM pages "
+            "WHERE confluence_page_id IS NOT NULL AND storage_path IS NOT NULL "
+            "ORDER BY RANDOM() LIMIT ?",
+            (args.sample,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT doku_id FROM pages "
+            "WHERE confluence_page_id IS NOT NULL AND storage_path IS NOT NULL "
+            "ORDER BY doku_id"
+        ).fetchall()
+    target_ids = [r[0] for r in rows]
+    log(f"audit-3way 대상: {len(target_ids)} 페이지")
+
+    # dokuwiki source 디렉터리 결정
+    dwdata = None
+    if args.with_source:
+        dwdata_path = args.dokuwiki_data or db_get_meta(conn, "dokuwiki_src")
+        if dwdata_path:
+            dwdata = Path(dwdata_path).expanduser().resolve()
+            if not (dwdata / "pages").is_dir():
+                log(f"  [WARN] dwdata/pages 부재: {dwdata} — --with-source 무시")
+                dwdata = None
+        else:
+            log("  [WARN] --with-source 지정됐으나 dokuwiki_src 미발견. "
+                "--dokuwiki-data 명시 또는 discover 먼저.")
+
+    # 결과 집계
+    all_results: list[dict] = []
+    summary = {"source_high": 0, "source_medium": 0,
+               "converter_high": 0, "converter_medium": 0,
+               "converter_low": 0, "inconclusive": 0,
+               "pages_with_violation": 0,
+               "pages_clean": 0}
+
+    for i, doku_id in enumerate(target_ids, 1):
+        # source 읽기 (옵션)
+        source = _audit_3way_load_source(doku_id, dwdata) if dwdata else None
+        # rendered 읽기
+        raw_path = RAW_DIR / Path(*doku_id.split(":")).with_suffix(".html")
+        rendered = raw_path.read_text(encoding="utf-8", errors="ignore") \
+            if raw_path.is_file() else None
+        # confluence storage 읽기 (로컬)
+        storage_row = conn.execute(
+            "SELECT storage_path FROM pages WHERE doku_id=?", (doku_id,)
+        ).fetchone()
+        storage_path = storage_row[0] if storage_row else None
+        confluence = None
+        if storage_path and Path(storage_path).is_file():
+            confluence = Path(storage_path).read_text(encoding="utf-8", errors="ignore")
+
+        result = _audit_3way_analyze(doku_id, source, rendered, confluence)
+        all_results.append(result)
+
+        if result["violations"]:
+            summary["pages_with_violation"] += 1
+        else:
+            summary["pages_clean"] += 1
+        for key, cnt in result["severity_counts"].items():
+            summary[key] = summary.get(key, 0) + cnt
+
+        # 진행 출력
+        if i % 100 == 0 or i == len(target_ids):
+            log(f"  [{i}/{len(target_ids)}] 진행...")
+
+    # 출력
+    log("=== audit-3way 요약 ===")
+    log(f"  페이지 전체: {len(target_ids)}")
+    log(f"  violation 있는 페이지: {summary['pages_with_violation']}")
+    log(f"  깨끗한 페이지:         {summary['pages_clean']}")
+    log(f"  source.high:     {summary['source_high']}")
+    log(f"  source.medium:   {summary['source_medium']}")
+    log(f"  converter.high:  {summary['converter_high']}")
+    log(f"  converter.medium:{summary['converter_medium']}")
+
+    # JSON 출력 (선택)
+    if args.output_json:
+        out_path = Path(args.output_json)
+        out_path.write_text(
+            _json.dumps({"summary": summary, "results": all_results},
+                        ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        log(f"  JSON 결과: {out_path}")
+
+    # severity threshold 에 따른 exit code
+    threshold = args.severity_threshold
+    if threshold == "high":
+        bad = summary["source_high"] + summary["converter_high"]
+    elif threshold == "medium":
+        bad = (summary["source_high"] + summary["converter_high"]
+               + summary["source_medium"] + summary["converter_medium"])
+    else:
+        bad = 0
+    conn.close()
+    return 0 if bad == 0 else 1
+
+
+
 
 def env_default(key: str, fallback: str = "") -> str:
     return os.environ.get(key, fallback)
@@ -10447,6 +10967,26 @@ def _build_audit_report_subcommands(sub) -> None:
     )
     sp_lint.add_argument("--limit", type=int, default=20, help="실패 항목 출력 최대 개수")
     sp_lint.set_defaults(func=cmd_lint)
+
+    sp_3way = sub.add_parser(
+        "audit-3way",
+        help="source ↔ rendered ↔ confluence 3-측 invariant audit "
+             "(docs/3way-audit.md)",
+    )
+    sp_3way.add_argument("--only", help="특정 doku_id 만 검사")
+    sp_3way.add_argument("--sample", type=int, help="UPLOADED 중 무작위 N 페이지")
+    sp_3way.add_argument("--with-source", action="store_true",
+                         help="dokuwiki source `.txt` 도 읽어 S↔D 신호 활성 "
+                              "(--dokuwiki-data 또는 state.db meta dokuwiki_src 사용)")
+    sp_3way.add_argument("--dokuwiki-data",
+                         help="dokuwiki dwdata 디렉터리 경로 (--with-source 시)")
+    sp_3way.add_argument("--output-json", help="결과 JSON 저장 경로")
+    sp_3way.add_argument(
+        "--severity-threshold", default="high",
+        choices=("none", "high", "medium"),
+        help="exit code 1 임계점 (기본: high 이상이면 1)",
+    )
+    sp_3way.set_defaults(func=cmd_audit_3way)
 
 
 def _build_verify_subcommands(sub) -> None:
