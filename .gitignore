@@ -38,3 +38,7 @@ venv/
 
 # Claude Code local state
 .claude/
+
+# Operational memory — P4 에는 유지 (운영 메모, 인스턴스별 함정/배운 점),
+# GitHub 공개 미러에는 노출 안 시킴
+docs/MEMORY.md
