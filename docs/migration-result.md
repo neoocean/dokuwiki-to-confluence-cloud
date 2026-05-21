@@ -33,7 +33,8 @@ CL 53121-53269. *대규모 변환기 보강 + 라이브 적용 사이클*.
 | `_convert_monthcal_fallback` | monthcal 매크로 미설치 fallback → 정적 캘린더 `<table>` (요일 헤더 + 날짜 셀 + namespace dwc-link) | 105 매크로 / 10+ 페이지 |
 | `_convert_youtube_fallback` | `{{youtube>VID}}` 깨진 fallback → Confluence iframe (youtube embed) | 본 인스턴스 0건 (사용자 데이터엔 정상 hyperlink) |
 | `_convert_google_calendar_iframe` | Google Calendar `<iframe>` 또는 escape 된 텍스트 → Confluence iframe 매크로 | 1 페이지 |
-| `_convert_encrypted_passwords` | `<decrypt>cipher</decrypt>` escape 텍스트 → Confluence expand + inline code (cipher 보존) | 11건 / 5 페이지 |
+| `_convert_encrypted_passwords` | (1) plugin 미활성 escape `<decrypt>...</decrypt>` raw HTML pre-process (2) plugin 활성 `<span class="encryptedpasswords" title="cipher">` → expand + inline code (cipher 보존) | 11건 / 6 페이지 |
+| `_preprocess_encrypted_passwords` | raw HTML 단계 escape `&lt;decrypt&gt;...&lt;/decrypt&gt;` → expand + code 매크로 (multi-line cipher 안 inline 마크업 잔재 회피 + `</decrypt>` 뒤 자동 줄바꿈) | (위 통합) |
 | `_convert_todos` 강화 | mixed ul / li 안 todo + 텍스트 / inline → task-list (single-task) / 또는 unicode 글리프 | 5,285 `<todo>` 매크로 영향 |
 | `_revision_header(fmt=)` | 8 형식 (none/panel/info/note/tip/warning/quote/table/paragraphs) — 기본 panel + shift+enter | 1,565 페이지 |
 
@@ -45,6 +46,7 @@ CL 53121-53269. *대규모 변환기 보강 + 라이브 적용 사이클*.
 | `decrypt` | encryptedpasswords cipher 복호화 (OpenSSL AES-256-CBC + EVP_BytesToKey MD5). `-p PASS --cipher / --page / --confluence-id` |
 | `link-check` | Confluence 측 페이지의 (1) dwc-link 잔존 (2) unresolved page title (3) external URL HEAD |
 | `history-rewrite-headers` | 이미 업로드된 페이지의 revision 헤더만 새 형식으로 재PUT. 기존 모양 자동 감지·strip |
+| `compare-publish` | 주요 페이지의 DokuWiki/Confluence 양측 풀-페이지 스크린샷을 캡쳐해 Confluence 루트 페이지 하위에 비교 갤러리 발행/갱신. 10 카테고리 자동 selection (메인/iframe/encrypt/표/이미지/info·note·warning/매크로 다양/코드/대용량) + per-category count (`sample/8`) 로 `--sample 20` 같은 큰 갤러리도 지원 |
 
 ## §3 결정적 발견
 
@@ -89,6 +91,21 @@ CL 53121-53269. *대규모 변환기 보강 + 라이브 적용 사이클*.
   `_struct_post_page`, `_diff_page`, `_vc_pil_open`, `_wizard_get`, q1, etc).
   `from __future__ import annotations` 활성 → 외부 import 없는 forward ref 안전
 - 전체 164 tests 무회귀, 모든 helper 분리는 순수 구조 리팩토링 (동작 동일)
+
+## §6 비교 갤러리 + 후속 issue fix 사이클 (Day 5 후반)
+
+사용자 검토 중 발견된 4개 issue 를 한 사이클로 fix:
+
+| issue | 원인 | fix |
+|-------|------|-----|
+| 비교 갤러리의 Confluence 측 이미지 깨짐 | `/wiki/download/attachments/...` 는 OAuth 만 받음 (Basic 거부) + 캡쳐 ctx 인증 헤더 누락 | `_compare_rewrite_attachment_urls` (v1 endpoint 으로 src rewrite) + ctx_c 의 `extra_http_headers={"Authorization": ...}` + `<base href>` 추가 |
+| 비교 갤러리의 Confluence 측 빈 페이지 | `wait_until="domcontentloaded"` + 짧은 wait — 미완성 렌더에서 캡쳐 | `networkidle` + `wait_for_timeout(1500ms)` |
+| BnSR 같은 거대 페이지 (이미지 100+) 가 110MB PNG | 풀-페이지 캡쳐가 모든 콘텐츠 다 포함 | 페이지 scrollHeight 측정 후 viewport 동적 조절 → 12000px clip (첨부 100MB 한도 + 갤러리 비대화 회피) |
+| lightsail 의 decrypt cipher 가 escape 텍스트로 노출 | cipher 안 우연히 형성된 DokuWiki 마크업 잔재 (`<em>`, `<u>` 등) 로 텍스트 노드 split → walker 매치 실패 | raw HTML 단계 pre-process `_preprocess_encrypted_passwords` 추가 (bs4 파싱 전에 직접 storage 매크로 치환). 또한 plugin 활성 시 `<span class="encryptedpasswords" title="...">` 도 별도 변환 |
+| u:lam:calendar 의 `<html><iframe>` 가 escape 텍스트로 노출 | DokuWiki Jack Jackrum (2023-04) 부터 `<html>...</html>` core 매크업 제거 | saggi-dw/dokuwiki-plugin-htmlok 설치 + plugin conf 활성. (encrypt 디렉터리 → encryptedpasswords rename 도 같이) |
+
+비교 갤러리 (cid=2526937148) 8 페이지 → 20 페이지 갱신, 첨부 40/40 OK,
+이미지·표·iframe 모두 정상.
 
 ---
 
