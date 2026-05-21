@@ -62,6 +62,25 @@ DokuWiki 가 렌더링한 최종 XHTML 을 받아 Confluence storage format 으�
   § wizard / report-publish             — 대화형 orchestration + 결과 보고
   § argparse                            — `_build_*_subcommands` 9 helper +
                                           `build_parser` orchestrator (메인 진입점)
+
+## Import 정책
+
+- *top-level*: 표준 라이브러리 + 모든 명령이 의존하는 외부 (`requests`,
+  `beautifulsoup4`) — 미설치 시 즉시 에러.
+- *함수 내부 lazy import*: **옵션 의존성만** — `playwright`, `PIL`,
+  `imagehash`, `anthropic`, `Crypto/pycryptodome`, `pytesseract`,
+  `requests_toolbelt`. 특정 명령 (verify --with-vision, compare-publish 등)
+  에서만 필요. 미설치여도 다른 명령 영향 없음.
+- 새 helper 작성 시 위 정책에 맞춰 결정.
+
+## 예외 처리 정책
+
+- `try: ... except Exception` 는 *비핵심 경로의 silent 실패만 흡수* 의도:
+  (1) 옵션 의존성 미설치, (2) audit / verify 의 분석 신호 fallback,
+  (3) Playwright 캡쳐 timeout. 핵심 데이터 (페이지/첨부 본문 PUT) 는
+  `requests.RequestException` 같은 구체 type 으로 처리.
+- `# noqa: BLE001` 표기는 위 의도 명시 (linter 의 broad-except 경고 suppress).
+- 새 광범위 except 추가 시 위 카테고리 어디에 속하는지 1줄 주석 권장.
 """
 
 from __future__ import annotations
@@ -514,6 +533,8 @@ def cmd_render(args: argparse.Namespace) -> int:
     session = requests.Session()
     if args.user and args.password:
         # DokuWiki 의 form 로그인. ?do=login 의 POST 로 세션 쿠키 획득.
+        # _request_with_retry 우회 의도: 로그인 실패는 retry 무의미 (자격증명 오타),
+        # 즉시 종료가 사용자에게 더 빠른 피드백.
         login_resp = session.post(
             f"{base_url}/doku.php",
             data={"do": "login", "u": args.user, "p": args.password},
@@ -541,6 +562,9 @@ def cmd_render(args: argparse.Namespace) -> int:
     for (doku_id,) in rows:
         url = f"{base_url}/doku.php"
         try:
+            # _request_with_retry 우회 의도: 로컬 DokuWiki 가 일관 빠르고
+            # 페이지마다 1회 호출. 실패 시 페이지 1건만 status=FAILED 로 두고
+            # 다음 페이지 진행 — 사용자 입장에선 retry 보다 빠른 batch 가 우선.
             resp = session.get(
                 url,
                 params={"id": doku_id, "do": "export_xhtmlbody"},
@@ -1918,7 +1942,18 @@ def cmd_convert(args: argparse.Namespace) -> int:
 
 # § S4~S6: Upload
 
-MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024  # 100MB
+MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024  # Confluence Cloud 첨부 한도 (100MB)
+# Confluence 본문 한도 — 직접 노출은 안 됨, 5MB 부근에서 400 + "body too long"
+# 응답. rewrite-oversized-pages 가 그 한도 초과 페이지 skeleton 폴백 처리.
+
+# § Confluence API 공통 상수 (retry / 캡쳐)
+REQUEST_MAX_RETRIES = 6           # _request_with_retry 의 시도 횟수 (429 + 5xx)
+REQUEST_BACKOFF_MAX_SEC = 60.0    # 지수 백오프 상한
+CAPTURE_VIEWPORT_W = 1280         # Playwright viewport 폭 (DokuWiki / Confluence 양측)
+CAPTURE_VIEWPORT_H = 900          # Playwright viewport 초기 높이 (캡쳐 시 동적 조절)
+CAPTURE_MAX_HEIGHT_PX = 12000     # full-page 캡쳐 height clip — 이미지 100+ 페이지가
+                                  # 100MB 첨부 한도 초과 + 갤러리 비대화 회피
+                                  # (자세한 사유는 docs/MEMORY.md "배운 점" 참조)
 
 
 CREDENTIAL_HELP = """
@@ -2022,13 +2057,13 @@ def _request_with_retry(session, method: str, url: str, **kwargs) -> "requests.R
 
     delay = 1.0
     last_resp = None
-    for _attempt in range(6):
+    for _attempt in range(REQUEST_MAX_RETRIES):
         try:
             resp = session.request(method, url, timeout=kwargs.pop("timeout", 60), **kwargs)
         except requests.RequestException as e:
             log(f"    네트워크 에러, {delay}s 대기: {e}")
             time.sleep(delay)
-            delay = min(delay * 2, 60.0)
+            delay = min(delay * 2, REQUEST_BACKOFF_MAX_SEC)
             continue
         last_resp = resp
         if resp.status_code < 400:
@@ -2038,12 +2073,12 @@ def _request_with_retry(session, method: str, url: str, **kwargs) -> "requests.R
             wait = float(ra) if ra and ra.replace(".", "", 1).isdigit() else delay
             log(f"    429, {wait}s 대기 후 재시도")
             time.sleep(wait)
-            delay = min(delay * 2, 60.0)
+            delay = min(delay * 2, REQUEST_BACKOFF_MAX_SEC)
             continue
         if 500 <= resp.status_code < 600:
             log(f"    {resp.status_code}, {delay}s 대기 후 재시도")
             time.sleep(delay)
-            delay = min(delay * 2, 60.0)
+            delay = min(delay * 2, REQUEST_BACKOFF_MAX_SEC)
             continue
         return resp
     return last_resp
@@ -2327,6 +2362,9 @@ def _upload_attachments_for_page(
 
         url = f"{base_url}/rest/api/content/{confluence_page_id}/child/attachment"
         try:
+            # _request_with_retry 우회 의도: multipart streaming body — retry 시
+            # 파일 핸들 재사용 불가. 같은 파일명 충돌은 200 으로 처리 (호출자
+            # 측에서 UPLOADED 로 마킹).
             with open(src_path, "rb") as fp:
                 m = tb_encoder.MultipartEncoder(
                     fields={"file": (filename, fp, "application/octet-stream")}
@@ -3098,6 +3136,8 @@ def cmd_history_render(args: argparse.Namespace) -> int:
     HISTORY_RAW_DIR.mkdir(exist_ok=True)
     session = requests.Session()
     if args.user and args.password:
+        # _request_with_retry 우회 의도: DokuWiki form 로그인 (cmd_render 와 동일
+        # 패턴). 실패 시 retry 무의미 — 자격증명 오타.
         session.post(
             f"{base_url}/doku.php",
             data={"do": "login", "u": args.user, "p": args.password},
@@ -3120,6 +3160,8 @@ def cmd_history_render(args: argparse.Namespace) -> int:
     for i, (doku_id, rev_ts) in enumerate(rows, 1):
         url = f"{base_url}/doku.php"
         try:
+            # _request_with_retry 우회 의도: cmd_render 동일 패턴 — DokuWiki
+            # 로컬 호출, 실패 시 1건만 FAILED 로 두고 다음 진행.
             resp = session.get(
                 url,
                 params={"id": doku_id, "rev": rev_ts, "do": "export_xhtmlbody"},
@@ -4965,6 +5007,9 @@ def cmd_rewrite_oversized_pages(args: argparse.Namespace) -> int:
         zip_name = f"{doku_id.replace(':', '_')}.xml.zip"
 
         # 첨부 업로드 — v1 multipart
+        # _request_with_retry 우회 의도: multipart streaming + 본 작업은
+        # cmd_rewrite_oversized 의 *대형* 첨부 (10MB+ zip) 라 retry 시 비용 큼.
+        # 실패 시 호출자 측 status='FAILED' 마킹.
         from requests_toolbelt.multipart import encoder as tb_encoder
         m = tb_encoder.MultipartEncoder(
             fields={"file": (zip_name, io.BytesIO(zip_bytes), "application/zip")}
@@ -9768,13 +9813,13 @@ def _compare_capture_screenshots(
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
-        ctx_d = browser.new_context(viewport={"width": 1280, "height": 900})
+        ctx_d = browser.new_context(viewport={"width": CAPTURE_VIEWPORT_W, "height": CAPTURE_VIEWPORT_H})
         page_d = ctx_d.new_page()
         # Confluence 첨부 이미지 (`/wiki/download/attachments/...`) 는 인증 필요.
         # ctx 의 extra_http_headers 에 Authorization 추가 → set_content 안 <img>
         # 가 절대 URL 로 fetch 될 때도 인증 통과.
         ctx_c = browser.new_context(
-            viewport={"width": 1280, "height": 900},
+            viewport={"width": CAPTURE_VIEWPORT_W, "height": CAPTURE_VIEWPORT_H},
             extra_http_headers={"Authorization": auth} if auth else {},
         )
         page_c = ctx_c.new_page()
@@ -9803,8 +9848,8 @@ def _compare_capture_screenshots(
                     "() => Math.max(document.body.scrollHeight, "
                     "document.documentElement.scrollHeight)"
                 )
-                cap_h = min(int(h), 12000)
-                page_d.set_viewport_size({"width": 1280, "height": cap_h})
+                cap_h = min(int(h), CAPTURE_MAX_HEIGHT_PX)
+                page_d.set_viewport_size({"width": CAPTURE_VIEWPORT_W, "height": cap_h})
                 page_d.screenshot(path=str(dwk_path), full_page=False)
             except Exception as e:  # noqa: BLE001
                 log(f"    DokuWiki 캡쳐 실패: {e}")
@@ -9859,8 +9904,8 @@ def _compare_capture_screenshots(
                         "() => Math.max(document.body.scrollHeight, "
                         "document.documentElement.scrollHeight)"
                     )
-                    cap_h = min(int(h), 12000)
-                    page_c.set_viewport_size({"width": 1280, "height": cap_h})
+                    cap_h = min(int(h), CAPTURE_MAX_HEIGHT_PX)
+                    page_c.set_viewport_size({"width": CAPTURE_VIEWPORT_W, "height": cap_h})
                     page_c.screenshot(path=str(cnf_path), full_page=False)
                 else:
                     log(f"    Confluence GET {r.status_code}: {r.text[:150]}")
@@ -9982,6 +10027,8 @@ def _compare_attach_screenshots(
             if not p or not Path(str(p)).is_file():
                 continue
             try:
+                # _request_with_retry 우회 의도: multipart streaming PNG.
+                # 같은 파일명 이미 있으면 자동 새 버전 (minorEdit=true).
                 with open(p, "rb") as fp:
                     m = tb_encoder.MultipartEncoder(
                         fields={
