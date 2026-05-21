@@ -385,6 +385,12 @@ def title_from_doku_id(doku_id: str) -> str:
 
 
 def cmd_discover(args: argparse.Namespace) -> int:
+    """S1: DokuWiki 데이터 디렉터리를 스캔해 페이지/첨부 트리를 state.db 에 등록.
+
+    state.db 갱신: `pages` (status='DISCOVERED'), `attachments` (status=
+    'DISCOVERED'), `meta` (dokuwiki_src). 멱등 — 이미 발견된 항목은 SKIP,
+    삭제된 페이지는 *제거 안 함* (history/audit 추적용 보존).
+    """
     src = Path(args.src).expanduser().resolve()
     pages_root = src / "pages"
     meta_root = src / "meta"
@@ -483,6 +489,12 @@ def cmd_discover(args: argparse.Namespace) -> int:
 # § S2: Render
 
 def cmd_render(args: argparse.Namespace) -> int:
+    """S2: DISCOVERED 페이지마다 DokuWiki `?do=export_xhtmlbody` 받아 `raw/`에 저장.
+
+    state.db 갱신: `pages.raw_xhtml_path / rendered_at`, status='RENDERED'.
+    `--force` 면 RENDERED 도 재 fetch. 실패 시 status='FAILED' + last_error.
+    멱등 — `--force` 없으면 RENDERED 페이지는 SKIP.
+    """
     try:
         import requests
     except ImportError:
@@ -1731,6 +1743,14 @@ def _convert_html_to_storage(
 
 
 def cmd_convert(args: argparse.Namespace) -> int:
+    """S3: RENDERED 페이지의 raw XHTML 을 Confluence storage XML 로 변환.
+
+    state.db 갱신: `pages.storage_path / content_hash / converted_at`, status=
+    'CONVERTED'. 변환 흐름 + 매크로 매핑 표는 `_convert_html_to_storage` 의
+    docstring 참고. `links` 와 `attachments` 테이블도 채움 (rewrite-links /
+    upload 에서 사용). `--force` 면 UPLOADED 도 다시 변환 (storage 갱신
+    후 content_hash 변경 시 다음 upload 가 PUT).
+    """
     try:
         import bs4  # noqa: F401
     except ImportError:
@@ -2426,6 +2446,15 @@ def _upload_select_targets(
 
 
 def cmd_upload(args: argparse.Namespace) -> int:
+    """S4~S6: CONVERTED 페이지 + 첨부를 Confluence 에 PUT/POST.
+
+    부모-자식 BFS 로 순회 — 자식 페이지 POST 전에 부모 페이지 보장. 멱등
+    short-circuit: 같은 content_hash 재발행 안 함. 첨부는 v1 multipart
+    (같은 파일명이면 새 버전). state.db 갱신: `pages.confluence_page_id /
+    confluence_version / uploaded_at`, status='UPLOADED'. 첨부도 같은
+    필드. `--dry-run` 으로 호출 그래프만 검증 가능. 400 (title 충돌) 시
+    자동 disambiguate.
+    """
     missing = _upload_validate_args(args)
     if missing:
         log("upload 호출에 필요한 항목이 누락되었습니다:")
@@ -2715,6 +2744,16 @@ def _rewrite_links_in_xml(
 
 
 def cmd_rewrite_links(args: argparse.Namespace) -> int:
+    """S7: storage XML 안의 `dwc-link:<doku_id>` placeholder 를 `<ac:link>
+    <ri:page>` 매크로로 치환 (2-pass).
+
+    1-pass: 모든 페이지가 confluence_page_id 를 가질 때까지 대기 (upload
+    완료 후). 2-pass: 본문 PUT 으로 placeholder → 실제 링크. unresolved
+    page (doku_id 가 state.db 에 없거나 미업로드) 는 평문으로 격하 (시각
+    경고 + `dwc-unresolved-page` class).
+    state.db 갱신: 본문 PUT 시 confluence_version 증가. 멱등 — 이미
+    placeholder 가 없는 페이지는 SKIP.
+    """
     try:
         import bs4  # noqa: F401
     except ImportError:
@@ -3716,6 +3755,11 @@ def cmd_history_rewrite_headers(args: argparse.Namespace) -> int:
 
 
 def cmd_history_status(args: argparse.Namespace) -> int:
+    """history 트랙의 진행 상황 출력 (read-only).
+
+    state.db 조회만 — 변경 없음. `revisions` 상태별 카운트 (DISCOVERED /
+    RENDERED / CONVERTED / UPLOADED / FAILED) + `history_meta` 의 페이지별
+    last_replayed_rev_ts 요약."""
     conn = db_connect(args.db)
     print("==== history_meta 요약 ====")
     n_pages, total_revs, max_revs = conn.execute(
@@ -4774,6 +4818,11 @@ def cmd_struct_embed_on_bound_pages(args: argparse.Namespace) -> int:
 
 
 def cmd_struct_status(args: argparse.Namespace) -> int:
+    """struct 트랙의 진행 상황 출력 (read-only).
+
+    state.db 조회만 — 변경 없음. `struct_schemas` 의 chosen_mode (snapshot/
+    properties/native) + row_count + confluence_db_id + status, `struct_rows`
+    의 상태별 카운트, `struct_columns` 의 dokuwiki_class 분포 요약."""
     conn = db_connect(args.db)
     print("==== struct_schemas ====")
     for sid, tbl, rc, cc, mode, status, db_id, idx_id in conn.execute(
@@ -6919,6 +6968,19 @@ def cmd_plugin_scan(args: argparse.Namespace) -> int:
 
 
 def cmd_dev(args: argparse.Namespace) -> int:
+    """로컬 DokuWiki 테스트 컨테이너 (dev/dokuwiki-local) 관리.
+
+    sub-action 별로 분기 (`args.action` = up/down/install-plugins):
+    - up: full install vs data-only 자동 감지. data-only 면 DokuWiki
+      stable tarball 다운로드 + 데이터 overlay + ACL bypass + 플러그인 자동
+      감지·설치 (PLUGIN_DOWNLOADS 매핑 기반).
+    - down: 컨테이너 종료. `--purge` 면 클론도 삭제.
+    - install-plugins: 기존 클론에 누락 플러그인 추가 설치.
+
+    state.db 변경 없음 (로컬 dev 환경만 손댐). 원본 DokuWiki 디렉터리
+    (`$DOKUWIKI_SRC`) 는 *수정하지 않음* — `/tmp/dwc_test_dokuwiki/dwdata`
+    같은 별도 클론에만 적용 (APFS clonefile + ACL bypass 패치 안전).
+    """
     compose = _project_root() / DEV_COMPOSE_REL
     if not compose.is_file():
         log(f"compose 파일이 없습니다: {compose}")
@@ -8693,6 +8755,15 @@ def _verify_compute_phase4_signals(
 
 
 def cmd_verify_build(args: argparse.Namespace) -> int:
+    """verify build: 시각 검수 큐 + 단일 HTML 갤러리 생성 (docs/visual-audit.md).
+
+    우선순위 큐 (score 기반) 로 UPLOADED 페이지 N개 (--sample) 또는 전체
+    (--strategy=all) 선정. 옵션으로 (1) Confluence body-format=view fetch
+    (2) Playwright 풀-페이지 스크린샷 + phash (3) AI vision (Claude) 자동
+    비교 (4) Phase 4 추가 신호 7종 (pixel-diff / tile-phash / element-
+    compare / OCR / bbox-LCS / storage-AST / color-histogram). 결과는
+    단일 HTML 갤러리 + state.db 의 `verify_decisions` 테이블에 메타 저장.
+    """
     conn = db_connect(args.db)
     _ensure_verify_schema(conn)
 
@@ -8833,6 +8904,14 @@ def cmd_verify_build(args: argparse.Namespace) -> int:
 
 
 def cmd_verify_import(args: argparse.Namespace) -> int:
+    """verify import: 브라우저에서 다운로드한 verify_decisions.json 을 state.db
+    에 반영.
+
+    사용자가 verify-gallery.html 에서 OK/NG/DEFER 라디오 + 노트 + 분류를
+    선택하고 "JSON 저장" 으로 받은 파일. state.db 갱신: `verify_decisions`
+    테이블에 inserted/updated. content_hash 도 함께 저장 — 향후 페이지
+    재변환되어 hash 변경 시 stale 표시 가능 (`verify status`).
+    """
     if not Path(args.path).is_file():
         log(f"파일 없음: {args.path}")
         return 1
@@ -8894,6 +8973,12 @@ def cmd_verify_import(args: argparse.Namespace) -> int:
 
 
 def cmd_verify_status(args: argparse.Namespace) -> int:
+    """verify status: 검수 진행률 요약 (read-only).
+
+    state.db 의 `verify_decisions` 의 decision 별 카운트 (OK/NG/DEFER) +
+    stale (페이지 content_hash 변경된 항목) 식별 + NG/stale 페이지 목록
+    (`--verbose`). state.db 변경 없음.
+    """
     conn = db_connect(args.db)
     _ensure_verify_schema(conn)
 
@@ -8961,6 +9046,7 @@ def cmd_verify_status(args: argparse.Namespace) -> int:
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
+    """verify 부모 명령 — `args.action` (build/import/status) 으로 dispatch."""
     if args.action == "build":
         return cmd_verify_build(args)
     if args.action == "import":
@@ -10052,6 +10138,12 @@ def cmd_report_publish(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
+    """state.db 의 상태별 카운트 요약 (read-only).
+
+    pages / attachments 의 status 별 카운트 + 진행률. state.db 변경 없음.
+    빠른 진행 상황 확인용 — history/struct/verify 같은 별도 트랙은 각 자체
+    `*-status` 명령 사용.
+    """
     if not Path(args.db).exists():
         log(f"DB 없음: {args.db}")
         return 1
