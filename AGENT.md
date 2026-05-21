@@ -82,6 +82,7 @@ discover  →  render  →  convert  →  upload  →  rewrite-links
 | | `link-check [--check-external]` | Confluence 측 placeholder / unresolved title / 외부 URL |
 | | `history-rewrite-headers --header-format X` | 헤더 형식만 교체 (panel/info/note/quote/table/paragraphs/none) |
 | | `report` / `report-publish` | 통계 / Confluence 페이지 자동 발행 |
+| | `compare-publish [--sample N]` | 주요 페이지 양측 풀-페이지 스크린샷 → 비교 갤러리 발행/갱신 (10 카테고리 selection + per-category count `sample/8`, e.g. `--sample 20` 이면 카테고리당 2개 + 대용량 fill) |
 
 전체를 한 명령으로: `python run.py wizard` (14 단계 step-by-step).
 

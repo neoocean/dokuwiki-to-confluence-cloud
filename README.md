@@ -34,6 +34,7 @@ format 으로 변환, 네임스페이스 트리를 그대로 페이지 계층에
   - [Step 9. 검증 (`audit`/`lint`/`report`/`preview`)](#step-9-검증-auditlintreportpreview)
   - [Step 10. 시각 검수 (`verify build`)](#step-10-시각-검수-verify-build)
   - [Step 11. 결과 보고서 (`report-publish`)](#step-11-결과-보고서-report-publish)
+  - [Step 12. 비교 갤러리 (`compare-publish`)](#step-12-비교-갤러리-compare-publish)
 - [사용 시나리오 (Recipes)](#사용-시나리오-recipes)
 - [상태 관리 (`state.db`)](#상태-관리-statedb)
 - [트러블슈팅](#트러블슈팅)
@@ -465,6 +466,29 @@ python run.py report-publish
 # 제목 override
 python run.py report-publish --report-title "DokuWiki 2026 마이그레이션 보고서"
 ```
+
+### Step 12. 비교 갤러리 (`compare-publish`)
+
+마이그레이션이 정성적으로 잘 됐는지 *시각적으로* 검증. 주요 페이지의
+DokuWiki 와 Confluence 측을 헤드리스 Chromium 으로 풀-페이지 캡쳐 후
+Confluence 루트 하위에 갤러리 페이지 발행/갱신.
+
+```sh
+python run.py compare-publish              # 기본 8 페이지 자동 선정
+python run.py compare-publish --sample 20  # 카테고리당 2~3개로 늘림
+python run.py compare-publish --select start,wiki:syntax,u:lam:calendar
+                                           # 명시 페이지 list
+python run.py compare-publish --dry-run    # 후보 + 캡쳐만, 발행 skip
+python run.py compare-publish --no-recapture  # 기존 PNG 재사용 (본문만 갱신)
+```
+
+- 자동 selection 카테고리 10종: 메인 / 사용자 시작 / iframe / encrypt / 표
+  풍부 / 이미지·첨부 / info·note·warning / 매크로 다양 / 코드 / 대용량
+- per-category count = `sample/8` — `--sample 20` 이면 각 카테고리 2~3개
+- 첨부 이미지는 v1 endpoint 으로 src rewrite (Confluence `/wiki/download`
+  endpoint 가 Basic Auth 거부 → 302 redirect 통해 media binary fetch)
+- 페이지 height 자동 clip 12000px (이미지 100+ 페이지가 100MB 첨부 한도
+  초과·갤러리 비대화 회피)
 
 ---
 
