@@ -43,6 +43,7 @@ python run.py report-publish
 | `docs/element-mapping.md` | DokuWiki 요소 → Confluence 변환 매트릭스 |
 | `docs/plugin-validation.md` | 플러그인별 동작 검증 결과 |
 | `docs/visual-audit.md` | 사용자 시각 검수 자동화 (Phase 1-3) |
+| `docs/3way-audit.md` | source ↔ rendered ↔ confluence 3-측 invariant audit (시나리오, 미구현) — 사용자 직접 비교로 발견한 4 사례 일반화 |
 | `docs/migration-result.md` | 날짜별 라이브 결과 누적 로그 (Day 1-5 + 후반 사이클) |
 | `docs/struct-migration.md` | struct 플러그인 데이터 이전 시나리오 + 라이브 결과 |
 | `docs/history-migration.md` | 과거 리비전 이전 시나리오 + 라이브 결과 |

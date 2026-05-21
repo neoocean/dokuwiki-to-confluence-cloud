@@ -7,6 +7,12 @@ DokuWiki 렌더 페이지 ↔ Confluence 이전 페이지의 *시각적 동등�
 > 검수 카드의 `.metrics-vc` 줄에 신호 표시. CLI 옵션 / 헬퍼 함수 /
 > 21 unit test 모두 포함. 제안 8 (AI vision 구조화) 은 보류. 자세한
 > 적용 매트릭스는 [`visual-audit.md` Phase 4](visual-audit.md).
+>
+> **2026-05-21 후속**: 사용자가 비교 갤러리 (`compare-publish`) 의
+> 양측 스크린샷을 *직접* 비교해 발견한 4 사례 — Phase 4 시각 신호로
+> 못 잡는 *3-측 invariant* 영역. 별도 시나리오:
+> [`3way-audit.md`](3way-audit.md) (source ↔ rendered ↔ confluence
+> 비교, 시나리오 미구현).
 
 본 도구는 이미 [visual-audit Phase 1-3](visual-audit.md) 가 구축되어
 있어 — 그 위에 *남은 갭* 을 메우는 방향으로 정리.
