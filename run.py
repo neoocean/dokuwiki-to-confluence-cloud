@@ -966,14 +966,36 @@ def _preprocess_encrypted_passwords(raw_html: str) -> str:
 
 
 def _convert_encrypted_passwords(soup) -> None:
-    """`<decrypt>cipher</decrypt>` 변환은 이제 `_preprocess_encrypted_passwords`
-    가 raw HTML 단계에서 처리 — 이 함수는 호출 흐름 보존용 no-op.
+    """encryptedpasswords plugin 활성 시 DokuWiki 가 출력하는
+    `<span class="encryptedpasswords" title="<cipher>"><a ...>••••••</a></span>`
+    형태를 expand+code 매크로로 변환. cipher 는 title 속성에 들어 있음.
 
-    이전 구현 (텍스트 노드 walker) 은 cipher 안에 우연히 형성된 DokuWiki
-    inline 마크업 잔재 (`<em>`, `<u>` 등) 에 의해 텍스트 노드가 split 되면
-    패턴 매치에 실패하는 한계가 있었음. raw HTML 단계의 escape 텍스트에서
-    매치하면 그 영향을 받지 않음."""
-    return
+    plugin 미활성 (escape `<decrypt>...</decrypt>` 텍스트) 케이스는
+    `_preprocess_encrypted_passwords` 가 raw HTML 단계에서 이미 처리. 두 함수
+    모두 같은 storage 결과 (expand 안 code 안 cipher 보존) 를 생성하여
+    plugin 설치 여부와 무관하게 일관된 변환."""
+    from bs4 import BeautifulSoup as _BS
+
+    for span in list(soup.find_all("span", class_="encryptedpasswords")):
+        cipher = (span.get("title") or "").strip()
+        if not cipher:
+            continue
+        # cipher 안 줄바꿈 / 공백 정규화 — base64 가 multi-line attribute 일 수도.
+        # 텍스트 노드 형태로 보존 (escape 처리).
+        cipher_esc = _h.escape(cipher)
+        macro = (
+            '<ac:structured-macro ac:name="expand">'
+            '<ac:parameter ac:name="title">'
+            '🔒 encryptedpasswords (클릭해서 펼치기)'
+            '</ac:parameter>'
+            '<ac:rich-text-body>'
+            f'<p><code>&lt;decrypt&gt;{cipher_esc}&lt;/decrypt&gt;</code></p>'
+            '</ac:rich-text-body>'
+            '</ac:structured-macro>'
+        )
+        wrapper = _BS(macro, "html.parser")
+        # span 자체를 매크로로 교체 (inline → block 이지만 Confluence 가 자동 wrap)
+        span.replace_with(*list(wrapper.children))
 
 
 def _calendar_iframe_macro(src: str, width: str = "750", height: str = "500") -> str:
@@ -9548,11 +9570,10 @@ def _compare_select_candidates(
     seen: set[str] = set()
     chosen2: list[tuple[str, str, str, str, int]] = []
 
-    def pick(reason: str, key_fn, filt=None) -> None:
+    def pick(reason: str, key_fn, filt=None, count: int = 1) -> None:
         cands = [s for s in scored if s[0] not in seen and (filt is None or filt(s))]
         cands.sort(key=key_fn, reverse=True)
-        if cands:
-            s = cands[0]
+        for s in cands[:count]:
             seen.add(s[0])
             chosen2.append((reason, s[0], s[1], s[3], s[4]))
 
@@ -9560,27 +9581,36 @@ def _compare_select_candidates(
     def medium(s):
         return 5_000 < s[4] < 200_000
 
+    # 카테고리당 기본 1 페이지 — sample 이 크면 (sample/8 만큼) 각 카테고리에서
+    # 추가 후보. e.g. sample=20 이면 카테고리당 2~3개. 메인/사용자 시작은 한 페이지
+    # 만 의미 있으므로 항상 1.
+    per_cat = max(1, sample // 8)
+
     # iframe/encrypt 같은 *특수 매크로* 카테고리는 큰 페이지에 묻혀 있을 수 있어
     # 작은 페이지를 우선 (-size 키) — 풀 페이지 스크린샷 timeout 회피.
     pick("메인 (start)",            lambda s: 1,
          filt=lambda s: s[0] == "start")
     pick("사용자 시작",              lambda s: 1,
-         filt=lambda s: s[0].endswith(":start") and s[0] != "start" and s[4] > 200)
+         filt=lambda s: s[0].endswith(":start") and s[0] != "start" and s[4] > 200,
+         count=per_cat)
     pick("iframe (캘린더/임베드)",  lambda s: -s[4],
-         filt=lambda s: s[5].get("iframe", 0) > 0)
+         filt=lambda s: s[5].get("iframe", 0) > 0, count=per_cat)
     pick("encrypted-passwords",     lambda s: -s[4],
-         filt=lambda s: s[5].get("expand", 0) > 0 and medium(s))
+         filt=lambda s: s[5].get("expand", 0) > 0 and medium(s), count=per_cat)
     pick("표 풍부",                  lambda s: s[5]["_table"],
-         filt=lambda s: s[5]["_table"] >= 3 and medium(s))
+         filt=lambda s: s[5]["_table"] >= 3 and medium(s), count=per_cat)
     pick("이미지·첨부 다수",         lambda s: s[5]["_image"] + s[5]["_attach"],
-         filt=lambda s: (s[5]["_image"] + s[5]["_attach"]) >= 2 and medium(s))
+         filt=lambda s: (s[5]["_image"] + s[5]["_attach"]) >= 2 and medium(s),
+         count=per_cat)
     pick("info/note/warning 매크로", lambda s: s[5].get("info", 0) + s[5].get("note", 0) + s[5].get("warning", 0),
-         filt=lambda s: (s[5].get("info", 0) + s[5].get("note", 0) + s[5].get("warning", 0)) > 0 and medium(s))
+         filt=lambda s: (s[5].get("info", 0) + s[5].get("note", 0) + s[5].get("warning", 0)) > 0 and medium(s),
+         count=per_cat)
     pick("매크로 다양",              lambda s: s[5]["_distinct"],
-         filt=lambda s: s[5]["_distinct"] >= 5 and medium(s))
+         filt=lambda s: s[5]["_distinct"] >= 5 and medium(s), count=per_cat)
     pick("코드 매크로 풍부",         lambda s: s[5].get("code", 0),
-         filt=lambda s: s[5].get("code", 0) >= 3 and medium(s))
-    pick("대용량 본문",              lambda s: s[4])
+         filt=lambda s: s[5].get("code", 0) >= 3 and medium(s), count=per_cat)
+    # 대용량 본문 fallback — sample 만큼 fill (마지막 카테고리)
+    pick("대용량 본문",              lambda s: s[4], count=max(1, sample))
 
     return chosen2[:sample]
 
@@ -9964,7 +9994,9 @@ def cmd_compare_publish(args: argparse.Namespace) -> int:
     if not space_id:
         return 1
 
-    title = args.title or f"DokuWiki ↔ Confluence 비교 갤러리 ({len(candidates)} 페이지)"
+    # default title 은 페이지 개수를 포함하지 않음 — 향후 --sample 바뀌어도 같은
+    # 갤러리 페이지를 갱신 (`_compare_find_or_create_page` 가 title 검색).
+    title = args.title or "DokuWiki ↔ Confluence 비교 갤러리"
     page_id = _compare_find_or_create_page(session, base, space_id, args.root_page_id, title)
     if not page_id:
         return 1
