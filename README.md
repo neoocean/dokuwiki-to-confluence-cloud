@@ -701,7 +701,7 @@ WAL 모드라 동시 read 는 OK 지만 long-running write 가 있으면 lock.
     ├── scenarios.md        — 메인 시나리오 S1~S10 + 새 엣지 케이스 절차
     ├── runbook.md          — 라이브 단계별 절차 + wizard 안내
     ├── wizard-walkthrough.md — wizard 8 사용 시나리오 (Happy path / Ctrl+C 재개 / 실패 복구 / 부분 재실행 등)
-    ├── migration-result.md — Day 1-4 운영 로그
+    ├── migration-result.md — Day 1-5 + 후반 사이클 운영 로그
     ├── element-mapping.md  — DokuWiki → Confluence 요소 매트릭스
     ├── plugin-validation.md — 플러그인 동작 검증
     ├── visual-audit.md     — 시각 검수 자동화 (Phase 1+2+3+4 구현 완료)

@@ -4,8 +4,10 @@
 요약 + 길잡이다. 사람이 처음 진입할 때도 동일하게 유용.
 
 본 저장소는 **자체 호스팅 DokuWiki → Confluence Cloud** 일회성/반복
-마이그레이션 도구. 본 인스턴스의 라이브 마이그레이션은 2026-05-19 시점
-**Day 1-4 모두 완료** 상태. 코드는 다른 인스턴스로도 재사용 가능.
+마이그레이션 도구. 본 인스턴스의 라이브 마이그레이션은 **Day 1-5 +
+후반 사이클 완료** (2026-05-21 시점, 1,675 페이지 / 10,732 첨부 /
+18,729 history revision / 4 struct schema / 사용자 검토 후 fix 4건
+적용). 코드는 다른 인스턴스로도 재사용 가능.
 
 ---
 
@@ -33,7 +35,7 @@ python run.py report-publish
 
 | 파일 | 역할 |
 |------|------|
-| `run.py` | 단일 진입 스크립트. 모든 서브커맨드 (~7500 line) |
+| `run.py` | 단일 진입 스크립트. 모든 서브커맨드 (~10.6k line). 코드 섹션 인덱스는 모듈 docstring + `grep -n '# §'` |
 | `state.db` | SQLite — pages/attachments/revisions/struct_*/wizard_state/verify_decisions/meta. P4 추적. |
 | `docs/MEMORY.md` | 세션 간 지속 메모리. *코드만 봐선 안 보이는* 결정/주의사항 위주 |
 | `docs/scenarios.md` | S1~S10 설계 + 새 엣지 케이스 발견 절차 (§7.2) |
@@ -41,7 +43,7 @@ python run.py report-publish
 | `docs/element-mapping.md` | DokuWiki 요소 → Confluence 변환 매트릭스 |
 | `docs/plugin-validation.md` | 플러그인별 동작 검증 결과 |
 | `docs/visual-audit.md` | 사용자 시각 검수 자동화 (Phase 1-3) |
-| `docs/migration-result.md` | 날짜별 라이브 결과 누적 로그 (Day 1-4) |
+| `docs/migration-result.md` | 날짜별 라이브 결과 누적 로그 (Day 1-5 + 후반 사이클) |
 | `docs/struct-migration.md` | struct 플러그인 데이터 이전 시나리오 + 라이브 결과 |
 | `docs/history-migration.md` | 과거 리비전 이전 시나리오 + 라이브 결과 |
 | `docs/oversized-attachments.md` / `oversized-pages.md` | 본문/첨부 한도 초과 폴백 |
@@ -197,7 +199,7 @@ git push
 - 본 프로젝트의 *왜* / *어떻게* / *함정*: [`docs/MEMORY.md`](docs/MEMORY.md)
 - 단계별 라이브 절차: [`docs/runbook.md`](docs/runbook.md)
 - 설계 + 새 엣지 케이스 발견 절차: [`docs/scenarios.md`](docs/scenarios.md)
-- 라이브 결과 (Day 1-4): [`docs/migration-result.md`](docs/migration-result.md)
+- 라이브 결과 (Day 1-5 + 후반 사이클): [`docs/migration-result.md`](docs/migration-result.md)
 - 변환 매트릭스 (요소별): [`docs/element-mapping.md`](docs/element-mapping.md)
 - 플러그인 동작: [`docs/plugin-validation.md`](docs/plugin-validation.md)
 - 시각 검수 자동화: [`docs/visual-audit.md`](docs/visual-audit.md)
