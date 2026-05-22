@@ -6662,6 +6662,51 @@ def _dev_patch_acl_off(clone_root: Path) -> None:
         log("  ACL 비활성화 (useacl=0) 패치 적용 — 클론 한정")
 
 
+# DokuWiki 공식 .htaccess (rewrite rules for /_media/, /_detail/, /_export/, 등)
+# data-only bootstrap 시 자동 생성. 본 인스턴스의 dwk 스크린샷 캡쳐 시
+# `/_media/...` 가 404 되어 *이미지가 모두 깨진* 케이스 회피.
+_DOKUWIKI_HTACCESS = """RewriteEngine on
+RewriteBase /
+RewriteRule ^_media/(.*)              lib/exe/fetch.php?media=$1 [QSA,L]
+RewriteRule ^_detail/(.*)             lib/exe/detail.php?media=$1 [QSA,L]
+RewriteRule ^_export/([^/]+)/(.*)     doku.php?do=export_$1&id=$2 [QSA,L]
+RewriteRule ^$                        doku.php  [L]
+RewriteCond %{REQUEST_FILENAME}       !-f
+RewriteCond %{REQUEST_FILENAME}       !-d
+RewriteRule (.*)                      doku.php?id=$1  [QSA,L]
+RewriteRule ^index.php$               doku.php
+"""
+
+
+def _dev_ensure_htaccess(clone_root: Path) -> None:
+    """`.htaccess` 가 부재하면 DokuWiki 공식 rewrite rules 생성.
+
+    DokuWiki 의 `userewrite=1` 설정 시 미디어 URL 이 `/_media/...` 형식 —
+    Apache 의 mod_rewrite 가 `lib/exe/fetch.php?media=...` 로 변환해야
+    동작. .htaccess 부재 시 *모든 미디어가 404* → 비교 갤러리의 dwk
+    스크린샷에 이미지가 깨진 채로 캡쳐됨.
+
+    .htaccess.dist 가 있으면 그것을 우선 사용 (DokuWiki 버전별 권장 내용).
+    없으면 위 _DOKUWIKI_HTACCESS 사용.
+    """
+    htaccess = clone_root / ".htaccess"
+    if htaccess.is_file():
+        return
+    dist = clone_root / ".htaccess.dist"
+    if dist.is_file():
+        try:
+            htaccess.write_text(dist.read_text(encoding="utf-8"), encoding="utf-8")
+            log("  .htaccess 생성 (.htaccess.dist 복원)")
+            return
+        except OSError:
+            pass
+    try:
+        htaccess.write_text(_DOKUWIKI_HTACCESS, encoding="utf-8")
+        log("  .htaccess 생성 (DokuWiki 공식 rewrite rules)")
+    except OSError as e:  # noqa: BLE001
+        log(f"  [WARN] .htaccess 생성 실패: {e}")
+
+
 def _dev_wait_healthy(timeout: int = DEV_HEALTH_TIMEOUT) -> bool:
     import urllib.error
     import urllib.request
@@ -7095,6 +7140,7 @@ def cmd_dev(args: argparse.Namespace) -> int:
                         if names:
                             log(f"  {kind} ({len(names)}): {', '.join(names)}")
         _dev_patch_acl_off(DEV_CLONE_DST)
+        _dev_ensure_htaccess(DEV_CLONE_DST)
 
         log("docker compose up -d")
         if subprocess.call(["docker", "compose", "-f", str(compose), "up", "-d"]) != 0:
