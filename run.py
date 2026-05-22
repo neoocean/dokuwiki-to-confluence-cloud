@@ -9666,6 +9666,7 @@ def _compare_select_candidates(
     *,
     sample: int = 8,
     explicit_ids: list[str] | None = None,
+    exclude_ids: set[str] | None = None,
 ) -> list[tuple[str, str, str, str, int]]:
     """비교 갤러리 후보 페이지 선정. 카테고리별 대표 1 페이지씩 + 명시 list 지원.
 
@@ -9673,6 +9674,9 @@ def _compare_select_candidates(
     info·note·warning / 매크로 다양 / 코드 매크로 / 최대 본문. 동일 페이지
     중복 선정 방지. 거대 본문 (>200KB) 은 톡톡 너무 길어 매크로 다양/표 등에선
     제외 (최대 본문 카테고리는 통과).
+
+    `exclude_ids` 지정 시 그 doku_id 들을 모든 카테고리에서 제외 — 로테이션용
+    (이미 비교 갤러리에 발행된 페이지 회피).
 
     Returns: list of (reason, doku_id, title, confluence_page_id, body_size).
     """
@@ -9708,11 +9712,20 @@ def _compare_select_candidates(
                 log(f"  [WARN] 명시 페이지 미발견 또는 미업로드: {did}")
         return chosen
 
-    seen: set[str] = set()
+    # 로테이션 — 이미 발행된 doku_id 는 후보에서 제외.
+    # macOS APFS 의 doku_id 가 NFD 로 저장된 경우 (한국어 등) NFC seed 와
+    # byte mismatch — 양측 NFC 정규화 후 비교.
+    import unicodedata as _ud
+    excluded_nfc = {_ud.normalize("NFC", x) for x in (exclude_ids or set())}
+    def _is_excluded(doku_id: str) -> bool:
+        return _ud.normalize("NFC", doku_id) in excluded_nfc
+    seen: set[str] = set()  # 같은 batch 안의 중복 방지
     chosen2: list[tuple[str, str, str, str, int]] = []
 
     def pick(reason: str, key_fn, filt=None, count: int = 1) -> None:
-        cands = [s for s in scored if s[0] not in seen and (filt is None or filt(s))]
+        cands = [s for s in scored
+                 if s[0] not in seen and not _is_excluded(s[0])
+                 and (filt is None or filt(s))]
         cands.sort(key=key_fn, reverse=True)
         for s in cands[:count]:
             seen.add(s[0])
@@ -10262,10 +10275,25 @@ def cmd_compare_publish(args: argparse.Namespace) -> int:
         return 2
     base = args.base_url.rstrip("/")
 
+    # --reset-rotation: 발행 이력 초기화 (다음 발행이 처음부터)
+    if getattr(args, "reset_rotation", False):
+        conn.execute("DELETE FROM meta WHERE key='compare_publish_history'")
+        conn.commit()
+        log("rotation 이력 초기화.")
+
     explicit = [s.strip() for s in args.select.split(",") if s.strip()] if args.select else None
-    candidates = _compare_select_candidates(conn, sample=args.sample, explicit_ids=explicit)
+    exclude_ids: set[str] = set()
+    if getattr(args, "rotate", False) and not explicit:
+        # 이전 발행 페이지 list 를 meta 에서 읽어 exclude
+        raw = db_get_meta(conn, "compare_publish_history") or ""
+        if raw:
+            exclude_ids = set(line.strip() for line in raw.splitlines() if line.strip())
+        log(f"--rotate: {len(exclude_ids)} 페이지 제외 (이전 발행 이력).")
+    candidates = _compare_select_candidates(
+        conn, sample=args.sample, explicit_ids=explicit, exclude_ids=exclude_ids,
+    )
     if not candidates:
-        log("후보 페이지 없음 — state.db 에 UPLOADED 페이지가 있는지 확인.")
+        log("후보 페이지 없음 — --rotate 사용 중이면 --reset-rotation 으로 이력 초기화.")
         return 1
 
     log(f"=== compare-publish: {len(candidates)} 페이지 ===")
@@ -10320,6 +10348,15 @@ def cmd_compare_publish(args: argparse.Namespace) -> int:
     if r is None or r.status_code >= 400:
         log(f"  [FAIL] PUT: {r.status_code if r else 'no resp'} body={(r.text if r else '')[:300]}")
         return 1
+
+    # 발행 성공 — history 누적 (다음 --rotate 발행 시 exclude 대상)
+    published_ids = [c[1] for c in candidates]
+    if getattr(args, "rotate", False) or not getattr(args, "no_track", False):
+        prev_raw = db_get_meta(conn, "compare_publish_history") or ""
+        prev_ids = set(line.strip() for line in prev_raw.splitlines() if line.strip())
+        prev_ids.update(published_ids)
+        db_set_meta(conn, "compare_publish_history", "\n".join(sorted(prev_ids)))
+        log(f"  rotation 이력 갱신: 총 {len(prev_ids)} 페이지 (이번 {len(published_ids)} 추가)")
 
     log(f"=== 완료: {base}/spaces/{args.space_key}/pages/{page_id} ===")
     conn.close()
@@ -11409,6 +11446,16 @@ def _build_tool_subcommands(sub) -> None:
                        help="발행 skip, 후보·캡쳐 결과만 출력")
     sp_cp.add_argument("--dokuwiki-base-url", default=env_default("DOKUWIKI_BASE_URL"),
                        help="DokuWiki HTTP base URL (스크린샷용)")
+    sp_cp.add_argument("--rotate", action="store_true",
+                       help="이전에 발행했던 페이지를 제외하고 *새* 페이지로 selection. "
+                            "state.db meta 의 compare_publish_history 가 누적 이력. "
+                            "후보 부족 시 --reset-rotation 으로 이력 초기화.")
+    sp_cp.add_argument("--reset-rotation", action="store_true",
+                       help="발행 이력 초기화 (다음 발행이 처음부터 selection). "
+                            "--rotate 와 함께 또는 단독 사용 가능.")
+    sp_cp.add_argument("--no-track", action="store_true",
+                       help="발행 후 이력에 *추가 안 함* (테스트 / 일회성 발행). "
+                            "기본은 매 발행마다 누적.")
     sp_cp.set_defaults(func=cmd_compare_publish)
 
 
