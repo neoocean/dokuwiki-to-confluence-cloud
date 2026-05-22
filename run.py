@@ -9763,12 +9763,22 @@ def _compare_rewrite_attachment_urls(
     email: str,
     token: str,
 ) -> str:
-    """view body 안 `<img src=".../wiki/download/attachments/{pid}/{filename}?...">`
-    를 v1 download endpoint URL 로 교체. v1 은 Basic Auth → 302 → media binary
-    로 정상 작동. v2 download URL (`/wiki/download/...`) 은 OAuth 만 받음.
+    """view body 안 `/wiki/download/{attachments|thumbnails}/{pid}/{filename}?...`
+    URL 을 v1 download endpoint 로 교체. v1 은 Basic Auth → 302 → media binary
+    로 정상 작동. v2 download URL (OAuth 만) 회피.
+
+    이미지 다수 페이지 (수십~수백 개) 의 핵심 — Confluence view body 가
+    *thumbnails* URL 을 src 로, *attachments* URL 을 data-image-src 로 두는데
+    img 의 *src* 가 thumbnails 라서 그것도 rewrite 필요.
+
+    매치 영역:
+    - `src=".../download/attachments/..."` (full size)
+    - `src=".../download/thumbnails/..."` (썸네일, 200×150 등)
+    - `srcset=".../download/thumbnails/..."` (responsive variants)
+    - `data-image-src=".../download/attachments/..."` (lightbox full size)
 
     페이지의 첨부 list 를 한 번 GET 해 filename → attachment_id 매핑.
-    매핑 실패한 src 는 원본 그대로 — 깨진 이미지 아이콘으로 보이지만 본문 손상 없음.
+    매핑 실패 src 는 원본 그대로.
     """
     import urllib.parse
     import requests as _rq
@@ -9786,24 +9796,53 @@ def _compare_rewrite_attachment_urls(
     if not filename_to_aid:
         return view_html
 
-    def repl(m: re.Match) -> str:
-        full = m.group(0)
-        src = m.group(2)
-        fn_m = re.search(r"/download/attachments/\d+/([^?]+)", src)
-        if not fn_m:
-            return full
-        filename = urllib.parse.unquote(fn_m.group(1))
+    def rewrite_url(url: str) -> str | None:
+        """`download/(attachments|thumbnails)/{pid}/{filename}?...` → v1 endpoint."""
+        m = re.search(r"/download/(?:attachments|thumbnails)/\d+/([^?]+)", url)
+        if not m:
+            return None
+        filename = urllib.parse.unquote(m.group(1))
         aid = filename_to_aid.get(filename)
         if not aid:
-            return full
-        new_src = f"{confluence_origin}/rest/api/content/{page_id}/child/attachment/{aid}/download"
-        return full.replace(src, new_src)
+            return None
+        return f"{confluence_origin}/rest/api/content/{page_id}/child/attachment/{aid}/download"
 
+    # img src + data-image-src + srcset 모두 매치
     pattern = re.compile(
-        r'(<img[^>]+src=")([^"]+/download/attachments/\d+/[^"]+)"',
+        r'((?:src|data-image-src)=")([^"]+/download/(?:attachments|thumbnails)/\d+/[^"]+)"',
         re.S,
     )
-    return pattern.sub(repl, view_html)
+
+    def repl(m: re.Match) -> str:
+        new = rewrite_url(m.group(2))
+        if new is None:
+            return m.group(0)
+        return m.group(1) + new + '"'
+
+    out = pattern.sub(repl, view_html)
+
+    # srcset 은 *여러 URL* — 각각 rewrite (`URL 1x, URL 2x, ...` 형식)
+    def srcset_repl(m: re.Match) -> str:
+        srcset = m.group(2)
+        parts = [p.strip() for p in srcset.split(",")]
+        new_parts = []
+        for p in parts:
+            tokens = p.split(None, 1)
+            if not tokens:
+                continue
+            url = tokens[0]
+            desc = tokens[1] if len(tokens) > 1 else ""
+            new = rewrite_url(url)
+            if new:
+                new_parts.append(f"{new} {desc}".strip())
+            else:
+                new_parts.append(p)
+        return m.group(1) + ", ".join(new_parts) + '"'
+
+    srcset_pattern = re.compile(r'(srcset=")([^"]+)"', re.S)
+    out = srcset_pattern.sub(srcset_repl, out)
+
+    return out
 
 
 def _compare_view_body_limitation_note(view_html: str) -> str:
