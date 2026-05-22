@@ -3525,8 +3525,67 @@ def _history_upload_replay_one_page(
         conn.commit()
         rev_ok += 1
         if limit_left is not None and rev_ok >= limit_left:
+            _history_restore_latest_body(session, base, conn, doku_id, cid, title)
             return (rev_ok, rev_fail, True)
+
+    # rev replay 끝 — Confluence 본문이 마지막 OK rev 로 남았으므로
+    # latest storage 본문을 강제 PUT 해 *최신 상태 보장*. rev 일부가 fail 해도
+    # 사용자가 보는 페이지 본문은 *언제나 latest*. 멱등 (uploaded_hash 매치 시 skip).
+    _history_restore_latest_body(session, base, conn, doku_id, cid, title)
     return (rev_ok, rev_fail, False)
+
+
+def _history_restore_latest_body(
+    session,
+    base: str,
+    conn: sqlite3.Connection,
+    doku_id: str,
+    cid: str,
+    title: str,
+) -> bool:
+    """history-upload 의 rev replay 후 *latest storage 본문* 을 PUT 보장.
+
+    rev 한 개라도 fail 하면 replay 가 break — Confluence 본문이 옛 rev 로
+    영구 남음. 이 helper 가 *replay 종료 후* latest 를 다시 push 해 *사용자가
+    보는 본문 = 항상 latest* 를 유지.
+
+    멱등: pages.content_hash == meta.uploaded_hash:<doku_id> 면 skip.
+    """
+    row = conn.execute(
+        "SELECT storage_path, content_hash FROM pages WHERE doku_id=?", (doku_id,)
+    ).fetchone()
+    if not row or not row[0]:
+        return False
+    storage_path, content_hash = row
+    uploaded_hash = db_get_meta(conn, f"uploaded_hash:{doku_id}") or ""
+    if content_hash == uploaded_hash:
+        return False  # 이미 latest
+
+    sp = Path(storage_path)
+    if not sp.is_file():
+        return False
+    body = sp.read_text(encoding="utf-8")
+    cur_ver = _get_page_version(session, base, cid)
+    if cur_ver is None:
+        return False
+    resp = _request_with_retry(
+        session, "PUT", f"{base}/api/v2/pages/{cid}",
+        json={
+            "id": cid, "status": "current", "title": title or doku_id,
+            "body": {"representation": "storage", "value": body},
+            "version": {
+                "number": cur_ver + 1,
+                "message": "history-upload: latest 본문 복원 (rev replay 후)",
+            },
+        },
+    )
+    if resp is None or resp.status_code >= 400:
+        log(f"    [WARN] {doku_id}: latest 복원 PUT 실패 "
+            f"({resp.status_code if resp else 'no resp'})")
+        return False
+    db_set_meta(conn, f"uploaded_hash:{doku_id}", content_hash)
+    conn.commit()
+    return True
 
 
 def cmd_history_upload(args: argparse.Namespace) -> int:
