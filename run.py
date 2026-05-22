@@ -3507,14 +3507,19 @@ def _history_upload_replay_one_page(
             session, "PUT", f"{base}/api/v2/pages/{cid}", json=payload
         )
         if resp is None or resp.status_code >= 400:
+            # fail 시 SKIPPED 로 마킹 후 *continue* (이전: break → 같은 페이지의
+            # 다음 rev 모두 누락). 본문 한도 초과 같은 *영구* fail rev 가 chain
+            # 을 막던 결함. Confluence current_version 은 fail PUT 으로 안 바뀌
+            # 므로 다음 rev 의 cur+1 PUT 은 영향 없음.
             conn.execute(
-                "UPDATE revisions SET status='FAILED', last_error=?, last_checked_at=? "
+                "UPDATE revisions SET status='SKIPPED', last_error=?, last_checked_at=? "
                 "WHERE doku_id=? AND rev_ts=?",
-                (f"PUT {resp.status_code if resp else 'no resp'}", now_iso(), doku_id, rev_ts),
+                (f"PUT {resp.status_code if resp else 'no resp'} (skipped, chain 보존)",
+                 now_iso(), doku_id, rev_ts),
             )
             conn.commit()
             rev_fail += 1
-            break
+            continue
         conn.execute(
             "UPDATE revisions SET status='UPLOADED', last_error=NULL, last_checked_at=? "
             "WHERE doku_id=? AND rev_ts=?",
