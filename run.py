@@ -10124,9 +10124,39 @@ def _compare_attach_screenshots(
     session, base: str, page_id: str,
     screenshots: dict[str, dict[str, Path | None]],
 ) -> tuple[int, int]:
-    """모든 PNG 를 v1 multipart 로 page_id 에 첨부. 같은 파일명 이미 있으면
-    update — Confluence 가 'minorEdit=true' 로 새 버전 만들기. Returns (ok, fail)."""
+    """모든 PNG 를 v1 multipart 로 page_id 에 첨부.
+
+    같은 filename 이 이미 있으면 *새 버전* POST `/child/attachment/{aid}/data`
+    — 이전 코드의 버그 (POST `/child/attachment` 에 같은 filename 시 400
+    'same file name as an existing attachment' 응답을 ok 마킹만 하고 *실제
+    새 버전 갱신 안 함* → 첫 빈 캡쳐가 그대로 남아있음) fix.
+
+    Returns (ok, fail)."""
     from requests_toolbelt.multipart import encoder as tb_encoder
+
+    def _post_multipart(url: str, p: Path) -> "requests.Response":
+        with open(p, "rb") as fp:
+            m = tb_encoder.MultipartEncoder(
+                fields={"file": (p.name, fp, "image/png"), "minorEdit": "true"}
+            )
+            return session.post(
+                url,
+                headers={"X-Atlassian-Token": "no-check", "Content-Type": m.content_type},
+                data=m,
+                timeout=120,
+            )
+
+    def _existing_attachment_id(filename: str) -> str | None:
+        """page 의 same filename 첨부 ID 조회 — 새 버전 PUT 위해."""
+        r = session.get(
+            f"{base}/rest/api/content/{page_id}/child/attachment",
+            params={"filename": filename, "expand": "version"},
+            timeout=30,
+        )
+        if not r.ok:
+            return None
+        results = r.json().get("results", [])
+        return results[0]["id"] if results else None
 
     ok = fail = 0
     for paths in screenshots.values():
@@ -10134,26 +10164,34 @@ def _compare_attach_screenshots(
             if not p or not Path(str(p)).is_file():
                 continue
             try:
-                # _request_with_retry 우회 의도: multipart streaming PNG.
-                # 같은 파일명 이미 있으면 자동 새 버전 (minorEdit=true).
-                with open(p, "rb") as fp:
-                    m = tb_encoder.MultipartEncoder(
-                        fields={
-                            "file": (p.name, fp, "image/png"),
-                            "minorEdit": "true",
-                        }
-                    )
-                    resp = session.post(
-                        f"{base}/rest/api/content/{page_id}/child/attachment",
-                        headers={"X-Atlassian-Token": "no-check", "Content-Type": m.content_type},
-                        data=m,
-                        timeout=120,
-                    )
-                if resp.status_code >= 400 and "same file name" not in (resp.text or "").lower():
-                    log(f"    [ATT-FAIL] {p.name}: {resp.status_code} {resp.text[:150]}")
-                    fail += 1
-                else:
+                # 1차: 신규 첨부 POST
+                resp = _post_multipart(
+                    f"{base}/rest/api/content/{page_id}/child/attachment", p
+                )
+                if resp.status_code < 400:
                     ok += 1
+                    continue
+                # 2차: 'same file name as an existing attachment' → 새 버전 POST
+                if "same file name" in (resp.text or "").lower():
+                    aid = _existing_attachment_id(p.name)
+                    if aid:
+                        upd = _post_multipart(
+                            f"{base}/rest/api/content/{page_id}/child/attachment/{aid}/data",
+                            p,
+                        )
+                        if upd.status_code < 400:
+                            ok += 1
+                            continue
+                        log(f"    [ATT-FAIL-UPDATE] {p.name}: {upd.status_code} "
+                            f"{(upd.text or '')[:150]}")
+                        fail += 1
+                        continue
+                    log(f"    [ATT-FAIL-AID] {p.name}: existing attachment id 조회 실패")
+                    fail += 1
+                    continue
+                log(f"    [ATT-FAIL] {p.name}: {resp.status_code} "
+                    f"{(resp.text or '')[:150]}")
+                fail += 1
             except Exception as e:  # noqa: BLE001
                 log(f"    [ATT-EXC] {p.name}: {e}")
                 fail += 1
