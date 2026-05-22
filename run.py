@@ -10671,12 +10671,16 @@ def cmd_compare_publish(args: argparse.Namespace) -> int:
 
     explicit = [s.strip() for s in args.select.split(",") if s.strip()] if args.select else None
     exclude_ids: set[str] = set()
-    if getattr(args, "rotate", False) and not explicit:
-        # 이전 발행 페이지 list 를 meta 에서 읽어 exclude
+    if not explicit:
+        # 기본 동작: 이전 발행 이력 (compare_publish_history meta) 전체 제외
+        # 매 호출이 새 페이지 batch 를 자동 선택. `--reset-rotation` 으로 초기화.
+        # (구 `--rotate` flag 는 backward-compat no-op — 기본 동작이 됨.)
         raw = db_get_meta(conn, "compare_publish_history") or ""
         if raw:
             exclude_ids = set(line.strip() for line in raw.splitlines() if line.strip())
-        log(f"--rotate: {len(exclude_ids)} 페이지 제외 (이전 발행 이력).")
+        if exclude_ids:
+            log(f"기존 발행 이력 {len(exclude_ids)} 페이지 제외 "
+                f"(--reset-rotation 으로 초기화).")
     candidates = _compare_select_candidates(
         conn, sample=args.sample, explicit_ids=explicit, exclude_ids=exclude_ids,
     )
@@ -11847,9 +11851,8 @@ def _build_tool_subcommands(sub) -> None:
     sp_cp.add_argument("--dokuwiki-base-url", default=env_default("DOKUWIKI_BASE_URL"),
                        help="DokuWiki HTTP base URL (스크린샷용)")
     sp_cp.add_argument("--rotate", action="store_true",
-                       help="이전에 발행했던 페이지를 제외하고 *새* 페이지로 selection. "
-                            "state.db meta 의 compare_publish_history 가 누적 이력. "
-                            "후보 부족 시 --reset-rotation 으로 이력 초기화.")
+                       help="(no-op, 기본 동작이 됨) 매 호출이 이전 발행 페이지를 "
+                            "제외하고 새 페이지를 selection. backward-compat 만 유지.")
     sp_cp.add_argument("--reset-rotation", action="store_true",
                        help="발행 이력 초기화 (다음 발행이 처음부터 selection). "
                             "--rotate 와 함께 또는 단독 사용 가능.")
