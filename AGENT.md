@@ -85,7 +85,8 @@ discover  →  render  →  convert  →  upload  →  rewrite-links
 | | `link-check [--check-external]` | Confluence 측 placeholder / unresolved title / 외부 URL |
 | | `history-rewrite-headers --header-format X` | 헤더 형식만 교체 (panel/info/note/quote/table/paragraphs/none) |
 | | `report` / `report-publish` | 통계 / Confluence 페이지 자동 발행 |
-| | `compare-publish [--sample N]` | 주요 페이지 양측 풀-페이지 스크린샷 → 비교 갤러리 발행/갱신 (10 카테고리 selection + per-category count `sample/8`, e.g. `--sample 20` 이면 카테고리당 2개 + 대용량 fill) |
+| | `compare-publish [--sample N] [--rotate]` | 주요 페이지 양측 풀-페이지 스크린샷 → 비교 갤러리 발행/갱신. 10 카테고리 selection + per-category count `sample/8`. `--rotate` 면 이전 발행 페이지 제외 (state.db meta 누적). `--reset-rotation` 으로 이력 초기화. 첨부 src + data-image-src + srcset 모두 v1 endpoint 으로 rewrite (thumbnails URL 도 OAuth 회피) |
+| | `audit-3way [--with-source]` | source ↔ rendered ↔ confluence 3-측 invariant audit (docs/3way-audit.md). 양측 동시 변형 / 동시 누락 검출 — 기존 audit/verify 가 못 잡는 영역. 책임 분류: source (dokuwiki 환경) vs converter (코드 fix 필요) |
 
 전체를 한 명령으로: `python run.py wizard` (14 단계 step-by-step).
 

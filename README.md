@@ -35,6 +35,7 @@ format 으로 변환, 네임스페이스 트리를 그대로 페이지 계층에
   - [Step 10. 시각 검수 (`verify build`)](#step-10-시각-검수-verify-build)
   - [Step 11. 결과 보고서 (`report-publish`)](#step-11-결과-보고서-report-publish)
   - [Step 12. 비교 갤러리 (`compare-publish`)](#step-12-비교-갤러리-compare-publish)
+  - [Step 13. 3-측 invariant audit (`audit-3way`)](#step-13-3-측-invariant-audit-audit-3way)
 - [사용 시나리오 (Recipes)](#사용-시나리오-recipes)
 - [상태 관리 (`state.db`)](#상태-관리-statedb)
 - [트러블슈팅](#트러블슈팅)
@@ -480,15 +481,44 @@ python run.py compare-publish --select start,wiki:syntax,u:lam:calendar
                                            # 명시 페이지 list
 python run.py compare-publish --dry-run    # 후보 + 캡쳐만, 발행 skip
 python run.py compare-publish --no-recapture  # 기존 PNG 재사용 (본문만 갱신)
+python run.py compare-publish --rotate --sample 20  # 이전 발행 페이지 제외 → 새 batch
+python run.py compare-publish --reset-rotation      # 이력 초기화
+python run.py compare-publish --no-track            # 발행하되 이력 추가 안 함
 ```
 
 - 자동 selection 카테고리 10종: 메인 / 사용자 시작 / iframe / encrypt / 표
   풍부 / 이미지·첨부 / info·note·warning / 매크로 다양 / 코드 / 대용량
 - per-category count = `sample/8` — `--sample 20` 이면 각 카테고리 2~3개
-- 첨부 이미지는 v1 endpoint 으로 src rewrite (Confluence `/wiki/download`
-  endpoint 가 Basic Auth 거부 → 302 redirect 통해 media binary fetch)
+- 첨부 이미지는 v1 endpoint 으로 `src` + `data-image-src` + `srcset` 모두
+  rewrite (`download/attachments` + `download/thumbnails` 양쪽, OAuth-only
+  endpoint 회피)
 - 페이지 height 자동 clip 12000px (이미지 100+ 페이지가 100MB 첨부 한도
-  초과·갤러리 비대화 회피)
+  초과·갤러리 비대화 회피) + PIL trim 으로 작은 콘텐츠 빈 영역 제거
+- iframe placeholder 위주 페이지 (calendar 등) 는 안내 박스 injection
+- `--rotate` 는 `state.db meta.compare_publish_history` 누적 — 매 발행마다
+  새 페이지 batch (한국어 doku_id NFC/NFD mismatch 자동 정규화)
+- 같은 filename 첨부는 v1 update endpoint (`/child/attachment/{aid}/data`)
+  로 새 버전 PUT — 이전 빈 캡쳐 영구 잔존 issue 회피
+
+### Step 13. 3-측 invariant audit (`audit-3way`)
+
+source ↔ rendered ↔ confluence 의 무결성 자동 검증 — 양측 *동시 변형 /
+동시 누락* 검출. 자세한 시나리오는 [`docs/3way-audit.md`](docs/3way-audit.md).
+
+```sh
+python run.py audit-3way --only u:lam:j:2019:09:27          # 한 페이지
+python run.py audit-3way --with-source --dokuwiki-data ...  # source(.txt) 활성
+python run.py audit-3way --output-json a3w.json             # 전체 + JSON
+```
+
+- 신호 5종: S1 plugin marker / S2 escape 텍스트 / D1 매크로 손실 / D2
+  wrap_color→code 오변환 / D3 image cluster 분리
+- 책임 분류: `source.{high,medium}` (dokuwiki 환경) / `converter.{high,medium}`
+  (변환기 버그) / `inconclusive`
+- INTENDED_TRANSFORMATIONS 화이트리스트: monthcal_fallback / youtube_fallback
+  / smiley_to_emoji / todo_inline_text (변환기의 의도된 변형은 위반 아님)
+- 본 인스턴스 결과: 1675 페이지 → 7 violation (0.42%), converter 측 0
+  (변환기 완벽)
 
 ---
 

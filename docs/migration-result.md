@@ -107,6 +107,50 @@ CL 53121-53269. *대규모 변환기 보강 + 라이브 적용 사이클*.
 비교 갤러리 (cid=2526937148) 8 페이지 → 20 페이지 갱신, 첨부 40/40 OK,
 이미지·표·iframe 모두 정상.
 
+## Day 5 §7 audit-3way 시나리오 구현 + 비교 갤러리 5종 추가 fix + 로테이션
+
+사용자 발견 + 후속 검토 사이클. 코드 6 CL 누적.
+
+### audit-3way 구현 — 1675 페이지 정수 검사
+
+`docs/3way-audit.md` 시나리오의 P1+P3 구현 (CL 53522, 53529).
+
+| 단계 | violation 페이지 | 비율 |
+|------|------------------|------|
+| 초기 audit | 149 | 8.9% |
+| S1 wrap regex 보강 | 114 | 6.8% |
+| S2 known plugin 필터 | 11 | 0.7% |
+| youtube VID 변환기 + intent 화이트리스트 | **7** | **0.42%** |
+
+- converter.high / medium: **모두 0** (변환기 완벽)
+- 변환기 fix 자율 (4 페이지): `<p>VID</p>` 단독 paragraph → Confluence
+  iframe macro (`_convert_youtube_fallback` 의 `_YOUTUBE_VID_ONLY_RE` 케이스)
+- 남은 7 페이지: source 측 plugin 누락 / 환경 issue (NFD 정규화 등)
+- 신규 22 unit tests (`tests/test_audit_3way.py`)
+
+### 비교 갤러리 5종 추가 fix
+
+| issue | 원인 | fix |
+|-------|------|-----|
+| 빈 PNG 캡쳐 (b:edit:start 등 작은 콘텐츠) | full_page=False + set_viewport_size(scrollHeight) → 빈 영역 노출 | viewport clip + PIL ImageChops.difference trim (CL 53638/53644) |
+| 거대 페이지 OOM hang (u:oh:모든_기록) | full_page=True 가 13MB+ PNG 메모리 폭증 | viewport 12000px clip + PIL skip threshold 5MB |
+| iframe placeholder 페이지 빈 박스 | view body API 가 iframe macro 를 빈 placeholder 로 응답 | placeholder 위에 노란 안내 박스 injection (CL 53638) |
+| 같은 filename 첨부 갱신 미작동 (한국어 페이지 32KB 빈 PNG 잔존) | POST /child/attachment 가 400 "same file name" → ok 마킹만 + 갱신 안 함 | 2-step upload: 400 시 GET 으로 aid 조회 후 POST /child/attachment/{aid}/data (CL 53828) |
+| 95 이미지 다수 페이지 모두 깨짐 (u:lam:j:2019:09:27 검은사막) | view body img src=`download/thumbnails/...` (OAuth-only) — 기존 rewrite 가 `attachments` 만 매치 | rewrite 함수 확장: `(src\|data-image-src)="...download/(attachments\|thumbnails)/..."` + srcset 별도 처리 (CL 53840) |
+
+### `--rotate` 로테이션 옵션 (CL 53845)
+
+같은 페이지 반복 발행 한계 해소:
+- `state.db meta.compare_publish_history` 누적 (개행 구분 doku_id list)
+- `--rotate`: 이전 발행 페이지 selection 제외 → 매번 새 batch
+- `--reset-rotation`: 이력 초기화
+- `--no-track`: 발행 후 이력에 추가 안 함 (테스트)
+- macOS APFS NFD 한국어 doku_id ↔ NFC seed mismatch 대응 — 양측 NFC 정규화
+
+비교 갤러리 20 페이지 새 batch 발행 — start / 게임구매내역 등 *이전 20*
+제외, blog:draft:start / u:neoocean:c:pt03b / u:lam:출퇴근기록 / wiki:til
+등 *새 20* 페이지 (rotation 이력 총 40).
+
 ---
 
 # Day 4 — 2026-05-19 (struct → native+properties 라이브 적용)
