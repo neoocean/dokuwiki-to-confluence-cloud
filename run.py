@@ -2877,7 +2877,12 @@ def cmd_rewrite_links(args: argparse.Namespace) -> int:
         total_unresolved += len(unresolved_phs)
 
         new_hash = sha256_bytes(new_xml.encode("utf-8"))
-        if new_hash == old_hash:
+        # storage 가 안 바뀌었어도 Confluence 에 PUT 안 된 상태일 수 있음
+        # (이전 dry-run 이 디스크 + content_hash 만 갱신하고 PUT skip 한 경우).
+        # uploaded_hash 메타와 다르면 PUT 필요.
+        uploaded_hash = db_get_meta(conn, f"uploaded_hash:{doku_id}") or ""
+        needs_push = (new_hash != uploaded_hash) and bool(confluence_page_id)
+        if new_hash == old_hash and not needs_push:
             no_change += 1
             # 그래도 links 테이블의 resolved 플래그는 갱신
             for ph in resolved_phs:
@@ -9751,6 +9756,14 @@ def cmd_wizard(args: argparse.Namespace) -> int:
 
 
 # § compare-publish (DokuWiki/Confluence 양측 스크린샷 + 비교 갤러리 발행)
+
+# 비교 갤러리 영구 제외 목록 — 본문이 의도적으로 빈 페이지.
+# 양측 모두 텅 빈 박스라 비교 가치가 없음. 사용자가 `--select` 로 명시하면 우회.
+# (예: `start` 는 2024-05-30 이후 본문이 `~~NOTOC~~` 한 줄로 비워진 상태 —
+#  woojinkim.org 가 dokuwiki → GitHub Pages 로 이주하면서 정리된 잔해.)
+_COMPARE_PERMANENT_EXCLUDE: set[str] = {"start", "sidebar"}
+
+
 def _compare_select_candidates(
     conn: sqlite3.Connection,
     *,
@@ -9807,6 +9820,7 @@ def _compare_select_candidates(
     # byte mismatch — 양측 NFC 정규화 후 비교.
     import unicodedata as _ud
     excluded_nfc = {_ud.normalize("NFC", x) for x in (exclude_ids or set())}
+    excluded_nfc |= _COMPARE_PERMANENT_EXCLUDE
     def _is_excluded(doku_id: str) -> bool:
         return _ud.normalize("NFC", doku_id) in excluded_nfc
     seen: set[str] = set()  # 같은 batch 안의 중복 방지

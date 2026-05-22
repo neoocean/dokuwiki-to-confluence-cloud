@@ -151,6 +151,122 @@ CL 53121-53269. *대규모 변환기 보강 + 라이브 적용 사이클*.
 제외, blog:draft:start / u:neoocean:c:pt03b / u:lam:출퇴근기록 / wiki:til
 등 *새 20* 페이지 (rotation 이력 총 40).
 
+## Day 5 §8 dwk 스크린샷 이미지 누락 fix — `.htaccess` + 한국어 NFC 정규화
+
+사용자 발견 — 새 batch 갤러리의 *DokuWiki 측 dwk 스크린샷* 이 일부
+페이지에서 *이미지 모두 누락* (텍스트만, 56~95 img tag 모두 0×0).
+
+### 두 단계 mismatch chain
+
+| 단계 | 원인 | 결과 |
+|------|------|------|
+| `.htaccess` 부재 (영문/한국어 모두) | DokuWiki `userewrite=1` 설정 + Apache `.htaccess` 부재 — `/_media/...` URL 이 mod_rewrite 못 받음 | 모든 미디어 404 |
+| NFD ↔ NFC byte mismatch (한국어만) | macOS APFS 가 NFD 저장 + DokuWiki 가 NFC URL 생성 + 컨테이너 PHP `file_exists()` byte-exact 비교 | 한국어 파일명 미디어 404 |
+
+### Fix 1 — `.htaccess` 자동 생성 (CL 53853)
+
+새 helper `_dev_ensure_htaccess(clone_root)`:
+- `.htaccess` 있으면 skip
+- `.htaccess.dist` 있으면 그것 복원
+- 둘 다 없으면 모듈 상수 `_DOKUWIKI_HTACCESS` (공식 rewrite rules:
+  `_media/`, `_detail/`, `_export/`, clean URL) 작성
+- `dev up` 흐름 `_dev_patch_acl_off` 직후 호출
+
+효과: 영문 파일명 미디어 정상 fetch. 검증: `curl /_media/wiki/logo.png`
+→ 200 OK, Playwright `naturalWidth=64`.
+
+### Fix 2 — 한국어 파일명 NFC 정규화 (CL 53861)
+
+새 helper `_dev_normalize_filenames_to_nfc(clone_root)`:
+- `data/media` + `data/pages` 하위 모든 비-ASCII 파일을 `os.walk` 로 스캔
+- NFD 파일을 NFC name 으로 *추가 cp* (`shutil.copy2`) — 원본 보존
+- macOS APFS 동등 비교 + cp 가 *directory entry 갱신* → 컨테이너 PHP 가
+  NFC byte 로도 `file_exists()` 매치 가능 (실험 검증)
+- `dev up` 흐름 htaccess 직후 호출
+
+검증 실험:
+```
+file_exists($nfd_bytes) → YES  (실제 file)
+file_exists($nfc_bytes) → NO   (cp 전)
+cp NFD NFC  →  "same file" 응답 (APFS 동등 비교)
+file_exists($nfc_bytes) → YES  (cp 후, directory entry 갱신 효과)
+```
+
+본 인스턴스: 1926 file cp 처리. 결과 — `curl /_media/%EA%B5%AC%ED%98%84...`
+(NFC URL) → 200 OK.
+
+### 결과
+
+- 비교 갤러리 (cid=2526937148) dwk 재 캡쳐 + 발행, 40/40 첨부 OK
+- u:oh:2017-10-2w 등 한국어 파일명 페이지의 dwk 이미지 모두 정상 표시
+- DokuWiki core 의 fetch.php / mediaFN 패치 *회피* — vendor 코드 무수정
+- 다른 macOS 인스턴스 마이그레이션 시 `dev up` 자동 처리 (ACL bypass +
+  htaccess + plugin 자동 설치 + NFC 정규화 4 단계)
+
+## Day 5 §9 dwc-link 잔존 데드락 — `rewrite-links` uploaded_hash 비교 + start 영구 제외
+
+사용자 발견 — `u:oh:2018-02-2w` 같은 페이지에 *깨진 placeholder/글로브
+아이콘* 잔뜩. 원인은 이미지 누락이 아니라 *변환 placeholder `dwc-link:`
+가 storage 에 raw 잔존* + Confluence 가 unknown scheme 으로 인식 →
+외부 링크처럼 globe icon (🌐) 부여.
+
+### 진단
+
+| 검증 | 값 |
+|------|----|
+| storage `u:oh:2018-02-2w` 의 `<ac:image>` | 4 (모두 첨부 매칭 OK) |
+| 같은 storage 의 `<a href="dwc-link:...">` | **75 (raw 잔존)** |
+| 전체 links 테이블 resolved=0 | **7943 / 7943** (0 처리됨) |
+| dwc-link 가진 페이지 | 345 |
+
+### 데드락 원인 (CL 53868)
+
+`cmd_rewrite_links` 의 dry-run 정의가 "Confluence PUT 안 함" *뿐* —
+로컬 storage 와 `pages.content_hash` 는 갱신. 흐름:
+
+1. dry-run 1 회 → storage + content_hash 갱신 (PUT skip)
+2. 라이브 재실행 → `new_hash == old_hash` → `no_change` 분기 → *PUT 영구
+   skip* (uploaded_hash 비교 없음)
+3. Confluence 페이지엔 dwc-link raw 잔존 + 글로브 아이콘 = "이미지 누락"
+   로 인지
+
+### Fix 1 — uploaded_hash 비교 추가 (run.py:2880)
+
+```python
+new_hash = sha256_bytes(new_xml.encode("utf-8"))
+uploaded_hash = db_get_meta(conn, f"uploaded_hash:{doku_id}") or ""
+needs_push = (new_hash != uploaded_hash) and bool(confluence_page_id)
+if new_hash == old_hash and not needs_push:
+    no_change += 1
+    ...
+    continue
+```
+
+`content_hash` (로컬 변환 상태) 와 `uploaded_hash` (최종 push 상태) 를
+분리. PUT 결정은 *실제 upload 흔적* 기준.
+
+### Fix 2 — `start` / `sidebar` 영구 제외 (run.py:9755)
+
+```python
+_COMPARE_PERMANENT_EXCLUDE: set[str] = {"start", "sidebar"}
+```
+
+`_compare_select_candidates` 의 `_is_excluded` 에 union. 본 인스턴스의
+`start.txt` 는 2024-05-30 이후 `~~NOTOC~~` 한 줄로 비워짐 (woojinkim.org
+가 GitHub Pages 로 이주한 흔적) — 비교 갤러리에서 양측 빈 박스만 보임.
+`--select` 명시 시는 우회.
+
+### 결과
+
+- 단일 페이지 (`u:oh:2018-02-2w`) 라이브 PUT v111 → view body dwc-link 0,
+  72 link 정상 변환 확인
+- 전체 345 페이지 rewrite-links 라이브:
+  - rewritten=280 / pushed=219 / no-change=23 / **failed=61**
+  - 링크 해결=1284 / 미해결=3358
+- 비교 갤러리 (cid 2526937148) 19 페이지 (start 제외) 재캡쳐 + 재발행
+- 잔여: failed 61 페이지는 *본문 한도 초과 (Confluence 5MB)* 같은 별개
+  결함 — 다음 사이클에서 *상위/하위 분할* 전략 처리
+
 ---
 
 # Day 4 — 2026-05-19 (struct → native+properties 라이브 적용)
