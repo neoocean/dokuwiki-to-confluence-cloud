@@ -14,8 +14,19 @@
 
 | 감지 | 동작 |
 |------|------|
-| **full install** (`doku.php` + `lib/` + `inc/`) | 기존 동작 — APFS clonefile 로 복제 후 ACL off 패치 |
-| **data-only** (`pages/` + `media/` 만 있음) | DokuWiki stable tarball (`download.dokuwiki.org`) 자동 다운로드 → 압축 풀기 → 데이터 / `conf/` overlay → 누락 플러그인 자동 감지·설치 → ACL off → 컨테이너 기동 |
+| **full install** (`doku.php` + `lib/` + `inc/`) | APFS clonefile 로 복제 후 4 단계 자동 처리 (아래) |
+| **data-only** (`pages/` + `media/` 만 있음) | DokuWiki stable tarball (`download.dokuwiki.org`) 자동 다운로드 → 압축 풀기 → 데이터 / `conf/` overlay → 4 단계 자동 처리 → 컨테이너 기동 |
+
+`dev up` 의 4 단계 자동 처리 (clone 직후, 호스트 원본 불변):
+
+1. **ACL bypass** — `_dev_patch_acl_off` 가 `conf/local.php` 의 `$conf['useacl']` 을 0 으로
+2. **`.htaccess` 자동 생성** — `_dev_ensure_htaccess`: `.htaccess.dist` 복원 또는
+   공식 mod_rewrite 룰 작성. `userewrite=1` 인스턴스의 `/_media/...` 가
+   404 안 되도록
+3. **플러그인 자동 감지·설치** — 아래 3 소스 + `PLUGIN_DOWNLOADS` 매핑 tarball 다운로드
+4. **한국어 파일명 NFC 정규화** — `_dev_normalize_filenames_to_nfc`: macOS APFS 가
+   NFD 로 저장한 한국어 파일을 NFC name 으로 추가 cp. 안 하면 DokuWiki 의
+   NFC URL → 컨테이너 PHP `file_exists()` byte-exact 비교 실패 → 404
 
 플러그인 자동 감지 (3 소스):
 1. `conf/plugins.local.php` 의 `$plugins['name'] = 1`
@@ -173,13 +184,38 @@ FAILED 페이지가 있으면 `--only <doku_id>` 로 개별 재시도. 매번 `l
 
 ## 8. 별도 트랙 + 사후 처리 서브커맨드
 
-라이브 1차 후 *오류 / 한도 초과* 처리 자동화 (2026-05-19 적용):
+라이브 1차 후 *오류 / 한도 초과* 처리 자동화:
 
 ```sh
 # OVERSIZED 첨부 (>100MB) → 본문에 note 매크로 메타 박스
 python run.py rewrite-oversized
-# 본문 거부된 페이지 → skeleton + 원본 storage zip 첨부 (자식 첨부 회복)
+
+# 본문 한도 초과 페이지를 H 단위 child 페이지 분할 (원본 본문 보존, 권장)
+python run.py split-oversize --only u:neoocean:2020 --dry-run   # 사전 확인
+python run.py split-oversize --max-chunk 100000                  # status=FAILED 자동 대상
+# parent = info + Children Display 매크로 (자동 목록). idempotent — title 매칭 PUT.
+# `_split_storage_by_heading` 가 H2 → 초과 시 H3/H4 재귀 분할 + 인접 chunk 합치기.
+# `_sanitize_empty_attachment_links` 가 빈 ri:filename 의 ac:link 를 평문 격하
+# (Confluence 가 빈 ri:filename 을 500 INTERNAL_SERVER_ERROR 거부하는 워크어라운드).
+# NFC/NFD `--only` argument — macOS APFS 의 한국어 doku_id 양쪽 매칭.
+
+# 본문 거부된 페이지를 skeleton + storage zip 으로 폴백 (원본 본문 폐기)
 python run.py rewrite-oversized-pages
+
+# 3-측 invariant audit (source ↔ rendered ↔ confluence)
+python run.py audit-3way --only <doku_id>                                # 한 페이지
+python run.py audit-3way --with-source --dokuwiki-data <dwdata>          # source 활성
+python run.py audit-3way --output-json a3w.json --severity-threshold high
+# 신호 5종 (S1/S2 = dokuwiki 환경 / D1/D2/D3 = 변환기) + INTENDED_TRANSFORMATIONS
+# 화이트리스트. 책임 분류 source.{high,medium} / converter.{high,medium} / inconclusive.
+# 본 인스턴스: 1675 페이지 → violation 7 (0.42%), converter 측 0. 자세히: docs/3way-audit.md
+
+# 비교 갤러리 (시각 검증) — 매 호출이 이전 발행 페이지 자동 exclude
+python run.py compare-publish --sample 20                                # 기본
+python run.py compare-publish --reset-rotation                           # 이력 초기화
+python run.py compare-publish --select start,wiki:syntax,u:lam:calendar  # 명시 (영구 제외 우회)
+# `_COMPARE_PERMANENT_EXCLUDE = {"start", "sidebar"}` 영구 제외 (양측 빈 페이지 비교 가치 없음).
+# 첨부 src+data-image-src+srcset 모두 v1 endpoint 으로 rewrite (Basic Auth 통과).
 ```
 
 별도 트랙:
@@ -201,7 +237,7 @@ python run.py struct-upload --mode native                             # 빈 Data
 python run.py struct-embed-on-bound-pages                             # bound 페이지에 "관련 struct 데이터" 패널
 python run.py struct-status                                           # 진행 요약
 
-# 사용자 시각 검수 (docs/visual-audit.md Phase 1 + 2 + 3)
+# 사용자 시각 검수 (docs/visual-audit.md Phase 1 + 2 + 3 + 4)
 python run.py verify build --sample 200                               # 상위 200, 기본 (의존성 없음)
 python run.py verify build --sample 200 \
     --with-confluence-view --with-attachment-check                    # 권장: 실 본문 + 첨부 점검

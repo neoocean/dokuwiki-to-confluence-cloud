@@ -76,6 +76,14 @@
 - 모든 페이지가 생성되어 doku_id → confluenceId 매핑이 완성된 후,
   S3 에서 placeholder 로 남겨둔 내부 링크를 실제 페이지로 치환하고 필요한 페이지만 재업데이트한다.
 - 미해결 링크(외부/삭제된 페이지)는 빨간 표시 대신 일반 텍스트 + 주석으로 남긴다.
+- **PUT 결정은 두 hash 비교** (CL 53876 / git f0d50c7):
+  - `pages.content_hash` — 마지막 변환 완료 상태 (local storage)
+  - `meta.uploaded_hash:<doku_id>` — 마지막 Confluence push 성공 본문
+  - `new_hash != uploaded_hash` 이면 *현 Confluence 본문* 과 다른 상태 → PUT 강제
+- 데드락 fix: dry-run 한 번 호출이 storage + content_hash 만 갱신
+  (PUT 은 skip) → 라이브 재실행에서 `new_hash == old_hash` 분기로 영구
+  no-push 가 되던 흐름을 *uploaded_hash 보조 비교* 로 해소. 본 인스턴스의
+  `dwc-link:` 7943 link / 345 page raw 잔존 사태의 직접 원인.
 
 ### S8. 멱등성과 재실행
 
@@ -379,11 +387,40 @@ Confluence 키 도착 후 라이브 업로드를 안전하게 수행하는 단�
 (`status`/`report`/`lint`), 소규모 검증(`upload --only`) → 전체 →
 `rewrite-links` 순서, FAILED 대응, 롤백 SQL.
 
+## 11b. 본문 한도 초과 페이지 (별도 트랙)
+
+본문 storage XML 이 Confluence 한도를 넘어 POST/PUT 이 거부되는 경우의
+대응. 두 모드가 **보완** 관계 — 데이터 가치별 선택:
+
+- `python run.py split-oversize` — H 단위 자식 페이지 분할 (원본 본문
+  보존, 검색·탐색 가능). 권장.
+- `python run.py rewrite-oversized-pages` — skeleton + storage zip 첨부
+  (원본 본문 폐기, 첨부 다운로드해야 열람).
+
+자세히: [`docs/oversized-pages.md`](oversized-pages.md). 본 인스턴스
+적용: 416KB / 1.4MB 두 페이지가 split-oversize 로 6/15 child 회복.
+
+## 11c. 3-측 invariant audit (별도 트랙)
+
+source ↔ rendered ↔ confluence 의 양측 *동시 변형 / 동시 누락* 검출. 기존
+`audit` (rendered vs confluence) 가 못 잡는 *원본 source 측 변형* 도
+포함:
+
+```sh
+python run.py audit-3way --with-source --dokuwiki-data <dwdata>
+```
+
+신호 5종 (S1/S2 = dokuwiki 환경 / D1/D2/D3 = 변환기) +
+`INTENDED_TRANSFORMATIONS` 화이트리스트. 책임 분류: `source.{high,medium}` /
+`converter.{high,medium}` / `inconclusive`. 본 인스턴스 결과: 1675 페이지
+→ violation 7 (0.42%), converter 측 0. 자세히:
+[`docs/3way-audit.md`](3way-audit.md).
+
 ## 12. 다음 단계
 
-본 인스턴스의 라이브 마이그레이션은 **Day 1-4 모두 완료** (2026-05-19).
-누적 결과는 [`docs/migration-result.md`](migration-result.md) 참고.
-새 작업 후보:
+본 인스턴스의 라이브 마이그레이션은 **Day 1-5 + 후반 사이클 모두 완료**
+(2026-05-21). 누적 결과는 [`docs/migration-result.md`](migration-result.md)
+참고. 새 작업 후보:
 
 - 6개월 후 Atlassian Database API 의 컬럼/row 공개 여부 재 probe
   (`python run.py struct-upload --probe`). 공개되면 [`struct-migration.md`](struct-migration.md) §3.1

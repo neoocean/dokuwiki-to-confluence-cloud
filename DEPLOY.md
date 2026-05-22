@@ -109,7 +109,8 @@ $EDITOR .secrets/confluence.env
 set -a; source .secrets/confluence.env; set +a
 
 # 5) 테스트 + 동작 확인
-python -m pytest tests/ -q                  # 84 통과
+python -m pytest tests/ -q                  # 190 통과 (~0.3초)
+python run.py                                # 도움말 + exit 0
 python run.py wizard --status                # 빈 진행 표
 ```
 
@@ -118,6 +119,21 @@ python run.py wizard --status                # 빈 진행 표
 ```sh
 python run.py wizard --from-step prereq --yes
 # 정상이면: env vars OK + docker/curl/tar available 표시
+```
+
+`.env.example` 의 값 형식 (모두 `.secrets/confluence.env` 로 옮긴 뒤
+편집):
+
+```ini
+CONFLUENCE_EMAIL=you@example.org
+CONFLUENCE_API_TOKEN=ATATT3xFf...                 # id.atlassian.com 에서 발급
+CONFLUENCE_BASE_URL=https://your-domain.atlassian.net/wiki
+CONFLUENCE_SPACE_KEY=MIGRATE                      # 공간 설정 → 공간 키
+CONFLUENCE_ROOT_PAGE_ID=123456789                 # 빈 페이지 1개 만들어 그 id
+DOKUWIKI_SRC=/Users/you/dokuwiki/data             # full install 또는 data-only
+DOKUWIKI_BASE_URL=http://127.0.0.1:18080          # dev up 사용 시. 라이브면 그 URL
+# 옵션
+ANTHROPIC_API_KEY=sk-ant-...                      # verify build --with-vision 사용 시
 ```
 
 ---
@@ -129,7 +145,25 @@ python run.py wizard
 # 14 단계 차례 — [Enter]/s/q/d 프롬프트
 ```
 
-자세한 흐름은 [README.md](README.md) 의 `빠른 시작 — wizard 한 줄`.
+자세한 흐름은 [README.md](README.md) 의 `빠른 시작 — wizard 한 줄` +
+실제 콘솔 출력 walkthrough 는 [`docs/wizard-walkthrough.md`](docs/wizard-walkthrough.md).
+
+### macOS 사용자: `dev up` 자동 처리 4 단계
+
+`python run.py dev up` 이 호스트 데이터 clone 직후 다음을 자동 수행
+(원본 호스트 디렉터리는 손대지 않음):
+
+1. **ACL bypass 패치** — clone 의 `conf/local.php` 에 `$conf['useacl'] = 0` 주입
+2. **`.htaccess` 자동 생성** — `userewrite=1` 인 인스턴스의 `/_media/...` URL
+   mod_rewrite rules. 부재 시 미디어가 모두 404
+3. **플러그인 자동 감지·설치** — `conf/plugins.local.php` / `meta/struct.sqlite3` /
+   `~~MACRO~~` 스캔 → release tarball URL 매핑 (`PLUGIN_DOWNLOADS`) 따라 다운로드
+4. **한국어 파일명 NFC 정규화** — APFS 가 NFD 로 저장한 한국어 파일명을
+   NFC name 으로 추가 cp. 안 하면 컨테이너 PHP 의 `file_exists()` 가
+   byte-exact 비교로 404
+
+Linux 호스트는 (3) 만 동작 — (1) 은 필요 시 수동, (2) 는 보통 dist
+파일 존재, (4) 는 ext4 가 NFC 저장이라 불필요.
 
 ---
 

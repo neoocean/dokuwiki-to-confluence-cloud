@@ -1,11 +1,22 @@
-# 3-측 렌더링 invariant audit (시나리오)
+# 3-측 렌더링 invariant audit
 
 본 문서는 사용자가 비교 갤러리 (`compare-publish`) 의 양측 스크린샷을
 *직접* 비교하여 발견한 4 사례를 일반화해 *코드로 자동 검출* 하는 방안을
 정리한다. 기존 audit / verify Phase 1-4 가 못 잡는 *3-측 무결성* 신호.
 
-상태: **시나리오 (미구현)**. 구현 시 `verify` 또는 새 명령 `audit-3way`
-로 통합 후속 사이클.
+**상태 (2026-05-21): 구현 완료 (P1+P2, CL 53522/53529).** 새 명령
+`audit-3way` 가 본 시나리오의 신호 5종 (S1/S2/D1/D2/D3) + INTENDED_TRANSFORMATIONS
+화이트리스트 + 책임 분류 (`source.{high,medium}` / `converter.{high,medium}` /
+`inconclusive`) 을 지원. 본 인스턴스 1675 페이지 실측 결과 **violation 7
+(0.42%), converter 측 0** — 변환기 완벽 검증 도구로도 작동. 22 unit
+tests (`tests/test_audit_3way.py`).
+
+```sh
+python run.py audit-3way --only u:lam:calendar                          # 한 페이지
+python run.py audit-3way --with-source --dokuwiki-data <dwdata>         # source 활성
+python run.py audit-3way --sample 200 --output-json a3w.json
+python run.py audit-3way --severity-threshold high                      # exit 1 임계
+```
 
 ---
 

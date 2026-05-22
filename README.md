@@ -30,7 +30,7 @@ format 으로 변환, 네임스페이스 트리를 그대로 페이지 계층에
   - [Step 5. 내부 링크 해소 (`rewrite-links`)](#step-5-내부-링크-해소-rewrite-links)
   - [Step 6 (옵션). 과거 리비전 (`history-*`)](#step-6-옵션-과거-리비전-history-)
   - [Step 7 (옵션). struct 데이터 (`struct-*`)](#step-7-옵션-struct-데이터-struct-)
-  - [Step 8 (옵션). 본문/첨부 한도 폴백 (`rewrite-oversized*`)](#step-8-옵션-본문첨부-한도-폴백-rewrite-oversized)
+  - [Step 8 (옵션). 본문/첨부 한도 폴백 (`split-oversize` / `rewrite-oversized*`)](#step-8-옵션-본문첨부-한도-폴백-split-oversize--rewrite-oversized)
   - [Step 9. 검증 (`audit`/`lint`/`report`/`preview`)](#step-9-검증-auditlintreportpreview)
   - [Step 10. 시각 검수 (`verify build`)](#step-10-시각-검수-verify-build)
   - [Step 11. 결과 보고서 (`report-publish`)](#step-11-결과-보고서-report-publish)
@@ -111,7 +111,7 @@ $EDITOR .secrets/confluence.env       # 모든 placeholder 채우기
 set -a; source .secrets/confluence.env; set +a
 
 # 5) 동작 확인
-python -m pytest tests/ -q                # 84 통과 (~0.2초)
+python -m pytest tests/ -q                # 190 통과 (~0.3초)
 python run.py                              # 도움말 + exit 0
 python run.py wizard --status              # wizard 진행 표 (빈 상태)
 ```
@@ -221,9 +221,25 @@ python run.py dev down
 python run.py dev down --purge   # 클론 /tmp/dwc_test_dokuwiki 도 삭제
 ```
 
+`dev up` 은 호스트 데이터 clone 직후 다음을 자동 수행 (원본 호스트 디렉터리는
+손대지 않음):
+
+1. **ACL bypass** — clone 의 `conf/local.php` 에 `$conf['useacl'] = 0` 주입.
+   anonymous 읽기 차단을 우회해 export_xhtmlbody 가 모든 페이지 응답 가능.
+2. **`.htaccess` 자동 생성** (`_dev_ensure_htaccess`) — `userewrite=1` 인스턴스의
+   `/_media/...` URL 이 mod_rewrite 룰 없으면 모두 404. 부재 시 dist 복원
+   또는 공식 룰 작성.
+3. **플러그인 자동 감지·설치** — `conf/plugins.local.php` + `meta/struct.sqlite3` +
+   `~~MACRO~~` 스캔 → `PLUGIN_DOWNLOADS` 매핑 따라 tarball 다운로드.
+4. **한국어 파일명 NFC 정규화** (`_dev_normalize_filenames_to_nfc`) — macOS APFS 가
+   NFD 로 저장한 한국어 미디어/페이지 파일에 NFC name 추가 cp. 컨테이너 PHP 의
+   `file_exists()` byte-exact 매치 회피. 1900+ 파일 cp 가능 (원본 보존).
+
 자동 설치되는 플러그인 (release tarball URL 매핑 내장):
-- 외부: wrap, struct, todo, discussion, blog, include, pagelist, tag, tagging, sqlite
-- core 번들 (별도 설치 불필요): info, config, acl, extension, usermanager, styling, auth*(plain/ad/ldap/pdo), safefnrecode, upgrade
+- 외부: wrap, struct, todo, discussion, blog, include, pagelist, tag, tagging,
+  sqlite, htmlok, encryptedpasswords, monthcal, iframe (Chris--S), youtube 등
+- core 번들 (별도 설치 불필요): info, config, acl, extension, usermanager,
+  styling, auth*(plain/ad/ldap/pdo), safefnrecode, upgrade
 
 매핑에 없는 플러그인은 `unknown` 으로 표시 — 컨테이너 기동 후
 `http://127.0.0.1:18080/doku.php?do=admin&page=extension` 에서 수동 설치.
@@ -302,13 +318,25 @@ python run.py upload --limit 10
 
 ```sh
 python run.py rewrite-links              # 라이브
-python run.py rewrite-links --dry-run    # 검증
+python run.py rewrite-links --dry-run    # 검증 — storage + content_hash 갱신, Confluence PUT skip
 python run.py rewrite-links --only wiki:syntax
 ```
 
 `links` 테이블의 placeholder (`dwc-link:<target>`) 를 실제
 `<ac:link><ri:page ri:content-title="..."/>` 로 치환. 변경된 페이지만
 재 PUT.
+
+PUT 결정은 두 hash 기준 (CL 53876 / git f0d50c7):
+
+| hash | 의미 |
+|------|------|
+| `pages.content_hash` | 마지막 변환 완료 상태 (local storage) |
+| `meta.uploaded_hash:<doku_id>` | 마지막 Confluence push 성공 본문 |
+
+`content_hash == uploaded_hash` 가 아니면 PUT 강제. dry-run 한 번 실행
+후 라이브 재실행 시 local storage 가 이미 갱신돼 *데드락* (PUT 영구 skip)
+이 생기던 데 대한 fix — `dwc-link:` 가 7943 link / 345 page 에 raw 잔존
+하던 본 인스턴스 사태의 직접 원인이었다.
 
 ### Step 6 (옵션). 과거 리비전 (`history-*`)
 
@@ -370,15 +398,27 @@ Database 객체는 빈 쉘로만 존재 (id 는 `struct_schemas.confluence_db_id
 
 자세히: [`docs/struct-migration.md`](docs/struct-migration.md).
 
-### Step 8 (옵션). 본문/첨부 한도 폴백 (`rewrite-oversized*`)
+### Step 8 (옵션). 본문/첨부 한도 폴백 (`split-oversize` / `rewrite-oversized*`)
 
 ```sh
 # 100MB+ 첨부 → note 매크로 박스로 표시 (실제 파일은 P4 백업 안내)
 python run.py rewrite-oversized
 
-# 본문 거부된 페이지 → skeleton + 원본 storage XML 첨부 (zip)
+# 본문 한도 초과 페이지를 H1/H2/H3 단위로 child 페이지 분할 — 원본 본문 보존 (권장)
+python run.py split-oversize --only u:neoocean:2020 --dry-run
+python run.py split-oversize --max-chunk 100000          # status=FAILED 자동 대상
+# parent = info + Children Display 매크로 (자동 목록). idempotent — 재실행 시 title 매칭 PUT.
+
+# 본문 거부된 페이지 → skeleton + 원본 storage XML 첨부 (zip) — 원본 본문 폐기
 python run.py rewrite-oversized-pages
 ```
+
+`split-oversize` 와 `rewrite-oversized-pages` 는 **보완** 관계:
+
+| 명령 | 원본 본문 | 사용자 경험 | 대상 |
+|------|----------|-------------|------|
+| `split-oversize` | 보존 (자식 페이지) | 트리에서 자식 페이지 탐색·검색 가능 | *데이터 가치 높은* 페이지 (긴 일지 등) |
+| `rewrite-oversized-pages` | 폐기 (zip 첨부에만) | skeleton + 첨부 다운로드 안내 | *잡다 메모* 페이지 |
 
 자세히: [`docs/oversized-attachments.md`](docs/oversized-attachments.md) /
 [`docs/oversized-pages.md`](docs/oversized-pages.md).
@@ -475,30 +515,35 @@ DokuWiki 와 Confluence 측을 헤드리스 Chromium 으로 풀-페이지 캡쳐
 Confluence 루트 하위에 갤러리 페이지 발행/갱신.
 
 ```sh
-python run.py compare-publish              # 기본 8 페이지 자동 선정
+python run.py compare-publish              # 기본 8 페이지 — 이전 발행 페이지는 자동 제외
 python run.py compare-publish --sample 20  # 카테고리당 2~3개로 늘림
 python run.py compare-publish --select start,wiki:syntax,u:lam:calendar
-                                           # 명시 페이지 list
+                                           # 명시 페이지 list — _COMPARE_PERMANENT_EXCLUDE 우회
 python run.py compare-publish --dry-run    # 후보 + 캡쳐만, 발행 skip
 python run.py compare-publish --no-recapture  # 기존 PNG 재사용 (본문만 갱신)
-python run.py compare-publish --rotate --sample 20  # 이전 발행 페이지 제외 → 새 batch
-python run.py compare-publish --reset-rotation      # 이력 초기화
-python run.py compare-publish --no-track            # 발행하되 이력 추가 안 함
+python run.py compare-publish --reset-rotation      # 발행 이력 초기화 → 처음부터 selection
+python run.py compare-publish --no-track            # 발행하되 이력 추가 안 함 (테스트)
 ```
 
+- **매 호출이 자동으로 이전 발행 페이지 제외** (default behavior since CL 53888).
+  `state.db meta.compare_publish_history` 에 doku_id 누적 → 다음 selection 에서
+  exclude. 구 `--rotate` flag 는 backward-compat no-op (help 만 갱신됨).
+- `_COMPARE_PERMANENT_EXCLUDE = {"start", "sidebar"}` — 본문 빈 페이지 영구 제외
+  (양측 빈 박스만 보이는 페이지는 비교 가치 없음). `--select` 명시 시 우회.
 - 자동 selection 카테고리 10종: 메인 / 사용자 시작 / iframe / encrypt / 표
   풍부 / 이미지·첨부 / info·note·warning / 매크로 다양 / 코드 / 대용량
 - per-category count = `sample/8` — `--sample 20` 이면 각 카테고리 2~3개
 - 첨부 이미지는 v1 endpoint 으로 `src` + `data-image-src` + `srcset` 모두
   rewrite (`download/attachments` + `download/thumbnails` 양쪽, OAuth-only
-  endpoint 회피)
+  endpoint 회피 — `_compare_rewrite_attachment_urls`)
 - 페이지 height 자동 clip 12000px (이미지 100+ 페이지가 100MB 첨부 한도
-  초과·갤러리 비대화 회피) + PIL trim 으로 작은 콘텐츠 빈 영역 제거
+  초과·갤러리 비대화 회피) + PIL trim (`_compare_clip_oversize`) 으로
+  작은 콘텐츠 빈 영역 제거 — PIL skip threshold 5MB (OOM 방지)
 - iframe placeholder 위주 페이지 (calendar 등) 는 안내 박스 injection
-- `--rotate` 는 `state.db meta.compare_publish_history` 누적 — 매 발행마다
-  새 페이지 batch (한국어 doku_id NFC/NFD mismatch 자동 정규화)
-- 같은 filename 첨부는 v1 update endpoint (`/child/attachment/{aid}/data`)
+- 같은 filename 첨부는 v1 2-step update endpoint
+  (`POST /child/attachment` 400 "same file name" → `POST /child/attachment/{aid}/data`)
   로 새 버전 PUT — 이전 빈 캡쳐 영구 잔존 issue 회피
+- 한국어 doku_id NFC/NFD mismatch 양측 정규화 후 비교
 
 ### Step 13. 3-측 invariant audit (`audit-3way`)
 
@@ -706,7 +751,10 @@ WAL 모드라 동시 read 는 OK 지만 long-running write 가 있으면 lock.
 |  | `dev install-plugins` | 기존 클론에 플러그인 추가 설치 |
 |  | `plugin-scan [--only-missing] [--install]` | DokuWiki 페이지 본문 스캔 → 미설치 플러그인 식별 (DokuWiki 동작 없이도) |
 | 사후 처리 | `rewrite-oversized` | 100MB+ 첨부 → note 매크로 |
-|  | `rewrite-oversized-pages` | 본문 거부 페이지 → skeleton + zip |
+|  | `rewrite-oversized-pages` | 본문 거부 페이지 → skeleton + zip (원본 폐기) |
+|  | `split-oversize [--only ID] [--max-chunk N] [--dry-run]` | 본문 한도 초과 페이지를 H 단위 child 페이지 분할 (원본 보존). parent = info + Children Display. idempotent. |
+|  | `audit-3way [--with-source] [--dokuwiki-data PATH]` | source ↔ rendered ↔ confluence 3-측 invariant audit. 양측 동시 변형 검출, INTENDED_TRANSFORMATIONS 화이트리스트. `docs/3way-audit.md` |
+|  | `compare-publish [--sample N] [--reset-rotation] [--select X,Y]` | 양측 풀-페이지 스크린샷 → 비교 갤러리. 기본이 자동 exclude (이전 발행 페이지). `start`/`sidebar` 영구 제외. |
 | history | `history-discover/render/convert/upload/status` | attic 인덱싱 → ?rev= 캐시 → storage + 헤더 → 시간순 PUT replay |
 |  | `history-convert --header-format {panel\|info\|note\|quote\|table\|paragraphs\|none}` | revision 헤더 형식 (기본 panel + shift+enter) |
 |  | `history-rewrite-headers --header-format X` | 이미 업로드된 페이지의 헤더만 새 형식으로 재PUT |
@@ -754,7 +802,7 @@ single source of truth. 본 README 는 사용법 + 시나리오 중심, AGENT.md
 
 ```sh
 python -m pytest tests/ -q
-# 84 통과, ~0.2s
+# 190 통과, ~0.3s
 ```
 
 ### CI

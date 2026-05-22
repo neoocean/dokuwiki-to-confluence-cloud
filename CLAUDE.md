@@ -37,11 +37,14 @@ python run.py                  # 도움말 + exit 0
 python run.py wizard           # 대화형 14 단계 (중단/재개 안전)
 python run.py wizard --status  # 진행 표
 python run.py status           # state.db 카운트 요약
-python run.py dev up           # DokuWiki 컨테이너 (full / data-only 자동 분기)
+python run.py dev up           # DokuWiki 컨테이너 (full / data-only 자동 분기 + .htaccess/NFC/플러그인 자동)
 python run.py audit --sample 50    # Confluence 측 본문 검증
+python run.py audit-3way --with-source --dokuwiki-data <dwdata>  # 3-측 invariant audit
 python run.py verify build         # 시각 검수 큐
+python run.py compare-publish      # 비교 갤러리 (이전 발행 페이지 자동 exclude)
+python run.py split-oversize --max-chunk 100000   # 본문 한도 초과 페이지 H 단위 분할
 python run.py report-publish       # 결과 보고서 Confluence 페이지 발행
-pytest tests/                  # 회귀 (현재 84 통과)
+pytest tests/                  # 회귀 (현재 190 통과)
 ```
 
 ## 통신

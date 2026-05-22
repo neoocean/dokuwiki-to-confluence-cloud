@@ -1,10 +1,19 @@
 # 본문이 큰 페이지 처리 시나리오
 
-**상태 (2026-05-19): C 모드 라이브 적용 완료.** §4.1 의 skeleton +
-storage XML zip 첨부 패턴으로 1 페이지 회복 + 119 자식 첨부 정착.
-구현 + 적용 명령: `python run.py rewrite-oversized-pages`. `cmd_upload`
-도 `large_body_fallback:<doku_id>` meta 확인해 본문 PUT 영구 skip +
-첨부만 처리. `docs/migration-result.md §2.3` 참고.
+**상태 (2026-05-19~21): C 모드 + D 모드 라이브 적용 완료.**
+
+| 모드 | 명령 | 원본 본문 | 사용자 경험 | 본 인스턴스 적용 |
+|------|------|----------|-------------|------------------|
+| **C** (skeleton + zip) | `rewrite-oversized-pages` | 폐기 (zip 첨부에만) | skeleton + 첨부 다운로드 안내 | `u:neoocean:2020` 1 페이지 + 119 자식 첨부 회복 |
+| **D** (자식 페이지 분할) | `split-oversize` (CL 53885 / git bcfaf06) | **보존 (자식 페이지)** | Confluence 내 검색·탐색 가능 | `u:neoocean:2020` (416KB → 6 children) / `u:oh:모든_기록` (1.4MB → 15 children) |
+
+두 명령은 **보완** 관계 — 데이터 가치별 선택. D 가 *원본 보존 + 검색
+가능* 이라 보통 우선. C 는 잡다 메모 페이지의 단순 보존용.
+
+`cmd_upload` 가 `large_body_fallback:<doku_id>` meta 확인해 본문 PUT 영구
+skip + 첨부만 처리 (C 모드 적용 페이지). D 모드는 `split_into:<doku_id>`
+meta 에 child 매핑 보존 (idempotent 재실행). `docs/migration-result.md
+§2.3 / §10` 참고.
 
 ---
 
@@ -55,14 +64,14 @@ Confluence Cloud 의 본문 한도는 공식적으로 *수 MB* 까지 허용한�
 
 ## 3. 옵션 매트릭스
 
-| # | 모드 | 보존 | 사용자 경험 | 복잡도 | API 호출 |
-|---|------|------|-------------|--------|----------|
-| A | 무시 — broken | 메타데이터 | 페이지 없음, 첨부 stuck | 0 | 0 |
-| B | skeleton 페이지 + 본문 안내 | 메타 + 백업 안내 | "원본은 호스트 P4 백업" 텍스트 | 낮음 | 1 |
-| C | skeleton + storage XML 을 첨부로 (.xml.zip) | 본문 통째 | 첨부 다운로드해서 열기 | 중간 | 1 + 1 |
-| D | 본문 분할 (각 `<h2>` 단위 N 자식 페이지) | 의미 + 시각 | 평탄해 보이지만 트리 구조 변화 | 높음 | N + 1 (parent) |
-| E | 외부 host static HTML | 본문 시각 | 클릭 → 외부 페이지 | 중간 | 1 + 호스팅 |
-| F | 손실 simplify (placeholder 텍스트로 정리) | 일부 | placeholder 손실하지만 작은 본문 | 중간 | 1 |
+| # | 모드 | 보존 | 사용자 경험 | 복잡도 | API 호출 | 본 도구 |
+|---|------|------|-------------|--------|----------|---------|
+| A | 무시 — broken | 메타데이터 | 페이지 없음, 첨부 stuck | 0 | 0 | — |
+| B | skeleton 페이지 + 본문 안내 | 메타 + 백업 안내 | "원본은 호스트 P4 백업" 텍스트 | 낮음 | 1 | — |
+| **C** | **skeleton + storage XML 을 첨부로 (.xml.zip)** | 본문 통째 | 첨부 다운로드해서 열기 | 중간 | 1 + 1 | **`rewrite-oversized-pages`** |
+| **D** | **본문 분할 (각 `<h2>` 단위 N 자식 페이지)** | **의미 + 시각** | **트리에서 검색·탐색** | 중-상 | N + 1 (parent) | **`split-oversize`** |
+| E | 외부 host static HTML | 본문 시각 | 클릭 → 외부 페이지 | 중간 | 1 + 호스팅 | — |
+| F | 손실 simplify (placeholder 텍스트로 정리) | 일부 | placeholder 손실하지만 작은 본문 | 중간 | 1 | — |
 
 ## 4. 권장 — C 모드 (skeleton + storage 첨부)
 
@@ -137,14 +146,53 @@ state.db schema 변경 없음 (meta key 사용).
 | 3 | threshold 설정 | 본 인스턴스는 1건이라 *threshold 없이 FAILED 만 대상*. |
 | 4 | dokuwiki 측 첨부 처리 | C 모드는 skeleton 생성 후 *원래 첨부도 같은 페이지에 업로드*. 자동. |
 
-## 7. 다음 단계
+## 7. D 모드 — `split-oversize` (CL 53885, 본문 보존 분할)
 
-1. 사용자가 §3 매트릭스 중 모드 채택.
-2. 채택안에 맞춰 `cmd_rewrite_oversized_pages` 또는 cmd_upload 의
-   `--auto-fallback` 구현 (~80 LOC).
-3. 본 인스턴스 1건에 적용 → 페이지 + 120 첨부 모두 정착.
-4. `migration-result.md §5.1` 의 outstanding 표시 제거.
+§3 의 D 모드를 본 인스턴스의 *두 번째 대용량 페이지 사이클* (Day 5 §10)
+에서 본격 구현·적용.
+
+### 7.1 동작
+
+```
+1. _sanitize_empty_attachment_links(storage_xml) — 빈 ri:filename 의
+   ac:link 를 평문 격하 (Confluence 가 빈 ri:filename 을 500 거부)
+2. _split_storage_by_heading(xml, max_chunk=100_000, start_level=2):
+   - start_level (default H2) 단위 경계 분할
+   - chunk > max_chunk 이면 다음 hN (H3/H4) 재귀 분할
+   - 인접 chunk 가 max_chunk 안에 들어가면 누적 그룹화
+   - heading 없으면 단일 chunk
+3. parent 본문 = info 박스 + `<ac:structured-macro ac:name="children">`
+   (모든 자식 페이지 자동 목록)
+4. child title = `{parent_title} – {idx:02d}. {label}`
+5. idempotent: parent 의 기존 children 을 *title 인덱스* 로 검색
+   - 매칭 title 있으면 PUT update (`/api/v2/pages/{cid}`)
+   - 없으면 POST create (`/api/v2/pages` + `parentId`)
+6. state.db meta `split_into:<doku_id>` 에 [(title, cid), ...] JSON 보존
+7. parent.status = 'UPLOADED', uploaded_hash 갱신
+```
+
+### 7.2 CLI
+
+```sh
+python run.py split-oversize --only u:neoocean:2020 --dry-run
+python run.py split-oversize --max-chunk 100000   # status=FAILED 자동
+python run.py split-oversize --only "u:oh:모든_기록"
+# NFC/NFD 양쪽 매칭 — macOS APFS 의 한국어 doku_id 가 NFD 로 db 저장됨.
+```
+
+### 7.3 본 인스턴스 적용 결과
+
+| 페이지 | storage | chunks | parent ver | children |
+|---|---|---|---|---|
+| `u:neoocean:2020` | 416KB | 6 | v10 | 6 child cid 기록 |
+| `u:oh:모든_기록` | 1.4MB | 15 | v12 | 15 child cid 기록 |
+
+`status='FAILED'` 잔존 0 페이지. 본문 한도 거부 페이지의 *전부* 가 D 모드
+로 회복 (C 모드 적용 1건은 이미 회복돼 그대로 유지).
+
+## 8. 다음 단계
 
 본 시나리오는 다음 라이브 마이그레이션 (다른 인스턴스 또는 본 인스턴스
 재실행) 에도 같은 패턴이 나타날 가능성 대비. 일회성 spot-fix 대신
-재사용 가능한 fallback 으로 두는 게 가치 큼.
+재사용 가능한 fallback 으로 두는 게 가치 큼. 데이터 가치별로 D 모드를
+우선 시도하고, 자식 분할로도 안 풀리는 페이지만 C 모드 fallback.

@@ -42,14 +42,15 @@ python run.py report-publish
 | `docs/runbook.md` | 라이브 마이그레이션 단계별 절차 |
 | `docs/element-mapping.md` | DokuWiki 요소 → Confluence 변환 매트릭스 |
 | `docs/plugin-validation.md` | 플러그인별 동작 검증 결과 |
-| `docs/visual-audit.md` | 사용자 시각 검수 자동화 (Phase 1-3) |
-| `docs/3way-audit.md` | source ↔ rendered ↔ confluence 3-측 invariant audit (시나리오, 미구현) — 사용자 직접 비교로 발견한 4 사례 일반화 |
+| `docs/visual-audit.md` | 사용자 시각 검수 자동화 (Phase 1-4) |
+| `docs/visual-comparison-proposal.md` | 비교 갤러리 (`compare-publish`) + Phase 4 시각 비교 7 신호 설계·구현 후 자료 |
+| `docs/3way-audit.md` | source ↔ rendered ↔ confluence 3-측 invariant audit (`audit-3way` 명령, Day 5 후반 구현). 사용자 직접 비교로 발견한 4 사례 일반화 |
 | `docs/migration-result.md` | 날짜별 라이브 결과 누적 로그 (Day 1-5 + 후반 사이클) |
 | `docs/struct-migration.md` | struct 플러그인 데이터 이전 시나리오 + 라이브 결과 |
 | `docs/history-migration.md` | 과거 리비전 이전 시나리오 + 라이브 결과 |
 | `docs/oversized-attachments.md` / `oversized-pages.md` | 본문/첨부 한도 초과 폴백 |
 | `dev/dokuwiki-local/docker-compose.yml` | 로컬 DokuWiki 테스트 컨테이너 |
-| `tests/test_*.py` | pytest 회귀 (현재 164 통과). 영역별 매핑은 [`tests/README.md`](tests/README.md) |
+| `tests/test_*.py` | pytest 회귀 (현재 190 통과). 영역별 매핑은 [`tests/README.md`](tests/README.md) |
 | `.secrets/confluence.env` | 자격증명 (커밋 금지) |
 | `.env.example` | 환경 변수 템플릿 (배포 시 .secrets/ 로 복사 후 편집) |
 | `DEPLOY.md` | 다른 머신에 배포할 때의 번들 구성 + 설치 절차 |
@@ -77,7 +78,8 @@ discover  →  render  →  convert  →  upload  →  rewrite-links
 | S7 | `rewrite-links` | placeholder → `<ac:link><ri:page>` 2-pass |
 | | `history-*` | attic + meta/.changes 시간순 PUT replay |
 | | `struct-*` | meta/struct.sqlite3 → native (Database 쉘 + Page Properties + Report + bound 페이지 임베드) |
-| | `rewrite-oversized*` | 100MB 초과 첨부 / 본문 한도 거부 폴백 |
+| | `rewrite-oversized*` | 100MB 초과 첨부 / 본문 한도 거부 폴백 (skeleton + zip, 원본 본문 폐기) |
+| | `split-oversize [--max-chunk N] [--only ID] [--dry-run]` | 본문 한도 초과 페이지를 H1/H2/H3 단위로 child 페이지 분할. parent = info + Children Display 매크로. 원본 본문 보존. idempotent — parent 의 기존 children title 인덱스화 후 PUT/POST. NFC/NFD 양쪽 매칭. `_split_storage_by_heading` + `_sanitize_empty_attachment_links` (빈 ri:filename 평문 격하). `docs/oversized-pages.md` |
 | | `audit` | Confluence 측 다시 받아 비교 |
 | | `verify build/import/status` | 사용자 시각 검수 큐 + Phase 3 자동 사전 거름 + Phase 4 (`--with-all-extra-signals`) |
 | | `plugin-scan [--install]` | 데이터에서 사용 매크로 → 미설치 플러그인 식별 (dokuwiki 동작 무관) |
@@ -85,8 +87,8 @@ discover  →  render  →  convert  →  upload  →  rewrite-links
 | | `link-check [--check-external]` | Confluence 측 placeholder / unresolved title / 외부 URL |
 | | `history-rewrite-headers --header-format X` | 헤더 형식만 교체 (panel/info/note/quote/table/paragraphs/none) |
 | | `report` / `report-publish` | 통계 / Confluence 페이지 자동 발행 |
-| | `compare-publish [--sample N] [--rotate]` | 주요 페이지 양측 풀-페이지 스크린샷 → 비교 갤러리 발행/갱신. 10 카테고리 selection + per-category count `sample/8`. `--rotate` 면 이전 발행 페이지 제외 (state.db meta 누적). `--reset-rotation` 으로 이력 초기화. 첨부 src + data-image-src + srcset 모두 v1 endpoint 으로 rewrite (thumbnails URL 도 OAuth 회피) |
-| | `audit-3way [--with-source]` | source ↔ rendered ↔ confluence 3-측 invariant audit (docs/3way-audit.md). 양측 동시 변형 / 동시 누락 검출 — 기존 audit/verify 가 못 잡는 영역. 책임 분류: source (dokuwiki 환경) vs converter (코드 fix 필요) |
+| | `compare-publish [--sample N] [--reset-rotation] [--no-track]` | 주요 페이지 양측 풀-페이지 스크린샷 → 비교 갤러리 발행/갱신. 10 카테고리 selection + per-category count `sample/8`. **매 호출이 자동으로 이전 발행 페이지 exclude** (CL 53888). `_COMPARE_PERMANENT_EXCLUDE = {"start", "sidebar"}` 영구 제외 (`--select` 우회). 구 `--rotate` 는 backward-compat no-op. 첨부 src + data-image-src + srcset 모두 v1 endpoint 으로 rewrite (`_compare_rewrite_attachment_urls`, thumbnails URL 도 OAuth 회피). 거대 페이지는 viewport 12000px clip + PIL trim (`_compare_clip_oversize`). 같은 filename 첨부는 2-step update endpoint. |
+| | `audit-3way [--with-source] [--dokuwiki-data PATH] [--severity-threshold X]` | source ↔ rendered ↔ confluence 3-측 invariant audit (docs/3way-audit.md). 양측 동시 변형 / 동시 누락 검출 — 기존 audit/verify 가 못 잡는 영역. 신호 S1/S2/D1/D2/D3 + INTENDED_TRANSFORMATIONS 화이트리스트. 책임 분류: source (dokuwiki 환경) vs converter (코드 fix 필요) vs inconclusive. |
 
 전체를 한 명령으로: `python run.py wizard` (14 단계 step-by-step).
 
@@ -176,9 +178,10 @@ git push
 ## 작업 시 체크리스트
 
 새 변경 PR 전:
-- [ ] `pytest tests/` 통과
+- [ ] `pytest tests/` 통과 (현재 190)
 - [ ] 라이브 영향 명령 (`upload`/`rewrite-links`/`history-upload`/
-      `struct-upload`/`struct-embed-on-bound-pages`/`rewrite-oversized*`)
+      `struct-upload`/`struct-embed-on-bound-pages`/`rewrite-oversized*`/
+      `split-oversize`/`compare-publish`)
       변경했으면 `--dry-run` 또는 `--limit N` 으로 소규모 라이브 검증
 - [ ] 새 엣지 케이스면 `docs/scenarios.md §7.2` 표 갱신
 - [ ] 새 명령이면 `docs/runbook.md` 갱신

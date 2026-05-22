@@ -10,9 +10,25 @@ DokuWiki 렌더 페이지 ↔ Confluence 이전 페이지의 *시각적 동등�
 >
 > **2026-05-21 후속**: 사용자가 비교 갤러리 (`compare-publish`) 의
 > 양측 스크린샷을 *직접* 비교해 발견한 4 사례 — Phase 4 시각 신호로
-> 못 잡는 *3-측 invariant* 영역. 별도 시나리오:
-> [`3way-audit.md`](3way-audit.md) (source ↔ rendered ↔ confluence
-> 비교, 시나리오 미구현).
+> 못 잡는 *3-측 invariant* 영역. 별도 명령으로 구현:
+> [`3way-audit.md`](3way-audit.md) (`audit-3way`, 신호 5종 + 화이트리스트,
+> 1675 페이지 실측 violation 0.42% / converter 측 0).
+>
+> **`compare-publish` 의 라이브 적용 사이클** (Day 5 §6~§9) 에서 발견·fix:
+> - `_compare_rewrite_attachment_urls` — 첨부 src + data-image-src + srcset
+>   3 attribute 모두 v1 endpoint 으로 rewrite (`download/attachments` +
+>   `download/thumbnails`). Basic Auth 통과.
+> - `_compare_clip_oversize` — viewport 12000px clip + PIL trim (PIL skip
+>   threshold 5MB, OOM 방지). 거대 페이지 100MB 첨부 한도 회피.
+> - 같은 filename 첨부 2-step update (`POST /child/attachment` 400 →
+>   `POST /child/attachment/{aid}/data`) — 이전 빈 PNG 영구 잔존 issue 해소.
+> - iframe placeholder 페이지 안내 박스 injection (view body API 가 빈
+>   placeholder 응답 시).
+> - **기본 동작이 자동 exclude** (CL 53888) — 매 호출이 `compare_publish_history`
+>   meta 누적 → 다음 selection 에서 제외. 구 `--rotate` flag 는 backward-compat
+>   no-op. `--reset-rotation` 으로 초기화, `--no-track` 으로 일회성 발행.
+> - `_COMPARE_PERMANENT_EXCLUDE = {"start", "sidebar"}` — 본문 빈 페이지 영구
+>   제외. `--select` 명시 시 우회.
 
 본 도구는 이미 [visual-audit Phase 1-3](visual-audit.md) 가 구축되어
 있어 — 그 위에 *남은 갭* 을 메우는 방향으로 정리.
