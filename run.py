@@ -6678,6 +6678,49 @@ RewriteRule ^index.php$               doku.php
 """
 
 
+def _dev_normalize_filenames_to_nfc(clone_root: Path) -> None:
+    """macOS APFS 가 한국어 파일명을 NFD (자모 분리) 로 저장 — DokuWiki 가
+    rendered HTML 에서 NFC (완성형) URL 생성 → byte mismatch → 404.
+
+    해결: data/media 와 data/pages 하위의 *모든 비-ASCII 파일명* 을 NFC
+    이름으로 *추가 cp* (rename 아님 — APFS 동등 비교라 mv 가 same file
+    응답). cp 는 directory entry 에 NFC name 도 추가하므로 DokuWiki 의
+    NFC URL → file_exists() 매치 가능.
+
+    의도: dev 컨테이너 한정 적용. 원본 호스트 디렉터리는 손대지 않음
+    (`_dev_clone_source` 가 clone 후 호출).
+    """
+    import unicodedata
+    cp_count = 0
+    err_count = 0
+    for sub in ("data/media", "data/pages"):
+        root = clone_root / sub
+        if not root.is_dir():
+            continue
+        # bottom-up — 디렉터리 rename 도 안전
+        for dirpath, dirs, files in os.walk(root, topdown=False):
+            for name in files + dirs:
+                if not any(ord(c) > 127 for c in name):
+                    continue
+                nfc = unicodedata.normalize("NFC", name)
+                if nfc == name:
+                    continue
+                old = os.path.join(dirpath, name)
+                new = os.path.join(dirpath, nfc)
+                # macOS host 에선 cp 가 same file 응답하지만 컨테이너 안
+                # Linux PHP 가 NFC byte 로 file_exists 시도 시 *NFC name
+                # 도 directory entry 에 등록* 됨 (실험적 확인). file 만
+                # 처리 (디렉터리는 같은 path 그대로).
+                if os.path.isfile(old) and not os.path.lexists(new):
+                    try:
+                        shutil.copy2(old, new)
+                        cp_count += 1
+                    except OSError:
+                        err_count += 1
+    if cp_count:
+        log(f"  한국어 파일명 NFC 정규화: {cp_count} cp (err={err_count})")
+
+
 def _dev_ensure_htaccess(clone_root: Path) -> None:
     """`.htaccess` 가 부재하면 DokuWiki 공식 rewrite rules 생성.
 
@@ -7141,6 +7184,7 @@ def cmd_dev(args: argparse.Namespace) -> int:
                             log(f"  {kind} ({len(names)}): {', '.join(names)}")
         _dev_patch_acl_off(DEV_CLONE_DST)
         _dev_ensure_htaccess(DEV_CLONE_DST)
+        _dev_normalize_filenames_to_nfc(DEV_CLONE_DST)
 
         log("docker compose up -d")
         if subprocess.call(["docker", "compose", "-f", str(compose), "up", "-d"]) != 0:
