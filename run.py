@@ -10376,6 +10376,77 @@ def _compare_clip_oversize(png_path: Path) -> None:
         pass
 
 
+def _compare_ensure_latest_body(
+    candidates: list[tuple[str, str, str, str, int]],
+    confluence_base: str,
+    email: str,
+    token: str,
+    conn: sqlite3.Connection,
+) -> None:
+    """캡쳐 전 안전판: 후보 페이지의 Confluence 본문이 *local storage 의 50% 미만* 이면
+    옛 rev (history-upload 가 첫 rev 만 push 한 경우 등) 로 덮인 상태로 추정.
+    *latest storage 본문* 을 강제 PUT 으로 복원해 캡쳐 결과의 일관성 보장.
+
+    `history-upload` 의 `_history_restore_latest_body` 와 유사하나 *content_hash ==
+    uploaded_hash 인 경우에도 강제* — meta 가 거짓말 (Confluence 가 옛 본문인데 meta 는
+    최신 hash) 인 케이스 흡수.
+    """
+    import requests as _rq
+    base = confluence_base.rstrip("/")
+    if not (email and token):
+        return
+    auth = (email, token)
+    restored = 0
+    for _reason, doku_id, _title, cid, local_size in candidates:
+        if local_size < 5_000 or not cid:
+            continue
+        try:
+            r = _rq.get(f"{base}/api/v2/pages/{cid}?body-format=storage",
+                        auth=auth, timeout=30)
+            if not r.ok:
+                continue
+            cnf_len = len(r.json().get("body", {}).get("storage", {}).get("value", ""))
+        except Exception:  # noqa: BLE001
+            continue
+        if cnf_len >= local_size * 0.5:
+            continue  # 본문 길이 정상
+        # 잘림 의심 — local 본문 강제 PUT
+        row = conn.execute(
+            "SELECT storage_path, title FROM pages WHERE doku_id=?", (doku_id,)
+        ).fetchone()
+        if not row or not row[0]:
+            continue
+        sp = Path(row[0])
+        if not sp.is_file():
+            continue
+        body = sp.read_text(encoding="utf-8")
+        try:
+            cv = _rq.get(f"{base}/api/v2/pages/{cid}", auth=auth, timeout=30).json().get("version", {}).get("number")
+            if cv is None:
+                continue
+            r2 = _rq.put(
+                f"{base}/api/v2/pages/{cid}", auth=auth, timeout=120,
+                json={
+                    "id": cid, "status": "current", "title": row[1] or doku_id,
+                    "body": {"representation": "storage", "value": body},
+                    "version": {
+                        "number": cv + 1,
+                        "message": "compare-publish: latest 본문 강제 복원 (잘림 감지)",
+                    },
+                },
+            )
+            if r2.ok:
+                new_hash = sha256_bytes(body.encode("utf-8"))
+                db_set_meta(conn, f"uploaded_hash:{doku_id}", new_hash)
+                conn.commit()
+                restored += 1
+                log(f"  [LATEST-RESTORE] {doku_id}: cnf {cnf_len:,d}b → local {local_size:,d}b")
+        except Exception as e:  # noqa: BLE001
+            log(f"  [WARN] {doku_id}: latest 복원 실패: {e}")
+    if restored:
+        log(f"  안전판: {restored} 페이지 latest 강제 복원 후 캡쳐 진행")
+
+
 def _compare_capture_screenshots(
     candidates: list[tuple[str, str, str, str, int]],
     out_dir: Path,
@@ -10758,6 +10829,11 @@ def cmd_compare_publish(args: argparse.Namespace) -> int:
     log(f"=== compare-publish: {len(candidates)} 페이지 ===")
     for i, (reason, d, t, cid, sz) in enumerate(candidates, 1):
         log(f"  [{i}] {reason}: {d} ({t}) — {sz:,} bytes / cid={cid}")
+
+    # 캡쳐 전 안전판: Confluence 본문이 *local storage 의 50% 미만* 인 페이지는
+    # 옛 rev 로 덮인 상태 (history-upload 가 첫 rev 만 push 한 경우 등). 강제
+    # latest PUT 후 캡쳐. 자율 진행 도구 사용 시 우연한 불일치 흡수.
+    _compare_ensure_latest_body(candidates, base, args.email, args.api_token, conn)
 
     out_dir = Path(args.out_dir or "compare_screenshots")
     screenshots = _compare_capture_screenshots(
