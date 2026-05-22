@@ -267,6 +267,67 @@ _COMPARE_PERMANENT_EXCLUDE: set[str] = {"start", "sidebar"}
 - 잔여: failed 61 페이지는 *본문 한도 초과 (Confluence 5MB)* 같은 별개
   결함 — 다음 사이클에서 *상위/하위 분할* 전략 처리
 
+## Day 5 §10 split-oversize 명령 + 빈 ri:filename sanitize
+
+§9 의 *failed 67 페이지* 정밀 분석:
+- 9 페이지: 이미 push 완료된 *stale FAILED status* → db 정리
+- 2 페이지: 진짜 fail (`u:neoocean:2020` 416KB / `u:oh:모든_기록` 1.4MB)
+- 나머지 56: transient — 같은 라이브 호출 안에서 일부 retry 후 자동 해결
+
+### 새 명령 `split-oversize`
+
+본문 한도 초과 페이지를 *H 경계로 child 페이지* 분할.
+
+- 상위 (parent): 짧은 info + Children Display 매크로 (자동 목록)
+- 하위 (child): `--max-chunk` (default 100KB) 이하의 본문
+
+기존 `rewrite-oversized-pages` (skeleton + zip 첨부, *원본 본문 잃음*) 와
+보완 — `split-oversize` 는 *원본 본문 보존*, Confluence 측에서 검색·탐색
+가능.
+
+`_split_storage_by_heading(xml, max_chunk, start_level)` helper:
+1. start_level (default H2) 단위 경계 분할
+2. chunk 가 max_chunk 보다 크면 *다음 hN* 재귀 분할
+3. 인접 chunk 가 max_chunk 안에 들어가면 누적 그룹화
+4. heading 없으면 단일 chunk
+
+CLI 옵션:
+```sh
+python run.py split-oversize --only u:neoocean:2020 --dry-run
+python run.py split-oversize --max-chunk 100000  # status=FAILED 자동
+```
+
+idempotent: parent 의 기존 children 을 *title 인덱스* 로 검색해
+- 매칭 title 있으면 PUT update
+- 없으면 POST create
+
+### 빈 `ri:filename` sanitize (변환기 후행 정리)
+
+`_split_storage_by_heading` 직전에 `_sanitize_empty_attachment_links`:
+- `<ac:link><ri:attachment ri:filename=""></ri:attachment><ac:link-body>
+  TEXT</ac:link-body></ac:link>` → `TEXT` (평문)
+- 변환기 결함 (DokuWiki `[[/_media/...]]` 의 *internal media URL* 을
+  첨부 link 변환 시도 시 파일명 추출 실패 → 빈 string) — Confluence
+  storage 가 빈 ri:filename 을 *500 INTERNAL_SERVER_ERROR* 거부
+- 본 인스턴스 `u:neoocean:2020` 의 chunk 3 가 이 패턴으로 fail 했음
+- 본질적 fix 는 *변환기 자체* — 본 sanitize 는 *후행 정리 워크어라운드*
+
+### 결과
+
+| 페이지 | storage | chunks | parent ver | children |
+|---|---|---|---|---|
+| `u:neoocean:2020` | 416KB | 6 | v10 | 6 child cid 기록 |
+| `u:oh:모든_기록` | 1.4MB | 15 | v12 | 15 child cid 기록 |
+
+`status='FAILED'` 잔존 0 페이지. `db_set_meta("split_into:<doku_id>", json)`
+로 child 매핑 보존 — 후속 재실행 시 idempotent.
+
+### NFC/NFD `--only` argument
+
+macOS APFS 의 한국어 doku_id 는 NFD 로 db 저장 (shell argument 는 NFC) —
+byte-exact 매치 실패 회피용으로 `--only` 매칭 시 NFC/NFD 양쪽 normalize
+폼 모두 시도하는 `WHERE doku_id IN (?, ?)` 추가.
+
 ---
 
 # Day 4 — 2026-05-19 (struct → native+properties 라이브 적용)

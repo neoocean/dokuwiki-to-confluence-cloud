@@ -4914,6 +4914,290 @@ def cmd_struct_status(args: argparse.Namespace) -> int:
 
 # § rewrite-oversized-pages: 본문 거부된 페이지 → skeleton + 첨부
 
+_EMPTY_ATTACHMENT_LINK_RE = _re.compile(
+    r'<ac:link>\s*<ri:attachment\s+ri:filename="\s*"\s*/?>'
+    r'(?:\s*</ri:attachment>)?\s*'
+    r'<ac:(?:plain-text-)?link-body>(.*?)</ac:(?:plain-text-)?link-body>\s*</ac:link>',
+    _re.S,
+)
+
+
+def _sanitize_empty_attachment_links(xml: str) -> str:
+    """`<ac:link><ri:attachment ri:filename=""></ri:attachment>...</ac:link>`
+    같이 *빈 filename* 의 attachment link 를 평문 (link-body 내용) 으로 격하.
+
+    원인: 변환기가 `[[/_media/...]]` 같은 *internal media URL* 을 첨부 link
+    로 변환 시도 → 파일명 추출 실패 (빈 string). Confluence storage 가
+    빈 ri:filename 을 500 INTERNAL_SERVER_ERROR 로 거부.
+
+    영향: 본 sanitize 가 없으면 storage 한도 초과 분할 시점에도 chunk PUT
+    fail. 변환기 자체 fix 가 본질적 해법이나 본 sanitize 는 *후행 정리*.
+    """
+    def repl(m: _re.Match) -> str:
+        body = m.group(1).strip()
+        # CDATA 안 텍스트 추출
+        body = _re.sub(r'<!\[CDATA\[(.*?)\]\]>', r'\1', body, flags=_re.S)
+        return body or ""
+    return _EMPTY_ATTACHMENT_LINK_RE.sub(repl, xml)
+
+
+def _split_storage_by_heading(
+    xml: str,
+    *,
+    max_chunk: int = 100_000,
+    start_level: int = 2,
+) -> list[tuple[str, str]]:
+    """본문을 H1/H2/H3 경계로 분할.
+
+    1. `start_level` (default H2) 단위 경계 → chunk 들
+    2. chunk 가 `max_chunk` 보다 크면 *다음 hN* 으로 재귀 분할
+    3. 인접 chunk 가 max_chunk 안에 들어가면 누적 그룹화
+    4. heading 없으면 단일 chunk 반환
+
+    Returns: list of (label, chunk_xml).
+    """
+    pat = _re.compile(rf'<h{start_level}[^>]*>([^<]*)</h{start_level}>')
+    matches = list(pat.finditer(xml))
+    if not matches:
+        if start_level < 4:
+            return _split_storage_by_heading(
+                xml, max_chunk=max_chunk, start_level=start_level + 1
+            )
+        return [("전체", xml)]
+
+    chunks: list[tuple[str, str]] = []
+    prefix = xml[: matches[0].start()]
+    for i, m in enumerate(matches):
+        start = m.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(xml)
+        body = xml[start:end]
+        if i == 0 and prefix.strip():
+            body = prefix + body
+        label = (m.group(1) or "").strip() or f"섹션 {i + 1}"
+        chunks.append((label, body))
+
+    refined: list[tuple[str, str]] = []
+    for label, body in chunks:
+        if len(body) > max_chunk and start_level < 4:
+            sub = _split_storage_by_heading(
+                body, max_chunk=max_chunk, start_level=start_level + 1
+            )
+            if len(sub) <= 1:
+                refined.append((label, body))
+            else:
+                for sl, sb in sub:
+                    refined.append((f"{label} – {sl}", sb))
+        else:
+            refined.append((label, body))
+
+    grouped: list[tuple[str, str]] = []
+    buf_label: str | None = None
+    buf_body = ""
+    for label, body in refined:
+        if buf_label is None:
+            buf_label, buf_body = label, body
+            continue
+        if len(buf_body) + len(body) <= max_chunk:
+            buf_body += body
+        else:
+            grouped.append((buf_label, buf_body))
+            buf_label, buf_body = label, body
+    if buf_label is not None:
+        grouped.append((buf_label, buf_body))
+
+    return grouped
+
+
+def cmd_split_oversize(args: argparse.Namespace) -> int:
+    """본문 한도 초과 페이지를 H 경계로 분할.
+
+    상위 (parent) 페이지: 짧은 info + Children Display 매크로.
+    하위 (child) 페이지: `--max-chunk` 이하의 본문.
+
+    `cmd_rewrite_oversized_pages` (C 모드: skeleton + zip 첨부) 와 달리
+    *원본 본문을 잃지 않음* — Confluence 측에서 본문 자체로 탐색 가능.
+    """
+    if not args.dry_run:
+        session = _confluence_session(args)
+        if session is None:
+            return 2
+    else:
+        session = None
+    base = args.base_url.rstrip("/") if getattr(args, "base_url", None) else ""
+
+    conn = db_connect(args.db)
+    db_init(conn)
+
+    if args.only:
+        # macOS APFS 의 한국어 doku_id 가 NFD 로 저장됨 (shell argument 는
+        # 보통 NFC) — 양쪽 normalize 폼 모두 시도.
+        import unicodedata as _ud
+        nfc = _ud.normalize("NFC", args.only)
+        nfd = _ud.normalize("NFD", args.only)
+        rows = conn.execute(
+            "SELECT doku_id, title, storage_path, confluence_page_id "
+            "FROM pages WHERE doku_id IN (?, ?)",
+            (nfc, nfd),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT doku_id, title, storage_path, confluence_page_id "
+            "FROM pages WHERE status='FAILED' AND last_error LIKE '%no resp%' "
+            "AND storage_path IS NOT NULL"
+        ).fetchall()
+    if not rows:
+        log("split-oversize 대상 페이지 없음.")
+        conn.close()
+        return 0
+
+    log(f"split-oversize 대상: {len(rows)} 페이지 (max_chunk={args.max_chunk:,d}b)")
+
+    space_id = None
+    if not args.dry_run and args.space_key:
+        space_id = _resolve_space_id(session, base, args.space_key)
+        if not space_id:
+            log("--space-key 해결 실패.")
+            conn.close()
+            return 2
+
+    pushed = failed_count = 0
+    for doku_id, title, storage_path, cid in rows:
+        sp = Path(storage_path)
+        if not sp.is_file():
+            log(f"  [SKIP] {doku_id}: storage 파일 없음")
+            continue
+        if not cid:
+            log(f"  [SKIP] {doku_id}: confluence_page_id 없음")
+            continue
+
+        body = sp.read_text(encoding="utf-8")
+        body = _sanitize_empty_attachment_links(body)
+        chunks = _split_storage_by_heading(body, max_chunk=args.max_chunk)
+        if len(chunks) <= 1:
+            log(f"  [SKIP] {doku_id}: heading 분할 불가 (단일 chunk)")
+            continue
+
+        log(f"  [{doku_id}] {len(chunks)} chunks (parent cid={cid})")
+        for lbl, ch in chunks:
+            log(f"    - {lbl[:60]} ({len(ch):,d}b)")
+
+        if args.dry_run:
+            continue
+
+        # parent 의 기존 children 을 title -> cid 로 인덱스 (idempotent 재실행)
+        existing_children: dict[str, str] = {}
+        cursor_url = f"{base}/api/v2/pages/{cid}/children?limit=250"
+        while cursor_url:
+            cr = _request_with_retry(session, "GET", cursor_url)
+            if cr is None or cr.status_code >= 400:
+                break
+            j = cr.json()
+            for r in j.get("results", []):
+                existing_children[r["title"]] = str(r["id"])
+            nxt = j.get("_links", {}).get("next")
+            cursor_url = f"{base}{nxt}" if nxt else None
+
+        # 각 chunk → child 페이지 POST (없으면) 또는 PUT (있으면)
+        child_records: list[tuple[str, str]] = []
+        any_fail = False
+        title_str = title or doku_id
+        for idx, (lbl, ch_xml) in enumerate(chunks, 1):
+            child_title = f"{title_str} – {idx:02d}. {lbl}"
+            existing_cid = existing_children.get(child_title)
+            if existing_cid:
+                # 기존 child 페이지 PUT 갱신
+                cv = _get_page_version(session, base, existing_cid)
+                if cv is None:
+                    log(f"    [FAIL] chunk {idx}: 기존 child ver 조회 실패")
+                    any_fail = True
+                    break
+                resp = _request_with_retry(
+                    session, "PUT", f"{base}/api/v2/pages/{existing_cid}",
+                    json={
+                        "id": existing_cid, "status": "current", "title": child_title,
+                        "body": {"representation": "storage", "value": ch_xml},
+                        "version": {"number": cv + 1},
+                    },
+                )
+                if resp is None or resp.status_code >= 400:
+                    err = f"PUT {resp.status_code if resp else 'no resp'}: {(resp.text if resp else '')[:200]}"
+                    log(f"    [FAIL] chunk {idx}: {err}")
+                    any_fail = True
+                    break
+                child_records.append((child_title, existing_cid))
+                log(f"    [UPDATE] chunk {idx} -> page {existing_cid} (v{cv+1})")
+            else:
+                payload = {
+                    "spaceId": space_id,
+                    "parentId": cid,
+                    "title": child_title,
+                    "body": {"representation": "storage", "value": ch_xml},
+                }
+                resp = _request_with_retry(
+                    session, "POST", f"{base}/api/v2/pages", json=payload
+                )
+                if resp is None or resp.status_code >= 400:
+                    err = f"create {resp.status_code if resp else 'no resp'}: {(resp.text if resp else '')[:200]}"
+                    log(f"    [FAIL] chunk {idx}: {err}")
+                    any_fail = True
+                    break
+                child_id = str(resp.json()["id"])
+                child_records.append((child_title, child_id))
+                log(f"    [CREATE] chunk {idx} -> page {child_id}")
+
+        if any_fail or not child_records:
+            failed_count += 1
+            continue
+
+        # parent 본문 = info + Children Display
+        new_parent_body = (
+            '<ac:structured-macro ac:name="info">'
+            "<ac:rich-text-body>"
+            f"<p>본문이 Confluence storage 한도를 초과해 {len(child_records)}개 "
+            f"자식 페이지로 분할됨. 자식 페이지 목록:</p>"
+            "</ac:rich-text-body>"
+            "</ac:structured-macro>"
+            '<ac:structured-macro ac:name="children">'
+            '<ac:parameter ac:name="all">true</ac:parameter>'
+            "</ac:structured-macro>"
+        )
+        cur_ver = _get_page_version(session, base, cid)
+        if cur_ver is None:
+            log(f"    [FAIL] {doku_id}: parent 버전 조회 실패")
+            failed_count += 1
+            continue
+        resp = _request_with_retry(
+            session, "PUT", f"{base}/api/v2/pages/{cid}",
+            json={
+                "id": cid, "status": "current", "title": title_str,
+                "body": {"representation": "storage", "value": new_parent_body},
+                "version": {"number": cur_ver + 1},
+            },
+        )
+        if resp is None or resp.status_code >= 400:
+            err = f"parent PUT {resp.status_code if resp else 'no resp'}: {(resp.text if resp else '')[:200]}"
+            log(f"    [FAIL] {doku_id}: {err}")
+            failed_count += 1
+            continue
+
+        new_hash = sha256_bytes(new_parent_body.encode("utf-8"))
+        conn.execute(
+            "UPDATE pages SET status='UPLOADED', last_error=NULL, confluence_version=?, "
+            "uploaded_at=?, last_checked_at=? WHERE doku_id=?",
+            (cur_ver + 1, now_iso(), now_iso(), doku_id),
+        )
+        db_set_meta(conn, f"uploaded_hash:{doku_id}", new_hash)
+        import json as _json
+        db_set_meta(conn, f"split_into:{doku_id}", _json.dumps(child_records, ensure_ascii=False))
+        conn.commit()
+        pushed += 1
+        log(f"  [SPLIT] {doku_id} -> {len(child_records)} children, parent v{cur_ver + 1}")
+
+    log(f"split-oversize 완료: split={pushed} failed={failed_count}")
+    conn.close()
+    return 0 if failed_count == 0 else 1
+
+
 def cmd_rewrite_oversized_pages(args: argparse.Namespace) -> int:
     """
     Confluence 본문 한계를 넘은 페이지 (status='FAILED' AND
@@ -11260,6 +11544,18 @@ def _build_oversized_subcommands(sub) -> None:
     _add_confluence_creds_args(sp_ro)
     sp_ro.add_argument("--no-upload", action="store_true", help="storage 만 갱신, Confluence PUT 안 함")
     sp_ro.set_defaults(func=cmd_rewrite_oversized)
+
+    sp_so = sub.add_parser(
+        "split-oversize",
+        help="본문 한도 초과 페이지를 H1/H2/H3 단위로 child 페이지 분할 (parent = 목차)",
+    )
+    _add_confluence_space_args(sp_so)
+    sp_so.add_argument("--only", help="특정 doku_id 만 처리")
+    sp_so.add_argument("--max-chunk", type=int, default=100_000,
+                       help="child 한 페이지 최대 본문 크기 (bytes, default 100KB)")
+    sp_so.add_argument("--dry-run", action="store_true",
+                       help="실제 PUT/POST 없이 분할 결과만 출력")
+    sp_so.set_defaults(func=cmd_split_oversize)
 
 
 def _build_audit_report_subcommands(sub) -> None:
