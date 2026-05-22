@@ -3442,7 +3442,10 @@ def _history_upload_select_pages(
 
     args.only 지정 시 한 페이지로 제한. large_body_fallback 페이지는 호출자에서
     건너뜀 (선택 단계에서는 포함)."""
-    where = "p.status='UPLOADED' AND p.confluence_page_id IS NOT NULL"
+    # 이전: status='UPLOADED' 만 — pages 의 status 가 CONVERTED 같은 *다른* 흐름
+    # 으로 떨어진 페이지 (실제로는 Confluence 에 본문 있음) 의 rev 가 누락됨.
+    # confluence_page_id 가 있고 storage_path 가 있으면 history 적용 가능.
+    where = "p.confluence_page_id IS NOT NULL AND p.storage_path IS NOT NULL"
     params: tuple = ()
     if args.only:
         where = "p.doku_id=?"
