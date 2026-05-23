@@ -42,3 +42,12 @@ venv/
 # Operational memory — P4 에는 유지 (운영 메모, 인스턴스별 함정/배운 점),
 # GitHub 공개 미러에는 노출 안 시킴
 docs/MEMORY.md
+MEMORY.md
+RESULT.md
+RESULT.json
+
+# Visual comparison gallery (regenerable by compare-publish)
+compare_screenshots/
+
+# RESULT 생성 스크립트는 일회성 도구 — P4 추적 / GitHub 미공개
+_build_result.py

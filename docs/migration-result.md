@@ -1099,3 +1099,67 @@ doku_id=?` 로 리셋하고 `upload --only` 로 재생성.
 - 별도 doc CL 들 (52871 oversized-attachments, 52697 element-mapping,
   52693 history-migration, 52695 struct-migration, 52709 runbook 등)
 은 라이브 결과에 영향 받지 않은 사전 작업
+
+---
+
+# Day 6 — 2026-05-23 (struct collapse / history footer / 변환기 sanitize / history 재개)
+
+CL 53950 (struct/history/sanitize 통합) + CL 54028 (history 재개 결과 docs).
+
+본 day 는 *후속 정리 + 재개 라운드*. 새 변환기 추가 없음 — 기존 도구의
+*적용/회수/안내* 와 history 재개.
+
+## Day 6 §0 라이브 결과 한 줄
+
+- **struct-collapse-unbound** (brevet_place): 98 row 자식 페이지 휴지통 +
+  인덱스 (id=2518720487) 본문 *마스터 표 1개* 로 교체. 다른 3 schema
+  (course/event/uri_cppage) 영향 없음. STRUCT_BINDINGS 미정의 schema 의
+  row 자식 페이지 생성 *기본 skip* 회귀 방지 (--allow-unbound-rows 로만 강제).
+- **history-append-skipped-footer**: SKIPPED PUT rev ≥2건 페이지 7 → 22
+  (history 재개 후 신규 15 추가 — u:oh:* 일지 그룹) latest 본문 끝에
+  *마이그레이션 안내 (history rev 누락)* note 매크로 부착. ASCII sentinel +
+  기존 중복 strip → 멱등. 외부 호스팅 채택 안 함 (P4 백업 충분).
+- **변환기 sanitize 통합**: `_sanitize_empty_attachment_links` 를
+  split-oversize 시점뿐 아니라 `_convert_html_to_storage` serialize 직후에도
+  호출. 변환기가 dokuwiki `[[/_media/...]]` 같은 internal media URL 을 첨부
+  link 로 잘못 매핑한 잔여 (u:neoocean:2020 코드 블록 예제 2건) 차단.
+- **content_hash != uploaded_hash 일괄 재업로드**: 이전 fix 사이클의 결과로
+  storage 가 갱신됐지만 PUT 안 됐던 499 페이지 — `python run.py upload`
+  로 updated=498 / failed=1 (b:2020-s200d-1 단발 PUT 실패).
+- **history-upload 재개 라운드** (limit 없이, 4시간 44분):
+  UPLOADED **27,359 → 32,453 (+5,094)** = **전체 rev 의 86.8%**.
+  CONVERTED 9,392 → 3,956 (잔여 = 비-마이그레이션 958 + large_body_fallback
+  2,895 + 시간 역순 skip 103).
+- **로컬 cache 정리**: raw/ + raw_history/ + storage/ + storage_history/ +
+  compare_screenshots/ 삭제 → 13.1GB 회수. state.db 만 P4 보존.
+  dev clone (`/tmp/dwc_test_dokuwiki`) 도 삭제 (clonefile 이라 디스크 회수
+  거의 0, inode 정리).
+
+## Day 6 §1 신규 명령
+
+| 명령 | 역할 |
+|------|------|
+| `struct-collapse-unbound [--only-tbl] [--dry-run]` | binding 없는 schema 의 row 자식 페이지 trash + 인덱스를 마스터 표로 |
+| `history-append-skipped-footer [--only] [--dry-run] [--force] [--min-skipped N]` | SKIPPED PUT rev N건 이상인 페이지의 latest 본문 끝에 안내 footer 부착. 멱등. |
+| `struct-upload --allow-unbound-rows` | STRUCT_BINDINGS 미정의 schema 의 row 자식 페이지 생성을 강제 (기본은 skip) |
+
+## Day 6 §2 통계 (마이그레이션 후)
+
+| 영역 | 수치 |
+|------|------|
+| 메인 페이지 (UPLOADED) | 1,675 (변동 없음) |
+| Confluence dokuwiki space 의 전체 페이지 | **2,818** (메인 1,675 + struct 자식 1,022 + 인덱스 4 + history footer 노출용 등) |
+| 본문 크기 합계 (storage XML 기준) | **24.23 MB** |
+| Confluence version 합계 (PUT 누적) | **60,772** |
+| history UPLOADED rev | 32,453 / 37,397 (**86.8%**) |
+| history SKIPPED rev (PUT 한도 / empty 등) | 1,536 |
+| 본문 크기 outlier (>1MB) | 3 페이지 (`u:oh:2018` 3.5MB / `u:oh:모든_기록` 1.6MB / `u:oh:2017` 1.5MB — 모두 UPLOADED, Confluence 가 실제로 수용) |
+| 본문 크기 outlier (500K-1M) | 3 페이지 |
+
+자세한 페이지별 통계는 루트의 `RESULT.md` (.gitignored, P4 추적).
+
+## Day 6 §3 결정 사항
+
+- **외부 호스팅 채택 안 함** — 본문 한도 거부 rev 의 원본은 P4 백업으로 충분.
+- **추가 history 라운드 무의미** — 잔여 (E) 103 rev 는 시간 역순 skip 으로 latest 본문 회귀 부작용 위험.
+- **로컬 cache 영구 회수 가능** — state.db + 코드 + secrets 만 보존하면 재실행 가능. `dev up → discover → render → convert → upload` 흐름이 멱등.
