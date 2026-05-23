@@ -1780,6 +1780,13 @@ def _convert_html_to_storage(
         else:
             del tag.attrs["class"]
 
+    # DokuWiki 의 `<li><div class="li">text</div></li>` 패턴 unwrap — div.li 는
+    # DokuWiki CSS 전용 wrapper (Confluence 에선 의미 없음). 긴 본문/깊은 nesting
+    # 페이지에서 Confluence renderer 가 li 의 bullet/줄바꿈 계산을 잘못해 시각적
+    # 으로 *bullet 없는 평문* 으로 보이는 케이스를 유발 — unwrap 으로 해결.
+    for div in list(soup.find_all("div", class_="li")):
+        div.unwrap()
+
     # 7) 직렬화 + void element XML 자체 닫기 + CDATA 치환
     result = "".join(str(c) for c in soup.children)
     result = _re.sub(r"<(br|hr|img)([^>]*?)(?<!/)\s*>", r"<\1\2/>", result)
