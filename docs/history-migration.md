@@ -12,6 +12,16 @@
 효과로 Confluence 본문 한도 초과 → 영구 fail. 1,520 페이지 완전 처리,
 46 부분, 63 미처리. **상세는 `migration-result.md` Day 3**.
 
+**후속 (2026-05-23): 영구 제약 페이지에 안내 푸터 부착.**
+`history-append-skipped-footer` 명령으로 SKIPPED PUT rev 가 2건 이상인
+페이지 7개 (u:lam:2019 324 / u:lam:2020 106 / u:neoocean:2019 51 / u:lam:
+start 28 / blog:draft:start 14 / u:lam:출퇴근기록 2 / u:neoocean:2018-03 2)
+의 latest 본문 끝에 *마이그레이션 안내 (history rev 누락)* note 매크로
+부착. 푸터에 (a) 보존된 rev 수 / 누락 rev 수 (b) P4 백업 경로 안내.
+멱등 — sentinel `<h2>마이그레이션 안내 (history rev 누락)</h2>` 로 중복
+부착 방지 + 기존 중복 cleanup. 결정: **외부 호스팅 채택 안 함** — P4 백업
+이 이미 충분 + 외부 호스팅의 운영 부담 큼.
+
 ---
 
 

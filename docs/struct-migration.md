@@ -8,6 +8,15 @@ Database 링크 + 컬럼 메타 + Page Properties Report) + (c) row 별 자식
 페이지 + (d) bound 페이지에 "관련 struct 데이터" 패널 임베드. test
 schema 는 빈 schema 라 SKIPPED.
 
+**후속 (2026-05-23): brevet_place collapsed.** `STRUCT_BINDINGS` 에
+없는 *binding 없는* schema (장소명 같은 free text — page reference 없음)
+는 row 별 자식 페이지가 *시각적 잡음* (네비게이션 트리 오염, search
+noise). `struct-collapse-unbound` 명령으로 (a) row 자식 페이지 98 개
+모두 휴지통 + (b) 인덱스 페이지 본문을 *마스터 표 1개* 로 교체.
+`struct_schemas.chosen_mode='collapsed'`, `struct_rows.status='COLLAPSED'`.
+회귀 방지: `struct-upload` 가 STRUCT_BINDINGS 미정의 schema 의 row 자식
+페이지 생성을 *기본 skip* (--allow-unbound-rows 로만 강제).
+
 **API 한계 (2026-05-19 probe 결과)**: Confluence Cloud v2 REST API 는
 `POST/GET/DELETE /api/v2/databases` 만 공개 — 컬럼 정의 / row 입력
 endpoint 는 *존재하지 않음*. 따라서 데이터는 Page Properties + Page

@@ -1795,6 +1795,11 @@ def _convert_html_to_storage(
         safe = text.replace("]]>", "]]]]><![CDATA[>")
         result = result.replace(sentinel, f"<![CDATA[{safe}]]>")
 
+    # 빈 ri:filename 의 ac:link 평문 격하 — 변환기가 dokuwiki internal
+    # `_media URL` 을 첨부 link 로 잘못 매핑한 잔여 (split-oversize 시점뿐
+    # 아니라 *모든 페이지* 의 일반 convert 흐름에도 적용).
+    result = _sanitize_empty_attachment_links(result)
+
     return result, links, list(attachments.values()), title, page_tags
 
 
@@ -3896,6 +3901,148 @@ def cmd_history_rewrite_headers(args: argparse.Namespace) -> int:
     return 0 if failed == 0 else 1
 
 
+_HISTORY_SKIPPED_FOOTER_SENTINEL = "<h2>마이그레이션 안내 (history rev 누락)</h2>"
+
+# Confluence storage 가 em dash 등 특수문자를 entity (`&mdash;`) 로 변환해 substring 매칭이 깨짐.
+# 기존(old/new) sentinel 의 footer 매크로 묶음을 모두 strip → fresh 1개 재부착.
+_HISTORY_SKIPPED_FOOTER_STRIP_RE = _re.compile(
+    r'<h2>(?:이주 안내[^<]*|마이그레이션 안내[^<]*)</h2>'
+    r'\s*<ac:structured-macro[^>]*ac:name="note"[^>]*>'
+    r'.*?</ac:structured-macro>',
+    _re.S,
+)
+
+
+def _history_skipped_footer_xml(doku_id: str, skipped_cnt: int, total_revs: int) -> str:
+    """latest 본문 끝에 부착할 *이주 안내 푸터*. sentinel h2 로 idempotent.
+
+    Confluence storage 가 HTML 코멘트 strip 하므로 *눈에 보이는* h2 heading 을
+    sentinel 로. 푸터는 항상 본문 끝에 부착 → sentinel 부터 EOF 가 푸터 본체."""
+    uploaded = total_revs - skipped_cnt
+    return (
+        f"{_HISTORY_SKIPPED_FOOTER_SENTINEL}"
+        "<ac:structured-macro ac:name=\"note\"><ac:rich-text-body>"
+        f"<p>이 페이지는 DokuWiki 총 <strong>{total_revs} revisions</strong> 중 "
+        f"<strong>{uploaded}건</strong> 만 Confluence 측에 보존되었고 "
+        f"<strong>{skipped_cnt}건</strong> 의 후반 rev 가 본문 누적 효과로 한도를 초과해 "
+        "Confluence 측에 이주되지 못했습니다.</p>"
+        "<p>현재 표시되는 latest 본문은 자동 복원되어 정확합니다. 누락된 rev 의 "
+        "원본은 P4 depot 의 DokuWiki 데이터 백업에서 확인할 수 있습니다 "
+        "(<code>data/attic/" + _h.escape(doku_id.replace(':', '/')) + ".*.txt.gz</code>).</p>"
+        "</ac:rich-text-body></ac:structured-macro>"
+    )
+
+
+def _history_get_page_body(session, base: str, page_id: str) -> tuple[str, int] | None:
+    """현재 페이지의 storage body + version number 반환. 실패 시 None."""
+    r = _request_with_retry(
+        session, "GET", f"{base}/api/v2/pages/{page_id}",
+        params={"body-format": "storage"},
+    )
+    if r is None or r.status_code >= 400:
+        return None
+    j = r.json()
+    body = (j.get("body", {}).get("storage", {}) or {}).get("value", "")
+    ver = (j.get("version", {}) or {}).get("number")
+    if ver is None:
+        return None
+    return (body, int(ver))
+
+
+def cmd_history_append_skipped_footer(args: argparse.Namespace) -> int:
+    """SKIPPED 'PUT no resp' rev 가 있는 페이지의 latest Confluence 본문 끝에
+    *이주 안내 푸터* 추가. 멱등 (sentinel h2 로 중복 부착 방지).
+
+    *왜*: history-upload 시 본문 한도 초과한 후반 rev 들은 영구 거부.
+    `_history_restore_latest_body` 가 latest 본문은 복원하지만, 사용자가
+    *어떤 rev 가 누락되었는지* 알 방법이 없음. latest 본문 끝에 한 줄 안내
+    + 영향 rev 수 표시 + P4 백업 안내.
+
+    영향 8 페이지 (CL 53868 이후 시점, 2026-05-23): u:lam:2019 (324) /
+    u:lam:2020 (106) / u:neoocean:2019 (51) / u:lam:start (28) / blog:draft:
+    start (14) / u:lam:출퇴근기록 (2) / u:neoocean:2018-03 (2) /
+    b:2020-s200d-1 (1).
+
+    --dry-run 으로 영향 페이지 목록만 확인.
+    """
+    if not args.email or not args.api_token:
+        log("자격증명 필요.")
+        return 2
+    conn = db_connect(args.db)
+    session = _confluence_session(args)
+    if session is None:
+        return 2
+    base = args.base_url.rstrip("/")
+
+    skip_err = "PUT no resp (skipped, chain 보존)"
+    min_skipped = max(1, int(args.min_skipped))
+    pages = conn.execute(
+        """
+        SELECT r.doku_id, p.confluence_page_id, p.title,
+               (SELECT COUNT(*) FROM revisions WHERE doku_id=r.doku_id AND status='SKIPPED' AND last_error=?) skipped_cnt,
+               (SELECT COUNT(*) FROM revisions WHERE doku_id=r.doku_id) total_revs
+        FROM (SELECT DISTINCT doku_id FROM revisions WHERE status='SKIPPED' AND last_error=?) r
+        JOIN pages p ON p.doku_id=r.doku_id
+        WHERE p.confluence_page_id IS NOT NULL
+          AND EXISTS (SELECT 1 FROM meta WHERE key='uploaded_hash:' || r.doku_id)
+          AND (SELECT COUNT(*) FROM revisions WHERE doku_id=r.doku_id AND status='SKIPPED' AND last_error=?) >= ?
+        ORDER BY r.doku_id
+        """,
+        (skip_err, skip_err, skip_err, min_skipped),
+    ).fetchall()
+    if args.only:
+        pages = [p for p in pages if p[0] == args.only]
+    log(f"영향 페이지: {len(pages)}")
+
+    appended = 0
+    already = 0
+    failed = 0
+    for doku_id, cid, title, skipped_cnt, total_revs in pages:
+        if args.dry_run:
+            log(f"  [DRY] {doku_id} (cid={cid}) skipped={skipped_cnt}/{total_revs}")
+            continue
+
+        fetched = _history_get_page_body(session, base, str(cid))
+        if not fetched:
+            log(f"  [FAIL] {doku_id}: GET 실패")
+            failed += 1
+            continue
+        body, cur_ver = fetched
+        # 기존 부착 footer (old/new sentinel 모두) 일괄 strip → 멱등 + 중복 정리.
+        stripped, n_removed = _HISTORY_SKIPPED_FOOTER_STRIP_RE.subn('', body)
+        footer = _history_skipped_footer_xml(doku_id, skipped_cnt, total_revs)
+        # *Confluence storage normalize 후* 본문과 의미적으로 동일한지 비교는 어려우므로,
+        # *우리가 PUT 한 footer 가 1개만* 존재 + sentinel 발견 시 skip (재부착 noise 방지).
+        if n_removed == 1 and not args.force:
+            already += 1
+            log(f"  [SKIP] {doku_id}: 푸터 이미 1개 부착됨 (--force 로 재부착)")
+            continue
+        if n_removed > 1:
+            log(f"  [CLEANUP] {doku_id}: 중복 푸터 {n_removed}개 발견 → 1개로 정리")
+        new_body = stripped + footer
+        r = _request_with_retry(
+            session, "PUT", f"{base}/api/v2/pages/{cid}",
+            json={
+                "id": str(cid), "status": "current", "title": title or doku_id,
+                "body": {"representation": "storage", "value": new_body},
+                "version": {
+                    "number": cur_ver + 1,
+                    "message": f"history-skipped-footer 부착 (rev {skipped_cnt}건 누락 안내)",
+                },
+            },
+        )
+        if r is None or r.status_code >= 400:
+            log(f"  [FAIL] {doku_id}: PUT {r.status_code if r else 'no resp'}")
+            failed += 1
+            continue
+        log(f"  [OK] {doku_id}: 푸터 부착 (skipped={skipped_cnt})")
+        appended += 1
+
+    conn.close()
+    log(f"history-append-skipped-footer 완료: appended={appended} already={already} failed={failed}")
+    return 0 if failed == 0 else 1
+
+
 def cmd_history_status(args: argparse.Namespace) -> int:
     """history 트랙의 진행 상황 출력 (read-only).
 
@@ -4602,6 +4749,11 @@ def _struct_upload_indexed_schema(
         log(f"  --index-only: row 페이지 갱신 skip")
         return (True, 0, 0)
 
+    if tbl not in STRUCT_BINDINGS and not getattr(args, "allow_unbound_rows", False):
+        log(f"  [INFO] {tbl}: binding 없는 schema — row 자식 페이지 skip "
+            f"(--allow-unbound-rows 로 강제 가능, struct-collapse-unbound 로 정리)")
+        return (True, 0, 0)
+
     # 2) 자식 row 페이지 업로드
     row_sql = "SELECT pid, payload_json, confluence_page_id FROM struct_rows WHERE sid=? ORDER BY pid"
     if args.row_limit:
@@ -4953,6 +5105,165 @@ def cmd_struct_embed_on_bound_pages(args: argparse.Namespace) -> int:
     log(f"struct-embed 완료: pushed={pushed} failed={failed} unresolved={unresolved}")
     conn.close()
     return 0 if failed == 0 else 1
+
+
+def _struct_build_collapsed_snapshot_xml(
+    conn: sqlite3.Connection, sid: int, tbl: str, db_id: str | None,
+    base_url: str, space_key: str,
+) -> str:
+    """binding 없는 schema 의 *마스터 페이지* 본문. 모든 row 를 한 표에 담는다.
+
+    sentinel `dwc-struct-collapsed:<tbl>` 코멘트(렌더 시 strip 되지만 storage 비교용)
+    + 사람이 보는 h1/info/표 + Database 링크 (있으면)."""
+    cols = conn.execute(
+        "SELECT colref, name, dokuwiki_class FROM struct_columns WHERE sid=? ORDER BY sort",
+        (sid,),
+    ).fetchall()
+    rows = conn.execute(
+        "SELECT pid, payload_json FROM struct_rows WHERE sid=? ORDER BY pid", (sid,),
+    ).fetchall()
+    headers = (
+        "<tr><th>#</th>"
+        + "".join(f"<th>{_h.escape(name or f'col{cr}')} <small>({cls})</small></th>" for cr, name, cls in cols)
+        + "</tr>"
+    )
+    body_trs = []
+    for pid, payload_json in rows:
+        payload = _json.loads(payload_json)
+        cells = "".join(
+            f"<td>{_struct_render_cell(conn, cls, payload.get(str(cr)))}</td>"
+            for cr, _nm, cls in cols
+        )
+        body_trs.append(f"<tr><td>{pid}</td>{cells}</tr>")
+    embed = ""
+    if db_id and base_url:
+        href = (
+            f"{base_url.rstrip('/')}/spaces/{space_key}/database/{db_id}"
+            if space_key else f"{base_url.rstrip('/')}/database/{db_id}"
+        )
+        embed = (
+            "<ac:structured-macro ac:name=\"info\"><ac:rich-text-body>"
+            f"<p><strong>Confluence Database</strong>: 빈 쉘 객체가 같은 공간에 있습니다 "
+            f'(<a href="{href}">dwc-struct-{_h.escape(tbl)}</a>, id={_h.escape(db_id)}). '
+            "Atlassian Database API 가 컬럼/row 입력을 지원하면 자동 동기화 예정.</p>"
+            "</ac:rich-text-body></ac:structured-macro>"
+        )
+    note = (
+        "<ac:structured-macro ac:name=\"note\"><ac:rich-text-body>"
+        f"<p><strong>collapsed</strong>: 이 schema 는 페이지 binding 이 없어 row 별 자식 페이지 대신 "
+        "본 마스터 페이지 1개로 통합되었습니다. 자식 row 페이지는 휴지통.</p>"
+        "</ac:rich-text-body></ac:structured-macro>"
+    )
+    return (
+        f"<h1>{_h.escape(tbl)} ({len(rows)} rows)</h1>"
+        f"<p>DokuWiki struct schema → Confluence (mode=collapsed). sid={sid}, "
+        f"columns={len(cols)}, rows={len(rows)}.</p>"
+        f"{embed}{note}"
+        f"<table>{headers}{''.join(body_trs)}</table>"
+    )
+
+
+def _struct_trash_page(session, base: str, page_id: str) -> bool:
+    """페이지를 휴지통으로 (Confluence v2 DELETE, purge=false 가 기본). 404 도 성공."""
+    r = _request_with_retry(session, "DELETE", f"{base}/api/v2/pages/{page_id}")
+    if r is None:
+        return False
+    if r.status_code in (204, 200, 404):
+        return True
+    return False
+
+
+def cmd_struct_collapse_unbound(args: argparse.Namespace) -> int:
+    """binding 없는 schema (`STRUCT_BINDINGS` 미정의) 의 row 자식 페이지를
+    휴지통으로 정리하고, 인덱스 페이지 본문을 *모든 row 가 들어있는 한 표* 로
+    교체. 본 인스턴스의 `brevet_place` (98 row, 장소명 free text) 가 대상.
+
+    *왜*: row 의 첫 Wiki 컬럼이 페이지 reference 인 schema 만 자식 페이지가
+    의미. 장소명 같은 free text 는 reference 가 없어 자식 페이지 98 개가 *시각적
+    잡음* (네비게이션 트리 오염, search noise). 한 표로 충분.
+
+    멱등: 이미 confluence_page_id=NULL 인 row 는 skip; 인덱스 페이지 본문에
+    `collapsed` note 가 있어 두 번째 실행은 PUT 만 (snapshot 표 갱신).
+    `--dry-run` 으로 영향 확인 가능.
+    """
+    if not args.email or not args.api_token:
+        log("자격증명 필요 — --email / --api-token 또는 .secrets/confluence.env")
+        return 2
+    conn = db_connect(args.db)
+    session = _confluence_session(args)
+    if session is None:
+        return 2
+    base = args.base_url.rstrip("/")
+    base_url = db_get_meta(conn, "confluence_base_url") or args.base_url
+    space_key = db_get_meta(conn, "confluence_space_key") or ""
+
+    schemas = conn.execute(
+        "SELECT sid, tbl, properties_index_page_id, confluence_db_id "
+        "FROM struct_schemas WHERE status='UPLOADED' ORDER BY tbl"
+    ).fetchall()
+    target_schemas = [s for s in schemas if s[1] not in STRUCT_BINDINGS]
+    if args.only_tbl:
+        target_schemas = [s for s in target_schemas if s[1] == args.only_tbl]
+    if not target_schemas:
+        log("collapse 대상 schema 없음 (STRUCT_BINDINGS 외 schema 가 없거나 모두 처리됨).")
+        conn.close()
+        return 0
+
+    total_trashed = total_kept = total_idx = 0
+    for sid, tbl, idx_page_id, db_id in target_schemas:
+        rows = conn.execute(
+            "SELECT pid, confluence_page_id FROM struct_rows "
+            "WHERE sid=? AND confluence_page_id IS NOT NULL ORDER BY pid",
+            (sid,),
+        ).fetchall()
+        log(f"=== {tbl} (sid={sid}) — idx={idx_page_id}, row 자식 페이지 {len(rows)} 개 ===")
+        if args.dry_run:
+            log(f"  [DRY] trash 대상: {len(rows)} 페이지, 인덱스 PUT 대상: 1 페이지")
+            total_trashed += len(rows)
+            total_idx += 1
+            continue
+
+        for pid, cid in rows:
+            if _struct_trash_page(session, base, str(cid)):
+                conn.execute(
+                    "UPDATE struct_rows SET confluence_page_id=NULL, status='COLLAPSED', "
+                    "last_error=NULL WHERE sid=? AND pid=?",
+                    (sid, pid),
+                )
+                total_trashed += 1
+            else:
+                conn.execute(
+                    "UPDATE struct_rows SET status='COLLAPSE_FAILED', last_error='trash DELETE' "
+                    "WHERE sid=? AND pid=?",
+                    (sid, pid),
+                )
+                total_kept += 1
+            if (total_trashed + total_kept) % 25 == 0:
+                conn.commit()
+                log(f"  ... trashed={total_trashed} kept={total_kept}")
+        conn.commit()
+
+        if idx_page_id:
+            new_body = _struct_build_collapsed_snapshot_xml(
+                conn, sid, tbl, db_id, base_url, space_key,
+            )
+            if _struct_put_page(session, base, str(idx_page_id), title=f"dokuwiki struct: {tbl}", storage=new_body):
+                conn.execute(
+                    "UPDATE struct_schemas SET chosen_mode='collapsed', last_checked_at=? "
+                    "WHERE sid=?",
+                    (now_iso(), sid),
+                )
+                conn.commit()
+                total_idx += 1
+                log(f"  index 본문 collapsed 마스터 표로 교체 → {idx_page_id}")
+            else:
+                log(f"  [WARN] index PUT 실패: {idx_page_id}")
+        else:
+            log(f"  [WARN] {tbl}: properties_index_page_id 없음 — 인덱스 교체 skip")
+
+    conn.close()
+    log(f"struct-collapse-unbound 완료: trashed={total_trashed} kept={total_kept} index_updated={total_idx}")
+    return 0 if total_kept == 0 else 1
 
 
 def cmd_struct_status(args: argparse.Namespace) -> int:
@@ -11580,14 +11891,92 @@ def env_default(key: str, fallback: str = "") -> str:
 
 def _add_confluence_creds_args(parser: argparse.ArgumentParser) -> None:
     """모든 Confluence API 호출 명령에 공통인 자격증명 옵션 (--base-url /
-    --email / --api-token) 일괄 추가. env_default 로 .env 자동 fill.
+    --email / --api-token / --api-token-file) 일괄 추가. env_default 로
+    .env 자동 fill.
 
     이 helper 가 없으면 매 명령마다 3줄 boilerplate. 새 명령 추가 시 자격증명
     인자 누락 방지.
+
+    `--api-token-file` 은 ps 노출 회피용. CLI 로 토큰을 직접 넘기면 다른
+    로컬 사용자의 `ps -ef` 에 그대로 보이므로 (한 번 발생한 사고 — 2026-
+    05-23), 파일 또는 환경 변수가 권장 경로. CLI 사용 시 main() 의
+    `_resolve_api_token` 가 stderr 경고를 출력.
     """
     parser.add_argument("--base-url", default=env_default("CONFLUENCE_BASE_URL"))
     parser.add_argument("--email", default=env_default("CONFLUENCE_EMAIL"))
     parser.add_argument("--api-token", default=env_default("CONFLUENCE_API_TOKEN"))
+    parser.add_argument(
+        "--api-token-file",
+        default=env_default("CONFLUENCE_API_TOKEN_FILE"),
+        help="API 토큰을 파일에서 읽음 (mode 0600 권장). `--api-token` 보다 "
+             "우선순위 낮음. CLI 노출 회피용.")
+
+
+def _resolve_api_token(args: argparse.Namespace, argv: list[str]) -> None:
+    """`args.api_token` 정상화 + ps 노출 경고.
+
+    우선순위 (높음→낮음):
+      1. CLI `--api-token <v>` (이 helper 가 stderr 경고)
+      2. CLI `--api-token-file <path>` 가 가리키는 파일 본문
+      3. 환경 변수 `CONFLUENCE_API_TOKEN` (이미 argparse default 로 fill)
+      4. 환경 변수 `CONFLUENCE_API_TOKEN_FILE` (--api-token-file default)
+
+    동작:
+      - `args.api_token` 존재 + sys.argv 에 `--api-token` 직접 나오면 ps 노출
+        경고 출력 (실행은 차단하지 않음 — 운영자가 토큰 회전 결정).
+      - `args.api_token` 비어 있고 `args.api_token_file` 있으면 파일 읽기.
+        파일 권한이 group/other 비트 (0o077) 가 set 이면 거부 + 빈 토큰 반환
+        (downstream 의 "자격증명 필요" 메시지가 자연스러운 fail-closed).
+
+    이 helper 는 args.api_token 이 있는 subcommand 에만 영향 (즉
+    `_add_confluence_creds_args` 가 호출된 subcommand 들). 그 외 subcommand
+    (예: discover) 는 무영향.
+    """
+    if not hasattr(args, "api_token"):
+        return
+    # ps 노출 검출 — sys.argv 에 `--api-token` 또는 `--api-token=` 가 나오면
+    # 토큰이 한 번이라도 명령줄에 들어왔던 것이고, ps -ef 가 그 시점에 캡처
+    # 가능했다.  default 가 env 에서 채워진 경우는 argv 에 안 보이므로 안전.
+    cli_exposed = any(
+        a == "--api-token" or a.startswith("--api-token=")
+        for a in argv[1:])
+    if cli_exposed and args.api_token:
+        print(
+            "[warn] --api-token 을 명령줄 인자로 전달했습니다. 토큰이 "
+            "ps 출력에 노출됩니다 (한 번 노출된 토큰은 회전 권장). "
+            "다음 중 하나로 대체하세요:\n"
+            "  (1) 환경 변수 CONFLUENCE_API_TOKEN "
+            "(set -a; source .secrets/confluence.env; set +a)\n"
+            "  (2) 파일: --api-token-file <path> "
+            "(파일은 chmod 0600 필수)\n"
+            "  (3) wizard: python run.py wizard "
+            "(stdin 으로 자격증명 입력)",
+            file=sys.stderr)
+    # --api-token 이 비어 있고 --api-token-file 가 있으면 파일에서 로드
+    token_file = getattr(args, "api_token_file", "") or ""
+    if not args.api_token and token_file:
+        path = Path(token_file).expanduser()
+        try:
+            st = path.stat()
+        except OSError as exc:
+            print(f"[error] --api-token-file 읽기 실패: {exc!r}",
+                  file=sys.stderr)
+            return
+        # mode 0600 정책 (group/other 비트 set → 거부)
+        if st.st_mode & 0o077:
+            print(
+                f"[error] --api-token-file 권한이 너무 열려있음 "
+                f"({oct(st.st_mode & 0o777)}); chmod 0600 {path} "
+                f"후 재시도.",
+                file=sys.stderr)
+            return
+        try:
+            args.api_token = path.read_text(
+                encoding="utf-8").strip()
+        except OSError as exc:
+            print(f"[error] --api-token-file 본문 읽기 실패: {exc!r}",
+                  file=sys.stderr)
+            return
 
 
 def _add_confluence_space_args(parser: argparse.ArgumentParser) -> None:
@@ -11694,6 +12083,18 @@ def _build_history_subcommands(sub) -> None:
     sp_hs = sub.add_parser("history-status", help="history 진행 상황 요약")
     sp_hs.set_defaults(func=cmd_history_status)
 
+    sp_hasf = sub.add_parser(
+        "history-append-skipped-footer",
+        help="SKIPPED PUT rev 가 있는 페이지의 latest 본문 끝에 이주 안내 푸터 부착 (영구 제약 안내)",
+    )
+    _add_confluence_creds_args(sp_hasf)
+    sp_hasf.add_argument("--only", help="특정 doku_id 만 처리")
+    sp_hasf.add_argument("--dry-run", action="store_true", help="영향 페이지만 출력")
+    sp_hasf.add_argument("--force", action="store_true", help="이미 부착된 1개 footer 도 재부착 (테스트/문구 수정 후)")
+    sp_hasf.add_argument("--min-skipped", type=int, default=2,
+                         help="SKIPPED rev 수 임계 (기본 2 — 단발 PUT 실패 1건은 제외, 큰 페이지 후반 rev 누락만 대상)")
+    sp_hasf.set_defaults(func=cmd_history_append_skipped_footer)
+
     sp_hrh = sub.add_parser(
         "history-rewrite-headers",
         help="이미 업로드된 페이지의 revision 헤더만 새 형식으로 교체 (PUT)",
@@ -11746,6 +12147,10 @@ def _build_struct_subcommands(sub) -> None:
     sp_su.add_argument("--only-tbl", help="특정 schema tbl 만 처리")
     sp_su.add_argument("--row-limit", type=int, help="schema 별 row 처음 N개만 처리 (디버깅)")
     sp_su.add_argument("--index-only", action="store_true", help="인덱스 페이지만 PUT (row 페이지 갱신 skip)")
+    sp_su.add_argument(
+        "--allow-unbound-rows", action="store_true",
+        help="STRUCT_BINDINGS 미정의 schema 도 row 자식 페이지 강제 생성 (기본은 skip — struct-collapse-unbound 사용 권장)",
+    )
     sp_su.set_defaults(func=cmd_struct_upload)
 
     sp_ss = sub.add_parser("struct-status", help="struct 진행 상황 요약")
@@ -11758,6 +12163,15 @@ def _build_struct_subcommands(sub) -> None:
     _add_confluence_creds_args(sp_se)
     sp_se.add_argument("--only-doku", help="특정 doku_id 한 페이지만 처리")
     sp_se.set_defaults(func=cmd_struct_embed_on_bound_pages)
+
+    sp_scu = sub.add_parser(
+        "struct-collapse-unbound",
+        help="binding 없는 schema (STRUCT_BINDINGS 미정의) 의 row 자식 페이지 휴지통 + 인덱스를 마스터 표로",
+    )
+    _add_confluence_creds_args(sp_scu)
+    sp_scu.add_argument("--only-tbl", help="특정 schema tbl 만 처리 (예: brevet_place)")
+    sp_scu.add_argument("--dry-run", action="store_true", help="실제 trash/PUT 없이 영향 페이지 수만 출력")
+    sp_scu.set_defaults(func=cmd_struct_collapse_unbound)
 
 
 def _build_oversized_subcommands(sub) -> None:
@@ -12151,11 +12565,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Iterable[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(list(argv) if argv is not None else None)
+    raw_argv = list(argv) if argv is not None else sys.argv
+    args = parser.parse_args(
+        raw_argv if argv is not None else None)
     if not getattr(args, "cmd", None):
         # 인자 없이 실행 → 도움말 출력 후 종료 (exit code 0)
         parser.print_help()
         return 0
+    # `--api-token` ps 노출 경고 + `--api-token-file` 파일 로드.
+    # `_add_confluence_creds_args` 가 호출된 subcommand 만 해당 — 그 외
+    # subcommand 는 args.api_token 미존재로 즉시 return.
+    _resolve_api_token(args, raw_argv)
     return args.func(args)
 
 
