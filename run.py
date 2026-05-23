@@ -2768,9 +2768,15 @@ def _rewrite_links_in_xml(
         else:
             target_id, anchor = rest, None
 
+        # NFC/NFD 양쪽 시도 — links 의 target_doku_id 는 raw HTML 의 wiki-id
+        # (NFC) 에서 추출되는 반면 pages.doku_id 는 filesystem path (macOS APFS
+        # NFD) 에서 생성됨. byte-exact 매치 실패 회피.
+        import unicodedata as _ud
+        target_id_nfc = _ud.normalize("NFC", target_id)
+        target_id_nfd = _ud.normalize("NFD", target_id)
         target_row = conn.execute(
-            "SELECT title, confluence_page_id, status FROM pages WHERE doku_id=?",
-            (target_id,),
+            "SELECT title, confluence_page_id, status FROM pages WHERE doku_id IN (?, ?)",
+            (target_id_nfc, target_id_nfd),
         ).fetchone()
 
         link_text = a.get_text() or target_id
