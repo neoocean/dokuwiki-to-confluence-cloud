@@ -328,6 +328,114 @@ macOS APFS 의 한국어 doku_id 는 NFD 로 db 저장 (shell argument 는 NFC) 
 byte-exact 매치 실패 회피용으로 `--only` 매칭 시 NFC/NFD 양쪽 normalize
 폼 모두 시도하는 `WHERE doku_id IN (?, ?)` 추가.
 
+## Day 5 §11 history-upload 의 latest 본문 복원 + chain 보존
+
+사용자 발견 — 비교 갤러리 cnf 캡쳐 (u:neoocean:j:2019:06:23 / u:neoocean:j:2019:09:15)
+에서 *본문 뒷부분 모두 사라짐* (DokuWiki rev 헤더 panel + `<h1>` 만).
+페이지의 *현재* Confluence 본문은 정상이거나 일부 잘림 상태로 드러남.
+
+### 진단 — 3 단계 결함
+
+**1) rev fail → break (CL 53919 / git 688da23)**
+
+`_history_upload_replay_one_page` 가 rev 시간순 PUT 중 한 rev fail 시
+`break`. 결과:
+- 같은 페이지의 다음 rev (newer) 모두 skip
+- `last_replayed_rev_ts` 가 마지막 OK rev 의 ts 로 고정
+- Confluence 본문 = *마지막 OK rev (대부분 첫 만듦 rev)* 으로 영구 남음
+
+본 인스턴스 측정: 49 페이지 (start, u:lam:2019/2020, u:neoocean:j:2019:06:23
+등) 가 이 상태. *uploaded_hash 메타는 latest hash* 이지만 *실제 Confluence
+본문은 짧음* — meta 가 거짓말.
+
+Fix: 신규 helper `_history_restore_latest_body` — rev replay 종료 후
+(성공/실패 무관) latest storage 본문 강제 PUT. `_history_upload_replay_one_page`
+의 두 return 경로 모두에 helper 호출 추가. 멱등 (content_hash ==
+uploaded_hash 면 skip).
+
+49 페이지 일괄 복원 — 사용자 페이지 339b → 136,156b v22 검증.
+
+**2) status='UPLOADED' filter (CL 53921 / git 9bf0a75)**
+
+`_history_upload_select_pages` 의 WHERE 가 `status='UPLOADED'` 만 필터 →
+status='CONVERTED' 같은 다른 흐름으로 떨어진 페이지 (실제 Confluence 에 본문
+있음) 의 rev 누락.
+
+본 인스턴스: 1675 페이지 중 첫 upload 가 534 페이지만 처리. 1032 CONVERTED
+페이지 skip.
+
+Fix: WHERE 가 `confluence_page_id IS NOT NULL AND storage_path IS NOT NULL`
+로 완화. status 무관. resume 은 `history_meta.last_replayed_rev_ts` 로.
+
+**3) rev fail break → continue (CL 53922 / git fe8fa92)**
+
+`break` 가 *영구* fail rev (본문 한도 초과 등) 에서 *나머지 모든 rev 막음*.
+17,949 CONVERTED rev 가 *같은 fail rev 에 stuck* 상태로 누적.
+
+Fix: rev fail 시 status='SKIPPED' 마킹 후 `continue`. Confluence
+current_version 은 fail PUT 으로 안 바뀌므로 다음 rev 의 cur+1 PUT 무관.
+같은 사이클에 FAILED rev (PUT no resp 166 개) → CONVERTED 재마킹 후
+history-upload 재실행.
+
+### compare-publish 안전판 (CL 53924 / git 4040a8b)
+
+신규 helper `_compare_ensure_latest_body` — `cmd_compare_publish` 의 캡쳐
+직전 호출. 각 후보 페이지에 대해:
+1. Confluence cnf body length GET (storage 표현)
+2. local storage 의 50% 미만이면 강제 latest PUT
+3. uploaded_hash meta 갱신
+
+`_history_restore_latest_body` 와 달리 *content_hash == uploaded_hash 인
+경우에도 강제* — meta 거짓말 흡수. 자율 진행 도구 사용 시 우연한 불일치
+방지 안전판.
+
+본 인스턴스: 직전 갤러리 batch 40 페이지 중 4 페이지 잘림 + 사용자 페이지
+- u:neoocean:read (643KB → 89KB)
+- u:oh:2017-11-1w (128KB → 44KB)
+- u:oh:2017-11-2w (126KB → 35KB)
+- u:oh:2018-04-3w (97KB → 27KB)
+- u:neoocean:j:2019:09:15 (96KB → 짧음)
+
+강제 latest PUT 후 갤러리 재발행 (37/37 캡쳐 + 74/74 첨부).
+
+## Day 5 §12 div.li unwrap — Confluence li bullet 줄바꿈 깨짐 fix
+
+사용자 발견 — `u:neoocean:j:2019:07:20` (스크랩, 262 li / 4 ac:image /
+65 footnote) 의 Confluence 측에서 *이미지 아래쪽부터 bullet list 가 평문
+처럼 보임*. storage 의 ul/li 갯수는 view 와 일치 (정상 nesting), 본문도
+끝까지 완전.
+
+### 진단
+
+`<li><div class="li">text</div></li>` 패턴 — DokuWiki 가 li 안에 자체 CSS
+target 용 wrapper div.li 를 출력. 본 변환기는 이걸 그대로 보존. Confluence
+storage 에서 *li 의 직접 자식이 block-level div* 인 경우 renderer 가
+*긴 본문 / 깊은 nesting* 페이지에서 li 의 bullet 위치 / 줄바꿈 계산을
+잘못해 시각적으로 *list 가 평문으로 보임*.
+
+본 인스턴스 영향: 1675 페이지 중 **748 페이지 (45%)** 에 div.li 잔존.
+
+### Fix
+
+`_convert_html_to_storage` 의 serialize 직전 (잔존 class 정리 후) 에:
+
+```python
+for div in list(soup.find_all("div", class_="li")):
+    div.unwrap()
+```
+
+div.li 는 wrapper 만 — 내용은 보존. Confluence 에선 의미 없는 wrapper 라
+무손실 제거.
+
+### 적용 결과
+
+- `convert --force` 전체 1675 페이지 → 1567 ok, div.li 0 잔존 검증
+- 사용자 페이지 `u:neoocean:j:2019:07:20` 단일 push v12 검증
+- `rewrite-links` 전체 — 748 페이지 push (background)
+- 갤러리 재발행 (캡쳐 + 첨부)
+- pytest 190 passed
+- P4 CL 53928 / git ed1e24f
+
 ---
 
 # Day 4 — 2026-05-19 (struct → native+properties 라이브 적용)
