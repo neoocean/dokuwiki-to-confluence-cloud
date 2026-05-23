@@ -436,6 +436,137 @@ div.li 는 wrapper 만 — 내용은 보존. Confluence 에선 의미 없는 wra
 - pytest 190 passed
 - P4 CL 53928 / git ed1e24f
 
+## Day 5 §13 discussion plugin PHP 8 호환성 patch
+
+사용자 발견 — `u:neoocean:d:start` 페이지 본문에 빨간 에러 박스 잔존:
+
+> TypeError: array_key_exists(): Argument #2 ($array) must be of type
+> array, bool given. It might be a problem in the discussion plugin.
+
+### 진단
+
+discussion plugin `action.php:1830`:
+
+```php
+$data = unserialize(io_readFile($file, false));
+```
+
+- `io_readFile` 실패 시 `false` 반환
+- `unserialize(false)` → `false`
+- `array_key_exists($key, false)` — PHP 7 까지 silent / warning, **PHP 8 부터
+  strict TypeError**
+- dev 컨테이너의 `php:8.2-apache` 환경에서 매번 trigger
+
+### Fix — `_dev_patch_discussion_php8(clone_root)` (CL 53937 / git 72c548c)
+
+새 helper. dev clone 의 `action.php` 의 알려진 needle 후에:
+
+```php
+if (!is_array($data)) { $data = []; }
+```
+
+삽입. 멱등 (`// [d2c-patch]` 마커로 중복 회피).
+
+`dev up` flow 의 자동 처리 단계가 **5 단계** 로 확장:
+1. ACL bypass (anonymous deny 우회)
+2. `.htaccess` 생성 (mod_rewrite rules)
+3. 플러그인 자동 설치
+4. NFC 정규화 (한국어 미디어/페이지명)
+5. **discussion PHP 8 호환성 patch** ← 신규
+
+다른 macOS / Linux 인스턴스 마이그레이션 시 `dev up` 한 줄로 자동 적용.
+
+### 적용 결과
+
+- `?do=export_xhtmlbody`: 3,048b (에러 메시지 0)
+- convert + rewrite-links → v34 push
+- 갤러리 재발행 — 사용자 페이지 cnf 캡쳐 에러 박스 사라짐
+
+## Day 5 §14 NFC/NFD mismatch — 한국어 internal link 미해결 fix
+
+사용자 발견 (Day 5 §13 같은 페이지의 *다음* 이슈) — `u:neoocean:d:start` 의
+글 목록 모든 항목이 *평문* (DokuWiki 측은 녹색 유효 링크 다수).
+
+### 진단
+
+`_rewrite_links_in_xml` 의 target row 검색:
+
+```python
+target_row = conn.execute(
+    "SELECT title, confluence_page_id, status FROM pages WHERE doku_id=?",
+    (target_id,),
+).fetchone()
+```
+
+**byte-exact** 매치. 그러나:
+
+| source | encoding |
+|---|---|
+| `links.target_doku_id` | raw HTML 의 `data-wiki-id` 속성 = **NFC** (HTML 표준) |
+| `pages.doku_id` | filesystem path = **NFD** (macOS APFS) |
+
+한국어 page name (글쓰기 / 어쎄신크리드 오딧세이 / 서피스고 등) 의
+NFC/NFD byte mismatch → SELECT None → unresolved → 평문 격하 (`a.replace_with(text)`).
+
+### Fix (CL 53940 / git 40aee2d)
+
+```python
+import unicodedata as _ud
+target_id_nfc = _ud.normalize("NFC", target_id)
+target_id_nfd = _ud.normalize("NFD", target_id)
+target_row = conn.execute(
+    "SELECT title, confluence_page_id, status FROM pages WHERE doku_id IN (?, ?)",
+    (target_id_nfc, target_id_nfd),
+).fetchone()
+```
+
+이전 `_compare_select_candidates` 의 `_is_excluded` / `cmd_split_oversize`
+의 `--only` 매칭과 같은 패턴 — *NFC/NFD 양쪽 시도*. 본 패턴이 *모든
+SQL doku_id lookup* 에 적용되어야 안전.
+
+### 영향 측정
+
+- 전체 4,440 unresolved link 중 199 unique target 이 NFC/NFD mismatch
+- **64 src 페이지** 영향 (한국어 wikilink 가진 페이지들)
+
+### 적용 결과
+
+- 사용자 페이지 9 link 중 **6 정상 변환** (3 unresolved 는 `user:` namespace
+  alias — 별개 follow-up issue)
+- 전체 convert --force (1567 OK) + rewrite-links (background)
+
+## Day 5 §15 compare-publish `--refresh` 옵션 신설
+
+자율 진행 흐름 (history-upload / 변환기 fix 등) 후 갤러리에 박힌 cnf
+캡쳐가 *옛 상태* 일 때, 새 candidate 선정 없이 같은 batch 의 PNG 만
+재캡쳐 + 재발행하는 명령 옵션.
+
+### 동작 (CL 53941 / git 6f99b13)
+
+```sh
+python run.py compare-publish --refresh
+```
+
+1. `compare_publish_last_batch` meta 에서 마지막 발행 batch id 읽음
+2. 해당 ids 를 `explicit_ids` 로 사용
+3. `out_dir` 의 모든 PNG 삭제 (강제 재캡쳐)
+4. `--no-track` 자동 (이미 history 에 있음)
+5. compare-publish 정상 흐름 (latest-restore 안전판 포함)
+
+### meta 갱신
+
+`cmd_compare_publish` 가 발행 성공 후 항상 `compare_publish_last_batch`
+meta 갱신 (track 여부 무관). `--refresh` 의 source.
+
+### 활용 시나리오
+
+| 시나리오 | 명령 |
+|---|---|
+| 새 batch (이전과 안 겹침) | `compare-publish --sample 40` (기본 자동 exclude) |
+| 같은 batch 재발행 (PNG 재캡쳐) | `compare-publish --refresh` |
+| 명시 페이지 batch | `compare-publish --select <ids>` |
+| 이력 초기화 | `compare-publish --reset-rotation --sample 40` |
+
 ---
 
 # Day 4 — 2026-05-19 (struct → native+properties 라이브 적용)
