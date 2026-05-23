@@ -10866,6 +10866,31 @@ def cmd_compare_publish(args: argparse.Namespace) -> int:
         log("rotation 이력 초기화.")
 
     explicit = [s.strip() for s in args.select.split(",") if s.strip()] if args.select else None
+
+    # --refresh: 현재 갤러리에 박힌 *마지막 발행 batch* 의 PNG 를 재캡쳐 + 재발행.
+    # 본문/이미지가 옛 상태 (history-upload 진행 중 / 변환기 fix 후 / discussion
+    # plugin patch 후 등) 일 때 갤러리만 빠르게 최신화. --no-track 자동 (이미
+    # 이력에 있음). --select / --sample 우선 — refresh 단독 호출 의도.
+    if getattr(args, "refresh", False) and not explicit:
+        last_batch_raw = db_get_meta(conn, "compare_publish_last_batch") or ""
+        last_ids = [l.strip() for l in last_batch_raw.splitlines() if l.strip()]
+        if not last_ids:
+            log("--refresh: 마지막 발행 batch 메타 없음. 일반 compare-publish 한 번 실행 필요.")
+            conn.close()
+            return 1
+        explicit = last_ids
+        args.no_track = True
+        # PNG 강제 재캡쳐
+        out_dir = Path(args.out_dir or "compare_screenshots")
+        removed = 0
+        for png in out_dir.glob("*.png"):
+            try:
+                png.unlink()
+                removed += 1
+            except OSError:
+                pass
+        log(f"--refresh: 마지막 batch {len(last_ids)} 페이지 재캡쳐 (PNG {removed} 삭제)")
+
     exclude_ids: set[str] = set()
     if not explicit:
         # 기본 동작: 이전 발행 이력 (compare_publish_history meta) 전체 제외
@@ -10950,6 +10975,9 @@ def cmd_compare_publish(args: argparse.Namespace) -> int:
         prev_ids.update(published_ids)
         db_set_meta(conn, "compare_publish_history", "\n".join(sorted(prev_ids)))
         log(f"  rotation 이력 갱신: 총 {len(prev_ids)} 페이지 (이번 {len(published_ids)} 추가)")
+
+    # 항상 *마지막 발행 batch* meta 갱신 — --refresh 의 source. track 여부 무관.
+    db_set_meta(conn, "compare_publish_last_batch", "\n".join(published_ids))
 
     log(f"=== 완료: {base}/spaces/{args.space_key}/pages/{page_id} ===")
     conn.close()
@@ -12047,6 +12075,10 @@ def _build_tool_subcommands(sub) -> None:
                        help="스크린샷 출력 디렉터리 (기본 compare_screenshots/)")
     sp_cp.add_argument("--no-recapture", action="store_true",
                        help="기존 PNG 재사용 (캡쳐 skip — 본문/첨부만 재발행)")
+    sp_cp.add_argument("--refresh", action="store_true",
+                       help="현재 갤러리의 *마지막 발행 batch* 를 PNG 강제 재캡쳐 + "
+                            "재발행. 본문/이미지가 옛 상태일 때 (history-upload 진행 / "
+                            "변환기 fix 후 등) 갤러리만 최신화. --no-track 자동 적용.")
     sp_cp.add_argument("--dry-run", action="store_true",
                        help="발행 skip, 후보·캡쳐 결과만 출력")
     sp_cp.add_argument("--dokuwiki-base-url", default=env_default("DOKUWIKI_BASE_URL"),
