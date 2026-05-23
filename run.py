@@ -7084,6 +7084,50 @@ def _dev_normalize_filenames_to_nfc(clone_root: Path) -> None:
         log(f"  한국어 파일명 NFC 정규화: {cp_count} cp (err={err_count})")
 
 
+def _dev_patch_discussion_php8(clone_root: Path) -> None:
+    """discussion plugin 의 PHP 8 호환성 patch.
+
+    `unserialize(io_readFile(file, false))` 는 file 읽기 실패 시 `false` 반환 →
+    `array_key_exists($key, false)` 는 PHP 8 부터 `TypeError`. 페이지 render 시
+    `TypeError: array_key_exists(): Argument #2 ($array) must be of type array,
+    bool given` 으로 *plugin error 메시지 출력 + 그 시점 이후 본문 누락*.
+
+    Fix: `$data = ...` 다음 줄에 `if (!is_array($data)) $data = [];` 삽입.
+
+    의도: dev 컨테이너 한정. 호스트 원본 plugin 은 손대지 않음.
+    """
+    target = clone_root / "lib" / "plugins" / "discussion" / "action.php"
+    if not target.is_file():
+        return
+    src = target.read_text(encoding="utf-8", errors="replace")
+    # 이미 patch 됐는지 확인 (멱등)
+    if "// [d2c-patch] PHP 8 array_key_exists" in src:
+        return
+    needle = (
+        "            $data = [];\n"
+        "            if (@file_exists($file)) {\n"
+        "                $data = unserialize(io_readFile($file, false));\n"
+        "            }\n"
+        "\n"
+        "            if (!array_key_exists('title', $data)"
+    )
+    replacement = (
+        "            $data = [];\n"
+        "            if (@file_exists($file)) {\n"
+        "                $data = @unserialize(io_readFile($file, false));\n"
+        "            }\n"
+        "            // [d2c-patch] PHP 8 array_key_exists 는 array 만 받음 — false 거부\n"
+        "            if (!is_array($data)) { $data = []; }\n"
+        "\n"
+        "            if (!array_key_exists('title', $data)"
+    )
+    if needle not in src:
+        log("  discussion plugin patch — 알려진 needle 미발견 (다른 버전?), skip")
+        return
+    target.write_text(src.replace(needle, replacement), encoding="utf-8")
+    log("  discussion plugin PHP 8 호환성 patch 적용")
+
+
 def _dev_ensure_htaccess(clone_root: Path) -> None:
     """`.htaccess` 가 부재하면 DokuWiki 공식 rewrite rules 생성.
 
@@ -7548,6 +7592,7 @@ def cmd_dev(args: argparse.Namespace) -> int:
         _dev_patch_acl_off(DEV_CLONE_DST)
         _dev_ensure_htaccess(DEV_CLONE_DST)
         _dev_normalize_filenames_to_nfc(DEV_CLONE_DST)
+        _dev_patch_discussion_php8(DEV_CLONE_DST)
 
         log("docker compose up -d")
         if subprocess.call(["docker", "compose", "-f", str(compose), "up", "-d"]) != 0:
