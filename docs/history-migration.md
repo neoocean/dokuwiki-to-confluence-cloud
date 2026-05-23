@@ -14,13 +14,25 @@
 
 **후속 (2026-05-23): 영구 제약 페이지에 안내 푸터 부착.**
 `history-append-skipped-footer` 명령으로 SKIPPED PUT rev 가 2건 이상인
-페이지 7개 (u:lam:2019 324 / u:lam:2020 106 / u:neoocean:2019 51 / u:lam:
-start 28 / blog:draft:start 14 / u:lam:출퇴근기록 2 / u:neoocean:2018-03 2)
-의 latest 본문 끝에 *마이그레이션 안내 (history rev 누락)* note 매크로
-부착. 푸터에 (a) 보존된 rev 수 / 누락 rev 수 (b) P4 백업 경로 안내.
-멱등 — sentinel `<h2>마이그레이션 안내 (history rev 누락)</h2>` 로 중복
-부착 방지 + 기존 중복 cleanup. 결정: **외부 호스팅 채택 안 함** — P4 백업
-이 이미 충분 + 외부 호스팅의 운영 부담 큼.
+페이지의 latest 본문 끝에 *마이그레이션 안내 (history rev 누락)* note
+매크로 부착. 푸터에 (a) 보존된 rev 수 / 누락 rev 수 (b) P4 백업 경로
+안내. 멱등 — sentinel `<h2>마이그레이션 안내 (history rev 누락)</h2>`
+로 중복 부착 방지 + 기존 중복 cleanup. 결정: **외부 호스팅 채택 안 함**
+— P4 백업이 이미 충분 + 외부 호스팅의 운영 부담 큼.
+
+**후속 (2026-05-23, 재개 라운드 완료):** 이전 라운드에서 limit 도달로
+중단된 (E) 재개 가능 5539 rev / 112 페이지에 대해 `history-upload`
+(--limit 없이) 4시간 44분 동안 라이브 적용. 결과:
+- **UPLOADED 27,359 → 32,453 (+5,094)** = **전체 rev 의 86.8%**
+- SKIPPED 1,202 → 1,536 (+334, 본문 한도 추가 도달)
+- CONVERTED 9,392 → 3,956 (잔여 = (A) 비-마이그레이션 958 + (D)
+  large_body_fallback 2,895 + (E) 시간 역순 skip 103)
+- footer 부착 페이지 22 (이전 7 + 신규 15, u:oh:* 일지 그룹).
+
+(E) 103 rev 는 각 페이지의 *과거 1 rev* 가 `last_replayed_rev_ts` 보다
+작아 `rev_ts > ?` SQL 에서 제외 — 시간 역순 PUT 은 *latest 본문 회귀*
+부작용 가능. latest 본문은 이미 OK 이므로 추가 라운드 가치 낮음, 본
+인스턴스에서는 무시.
 
 ---
 
