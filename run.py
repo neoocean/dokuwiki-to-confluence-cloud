@@ -4103,6 +4103,8 @@ def _split_phase_define(conn, doku_id: str, xml: str, h_level: int) -> list[tupl
 def _split_phase_convert(conn, doku_id: str, h_level: int) -> int:
     """각 rev 의 본문을 같은 chunk schema 로 분할 → history_split_rev_chunks 채움.
 
+    A3: schema 외 신규 slug 발견 시 history_split_chunks 에 동적 INSERT.
+
     Returns: 처리한 (rev, chunk) 행 수."""
     revs = conn.execute(
         "SELECT rev_ts, storage_path FROM revisions WHERE doku_id=? AND storage_path IS NOT NULL "
@@ -4110,7 +4112,12 @@ def _split_phase_convert(conn, doku_id: str, h_level: int) -> int:
         (doku_id,),
     ).fetchall()
     log(f"  [CONVERT] {doku_id}: {len(revs)} rev 분할")
+    # 기존 schema slug 집합
+    existing_slugs = {r[0] for r in conn.execute(
+        "SELECT chunk_slug FROM history_split_chunks WHERE doku_id=?", (doku_id,)
+    ).fetchall()}
     rows = 0
+    new_slugs: set[str] = set()
     prev_chunk_hash: dict[str, str] = {}
     for rev_ts, sp in revs:
         if not Path(sp).is_file():
@@ -4118,6 +4125,14 @@ def _split_phase_convert(conn, doku_id: str, h_level: int) -> int:
         body = Path(sp).read_text(encoding="utf-8")
         chunks = _split_chunks_with_slug(body, h_level)
         for slug, label, ch_body in chunks:
+            # A3: 새 slug 발견 시 schema 에 ACTIVE 로 INSERT
+            if slug not in existing_slugs and slug not in new_slugs and slug != "_misc":
+                conn.execute(
+                    "INSERT OR IGNORE INTO history_split_chunks(doku_id, chunk_slug, chunk_title, status) "
+                    "VALUES(?, ?, ?, 'ACTIVE')",
+                    (doku_id, slug, label[:128]),
+                )
+                new_slugs.add(slug)
             h = sha256_bytes(ch_body.encode("utf-8"))
             # 직전 rev 의 같은 chunk 와 hash 동일 → PENDING 안 만들고 SKIPPED 마킹 (no change)
             if prev_chunk_hash.get(slug) == h:
@@ -4138,13 +4153,15 @@ def _split_phase_convert(conn, doku_id: str, h_level: int) -> int:
             conn.commit()
             log(f"    ... {rows} chunk rev 처리")
     conn.commit()
+    if new_slugs:
+        log(f"  [CONVERT] 신규 chunk slug {len(new_slugs)}: {sorted(new_slugs)}")
     log(f"  [CONVERT] {doku_id}: {rows} (rev, chunk) 행 생성")
     return rows
 
 
 def _split_phase_upload(conn, session, base: str, doku_id: str, parent_cid: str,
                        parent_title: str, space_id: str, h_level: int,
-                       limit: int | None = None) -> tuple[int, int]:
+                       limit: int | None = None, sleep_ms: int = 0) -> tuple[int, int]:
     """각 slug 의 child page 생성 + chunk replay (rev 시간순 PUT).
 
     Returns: (rev_chunk_ok, rev_chunk_fail).
@@ -4253,6 +4270,8 @@ def _split_phase_upload(conn, session, base: str, doku_id: str, parent_cid: str,
                 if cur_ver is None:
                     fail += 1
                     break
+            if sleep_ms > 0:
+                time.sleep(sleep_ms / 1000.0)
             r = _request_with_retry(
                 session, "PUT", f"{base}/api/v2/pages/{child_cid}",
                 json={
@@ -4307,13 +4326,8 @@ def _split_phase_finalize(conn, session, base: str, doku_id: str, parent_cid: st
     if not slugs:
         log(f"  [SKIP] {doku_id}: 자식 페이지 없음")
         return False
-    items = []
-    for slug, title, cid, last_ts in slugs:
-        items.append(
-            f"<li><ac:link><ri:page ri:content-title=\"{_h.escape(parent_title + ' – ' + (title or slug))}\"/>"
-            f"<ac:plain-text-link-body><![CDATA[{title or slug}]]></ac:plain-text-link-body>"
-            f"</ac:link>{f' <small>(latest rev {last_ts})</small>' if last_ts else ''}</li>"
-        )
+    # A5: link list 제거 (children 매크로만) + B3: cid 직접 참조 안전망 (현재는
+    # children 매크로가 자동 동기화하므로 link list 자체가 stale 위험 — 제거).
     body = (
         f"<h1>{_h.escape(parent_title)}</h1>"
         f"{_SPLIT_INDEX_SENTINEL}"
@@ -4321,9 +4335,8 @@ def _split_phase_finalize(conn, session, base: str, doku_id: str, parent_cid: st
         "<p>이 페이지는 본문이 커서 자식 페이지로 분할 보존됩니다. "
         "각 자식 페이지의 <em>history</em> 가 원본 DokuWiki rev 입니다. "
         "최신 본문은 자식 페이지 합본 (각 자식의 latest = 그 chunk 의 최신 rev) 으로 구성.</p>"
+        f"<p>chunk 자식 페이지 {len(slugs)}개 — 아래 children 매크로에서 동적 표시.</p>"
         "</ac:rich-text-body></ac:structured-macro>"
-        f"<h3>chunk 자식 페이지 ({len(slugs)}개)</h3>"
-        f"<ul>{''.join(items)}</ul>"
         "<ac:structured-macro ac:name=\"children\"><ac:parameter ac:name=\"depth\">1</ac:parameter></ac:structured-macro>"
     )
     cur_ver = _get_page_version(session, base, parent_cid)
@@ -4403,13 +4416,88 @@ def cmd_history_split_run(args: argparse.Namespace) -> int:
         return 0
     ok, fail = _split_phase_upload(
         conn, session, base, doku_id, parent_cid, parent_title, space_id,
-        info["h_level"], limit=args.limit,
+        info["h_level"], limit=args.limit, sleep_ms=args.sleep_ms,
     )
     if not args.no_finalize and ok > 0:
         _split_phase_finalize(conn, session, base, doku_id, parent_cid, parent_title)
     conn.close()
     log(f"history-split-run 완료: ok={ok} fail={fail}")
     return 0 if fail == 0 else 1
+
+
+def cmd_history_split_retry(args: argparse.Namespace) -> int:
+    """status='SKIPPED' AND last_error LIKE 'PUT %' 인 chunk rev 를 재시도.
+
+    PoC 라이브 적용 시 PUT no resp / rate limit 등 일시적 거부된 250 rev
+    회복용. chunk chain 보존 정책 덕에 *늦게 재시도해도 안전*."""
+    if not args.email or not args.api_token:
+        log("자격증명 필요.")
+        return 2
+    conn = db_connect(args.db)
+    _split_init_tables(conn)
+    session = _confluence_session(args)
+    if session is None:
+        return 2
+    base = args.base_url.rstrip("/")
+
+    import unicodedata as _ud
+    doku_id_nfc = _ud.normalize("NFC", args.only) if args.only else None
+    if args.only:
+        doku_id_nfd = _ud.normalize("NFD", args.only)
+        page_row = conn.execute(
+            "SELECT doku_id, title FROM pages WHERE doku_id IN (?, ?)",
+            (doku_id_nfc, doku_id_nfd),
+        ).fetchone()
+        if not page_row:
+            log(f"page 미존재: {args.only}")
+            return 1
+        doku_id_resolved = page_row[0]
+        targets = [doku_id_resolved]
+    else:
+        targets = [r[0] for r in conn.execute(
+            "SELECT DISTINCT doku_id FROM history_split_rev_chunks "
+            "WHERE status='SKIPPED' AND last_error LIKE 'PUT %'"
+        ).fetchall()]
+    log(f"retry 대상 페이지: {len(targets)}")
+
+    total_ok = total_fail = 0
+    for doku_id in targets:
+        h_row = conn.execute(
+            "SELECT chunk_h_level FROM history_split_pages WHERE doku_id=?", (doku_id,)
+        ).fetchone()
+        if not h_row:
+            continue
+        h_level = h_row[0]
+        # 페이지 단위 retry: SKIPPED + PUT 에러인 chunk rev → PENDING 으로 환원
+        n_reset = conn.execute(
+            "UPDATE history_split_rev_chunks SET status='PENDING', last_error=NULL "
+            "WHERE doku_id=? AND status='SKIPPED' AND last_error LIKE 'PUT %'",
+            (doku_id,),
+        ).rowcount
+        conn.commit()
+        log(f"  [RESET] {doku_id}: {n_reset} PUT 실패 rev → PENDING")
+        if n_reset == 0:
+            continue
+        # upload phase 재호출
+        page_row = conn.execute(
+            "SELECT confluence_page_id, title FROM pages WHERE doku_id=?", (doku_id,)
+        ).fetchone()
+        if not page_row or not page_row[0]:
+            log(f"  [SKIP] {doku_id}: confluence_page_id 없음")
+            continue
+        parent_cid, parent_title = page_row[0], page_row[1] or doku_id
+        space_id = _resolve_space_id(session, base, args.space_key)
+        if not space_id:
+            return 2
+        ok, fail = _split_phase_upload(
+            conn, session, base, doku_id, parent_cid, parent_title, space_id,
+            h_level, limit=args.limit, sleep_ms=args.sleep_ms,
+        )
+        total_ok += ok
+        total_fail += fail
+    conn.close()
+    log(f"history-split-retry 완료: ok={total_ok} fail={total_fail}")
+    return 0 if total_fail == 0 else 1
 
 
 def cmd_history_split_status(args: argparse.Namespace) -> int:
@@ -12580,10 +12668,21 @@ def _build_history_subcommands(sub) -> None:
     sp_hsr.add_argument("--no-convert", action="store_true", help="convert phase skip (이미 채워진 history_split_rev_chunks 재사용)")
     sp_hsr.add_argument("--no-finalize", action="store_true", help="parent 본문 인덱스로 교체 skip")
     sp_hsr.add_argument("--limit", type=int, help="upload 시 chunk PUT 개수 제한")
+    sp_hsr.add_argument("--sleep-ms", type=int, default=0, help="PUT 사이 sleep (rate limit 회피, default 0)")
     sp_hsr.set_defaults(func=cmd_history_split_run)
 
     sp_hss = sub.add_parser("history-split-status", help="history-split 진행 상황 요약")
     sp_hss.set_defaults(func=cmd_history_split_status)
+
+    sp_hsrt = sub.add_parser(
+        "history-split-retry",
+        help="PUT 실패 (rate limit 추정) 한 chunk rev 재시도",
+    )
+    _add_confluence_space_args(sp_hsrt)
+    sp_hsrt.add_argument("--only", help="특정 doku_id (생략 시 모든 split 페이지)")
+    sp_hsrt.add_argument("--limit", type=int, help="재시도 chunk PUT 개수 제한")
+    sp_hsrt.add_argument("--sleep-ms", type=int, default=300, help="PUT 사이 sleep (default 300ms — retry 는 보수적)")
+    sp_hsrt.set_defaults(func=cmd_history_split_retry)
 
     sp_hasf = sub.add_parser(
         "history-append-skipped-footer",

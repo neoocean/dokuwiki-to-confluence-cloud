@@ -340,10 +340,28 @@ PoC 검증 결과 설계의 핵심 가정 모두 OK:
 - ✅ cur_ver cached counter 효과 (8배 가속)
 - ✅ _misc policy 효과 (2,895 rev × PUT 절약)
 
-문제 발견 (개선 후보):
-- 250 PUT no resp — Confluence rate limit 추정. 재시도 또는 PUT 간 sleep 권장.
-- 6 고아 chunk (`2020-01-1w`, `링크`) — schema 정의 후 rev 에 추가 H2 등장.
-  현재는 그대로 누락. 향후 *동적 schema 확장* 또는 `_misc` fallback 통합.
+개선 적용 결과 (2026-05-24, A1+A3+A5+A2+B3 통합):
+- **A1 retry**: 250 PUT no resp → **244 회복** (`history-split-retry --sleep-ms 300`). 잔여 15.
+- **A3 동적 schema 확장**: convert phase 가 새 slug 발견 시 schema INSERT.
+  검증: 고아 6 chunk (`2020-01-1w` 3 + `링크` 3) → 자식 페이지 2개 추가 생성,
+  6 chunk rev 모두 OK.
+- **A5 NFC/NFD title**: parent 본문에서 link list 제거 (children 매크로만,
+  자동 동기화). NFC/NFD title mismatch 위험 차단.
+- **A2 sleep**: `--sleep-ms` 옵션 추가 (retry default 300ms).
+- **B3 children only**: parent 본문 = info note + children 매크로. stale link
+  list 제거.
+
+**최종 결과:**
+- 자식 페이지 **10개** (월별 8 + 보조 2)
+- chunk rev UPLOADED **3,583** (이전 3,333 + 244 retry + 6 동적 schema)
+- SKIPPED 10,423 (no-change 7,517 + _misc policy 2,895 + PUT 잔여 11)
+- 잔여 PUT 실패 15 (추가 retry 가능, 수확 감소로 미진행)
+- parent 본문 → children-only 인덱스 (자동 갱신, stale 위험 없음)
+
+B1 (다른 fallback 페이지 재평가): 본 인스턴스에 `large_body_fallback`
+메타 = 0 (u:neoocean:2020 PoC 후 정리). 다른 SKIPPED 페이지는 *이미
+90%+ UPLOADED* + split 시 사용자가 보는 본문 분할 부작용 → **다른 페이지
+적용 안 함. PoC 는 u:neoocean:2020 1 페이지로 종결.**
 
 ### 8.2 u:lam:2019 + u:lam:2020 + u:neoocean:2019
 
