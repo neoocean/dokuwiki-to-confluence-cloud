@@ -1,9 +1,22 @@
 # 큰 페이지의 history 분할 보존 시나리오
 
-**상태 (2026-05-24): 설계 — 구현 미시작.** 본 문서는 docs/oversized-pages.md
-(현재 latest 본문의 H 단위 분할) 와 docs/history-migration.md (시간순
-PUT replay) 의 *교집합* — *큰 페이지의 history 를 자연 경계로 분할해 자식
-페이지들의 chain 으로 보존* 하는 후속 트랙.
+**상태 (2026-05-24): PoC 완료 — u:neoocean:2020 라이브 적용.** 본 문서는
+docs/oversized-pages.md (현재 latest 본문의 H 단위 분할) 와 docs/history-
+migration.md (시간순 PUT replay) 의 *교집합* — *큰 페이지의 history 를
+자연 경계로 분할해 자식 페이지들의 chain 으로 보존* 하는 후속 트랙.
+
+**PoC 라이브 결과 (u:neoocean:2020)**:
+- 자식 페이지 **8개** (2020-01 ~ 2020-08, 월별 H2 chunk)
+- chunk rev **UPLOADED 3,333** (각 rev 의 변경된 chunk 만)
+- SKIPPED 10,670 (no-change + _misc policy + 250 PUT no resp)
+- 자식 페이지 가장 무거운 chunk (`2020-01`): 807 version
+- parent 본문 → 인덱스 (8 자식 link + children 매크로)
+- `large_body_fallback` 메타 자동 제거 (C-mode 해제)
+
+PoC 소요: ~40분 (cur_ver cached counter 적용 후 ~75 PUT/min). `_misc`
+preamble 은 정책상 skip — 매 rev 변동, 가치 낮음 (2,895 rev → SKIPPED).
+250 fail (PUT no resp) 은 chunk chain 보존 (같은 chunk 다음 rev 시도
+가능). 향후 retry 로 회복 가능.
 
 ## 1. 문제 정의
 
@@ -307,13 +320,30 @@ python run.py history-split run --only u:neoocean:2020
 
 ## 8. 본 인스턴스 예상 결과
 
-### 8.1 u:neoocean:2020 (최우선)
+### 8.1 u:neoocean:2020 (최우선) — **PoC 라이브 완료**
 
-- latest storage: ~819 KB (storage/u/neoocean/2020.xml)
-- H2 단위 분할 시 추정: 12-15 chunk (월별, 평균 50-70KB)
-- 자식 페이지 12-15개 신규 생성
-- 2,895 rev → 각 자식 평균 200 version
-- 회복 rev: **2,895 (전부)**, history UPLOADED 86.8% → 94.5%
+- latest storage: ~349 KB (변환기 개선 후 — 이전 819KB)
+- H2 단위 분할 결과 실측: **9 chunk** (8 active + 1 _misc preamble)
+- chunk 크기 분포: 2KB ~ 113KB (`2020-01` 113KB 최대)
+- 자식 페이지 **8개** 생성 (cid 2532234398 ~ 2533034323)
+- chunk rev UPLOADED **3,333**, SKIPPED 10,670 (no-change 7,775 + _misc
+  policy 2,895), fail 250 (PUT no resp)
+- _misc preamble 은 정책상 skip — 매 rev 변동 + 가치 낮음
+- 자식 페이지의 가장 무거운 chunk: `2020-01` 807 version
+- parent 본문 → 인덱스로 교체, large_body_fallback 메타 자동 제거
+
+**소요 시간**: history-render 4분 + history-convert 12분 + split-run 40분 = 약 1시간
+
+PoC 검증 결과 설계의 핵심 가정 모두 OK:
+- ✅ chunk slug 안정성 (`2020-01` ~ `2020-08` 매칭 일관)
+- ✅ chunk chain 보존 (PUT 실패 시 다음 rev OK)
+- ✅ cur_ver cached counter 효과 (8배 가속)
+- ✅ _misc policy 효과 (2,895 rev × PUT 절약)
+
+문제 발견 (개선 후보):
+- 250 PUT no resp — Confluence rate limit 추정. 재시도 또는 PUT 간 sleep 권장.
+- 6 고아 chunk (`2020-01-1w`, `링크`) — schema 정의 후 rev 에 추가 H2 등장.
+  현재는 그대로 누락. 향후 *동적 schema 확장* 또는 `_misc` fallback 통합.
 
 ### 8.2 u:lam:2019 + u:lam:2020 + u:neoocean:2019
 
