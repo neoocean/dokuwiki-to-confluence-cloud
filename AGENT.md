@@ -4,10 +4,11 @@
 요약 + 길잡이다. 사람이 처음 진입할 때도 동일하게 유용.
 
 본 저장소는 **자체 호스팅 DokuWiki → Confluence Cloud** 일회성/반복
-마이그레이션 도구. 본 인스턴스의 라이브 마이그레이션은 **Day 1-5 +
-후반 사이클 완료** (2026-05-21 시점, 1,675 페이지 / 10,732 첨부 /
-18,729 history revision / 4 struct schema / 사용자 검토 후 fix 4건
-적용). 코드는 다른 인스턴스로도 재사용 가능.
+마이그레이션 도구. 본 인스턴스의 라이브 마이그레이션은 **Day 1-6 완료**
+(2026-05-23 시점, 1,675 메인 페이지 / 10,725 첨부 / **32,453 history
+rev (86.8%)** / 4 struct schema (brevet_place collapsed) / Confluence
+측 실측 2,818 페이지 / 24.23 MB 본문 / 60,772 version). 코드는 다른
+인스턴스로도 재사용 가능.
 
 ---
 
@@ -45,7 +46,9 @@ python run.py report-publish
 | `docs/visual-audit.md` | 사용자 시각 검수 자동화 (Phase 1-4) |
 | `docs/visual-comparison-proposal.md` | 비교 갤러리 (`compare-publish`) + Phase 4 시각 비교 7 신호 설계·구현 후 자료 |
 | `docs/3way-audit.md` | source ↔ rendered ↔ confluence 3-측 invariant audit (`audit-3way` 명령, Day 5 후반 구현). 사용자 직접 비교로 발견한 4 사례 일반화 |
-| `docs/migration-result.md` | 날짜별 라이브 결과 누적 로그 (Day 1-5 + 후반 사이클) |
+| `docs/migration-result.md` | 날짜별 라이브 결과 누적 로그 (Day 1-6) |
+| `RESULT.md` / `RESULT.json` | Confluence 측 전수 조사 — 2,818 페이지 / 본문 24.23MB / version 60,772 (Day 6 시점). gitignored, P4 추적 |
+| `MEMORY.md` (루트) | 본 인스턴스 작업의 *배운 점* (운영 메모, 본 작성자 본인 인계용). gitignored, P4 추적 |
 | `docs/struct-migration.md` | struct 플러그인 데이터 이전 시나리오 + 라이브 결과 |
 | `docs/history-migration.md` | 과거 리비전 이전 시나리오 + 라이브 결과 |
 | `docs/oversized-attachments.md` / `oversized-pages.md` | 본문/첨부 한도 초과 폴백 |
@@ -146,12 +149,16 @@ git push
 | 내부 링크 | ✅ resolved | 5,180 / unresolved 1,317 |
 | OVERSIZED 첨부 (B mode) | ✅ | 9건 → note 매크로 |
 | 본문 한도 거부 페이지 (C mode) | ✅ | 1건 → skeleton + 119 자식 첨부 |
-| struct (native, Day 4) | ✅ | 4 Database + 4 인덱스 + 1,213 row + 208 bound 임베드 |
-| history (B+A) | ⚠️ 영구 제약 | 18,729 / 37,279 (50%, 큰 페이지 후반 rev 거부) |
+| struct (native, Day 4) | ✅ | 3 Database + 3 인덱스 + 1,115 row 자식 + 208 bound 임베드 |
+| struct brevet_place (collapsed, Day 6) | ✅ | 98 자식 휴지통 + 마스터 표 1개 (인덱스 본문 교체) |
+| history (B+A) | ✅ **86.8%** | **32,453** / 37,397 (Day 6 재개 라운드 완료) |
+| history 누락 안내 footer (Day 6) | ✅ | 22 페이지 latest 본문에 *마이그레이션 안내* note 부착 |
 | 공간 정리 | ✅ | 1,465 비-마이그레이션 페이지 휴지통 |
 | 결과 보고서 | ✅ | page id 2522513553 |
+| Confluence 측 실측 (Day 6) | ✅ | **2,818 페이지** / 본문 24.23 MB / version 합계 60,772 |
 
-자세한 통계 + 날짜별 로그는 [`docs/migration-result.md`](docs/migration-result.md).
+자세한 통계 + 날짜별 로그는 [`docs/migration-result.md`](docs/migration-result.md) (Day 6 절).
+페이지별 전수 조사는 [`RESULT.md`](RESULT.md) (gitignored, P4 추적).
 
 ---
 
@@ -168,7 +175,10 @@ git push
   공개. 컬럼/row endpoint 없음. storage 측 ri:database 임베드 거부.
   → 데이터는 Page Properties 매크로 조합으로, Database 는 쉘만.
 - **본문 한도**: 큰 일지 페이지의 history 후반 rev 가 본문 한도 초과해
-  영구 거부. *서버 측 정확한 한도 미공개* — 50% 도달 후 추가 라운드 무의미.
+  영구 거부. *서버 측 정확한 한도 미공개*. **Day 6 라운드 후 86.8%
+  도달, 잔여는 (A) 비-마이그레이션 페이지 + (D) large_body_fallback +
+  (E) 시간 역순 skip — 모두 추가 라운드 가치 낮음.** SKIPPED 페이지엔
+  `history-append-skipped-footer` 로 latest 본문에 안내 부착.
 - **`<!-- HTML 코멘트 -->` 는 Confluence storage 정규화 시 strip**.
   Idempotent 마커로 쓸 수 없음 → struct-embed 는 `<h2>관련 struct 데이터</h2>`
   를 sentinel 로 사용.
@@ -204,7 +214,7 @@ git push
 - 본 프로젝트의 *왜* / *어떻게* / *함정*: [`docs/MEMORY.md`](docs/MEMORY.md)
 - 단계별 라이브 절차: [`docs/runbook.md`](docs/runbook.md)
 - 설계 + 새 엣지 케이스 발견 절차: [`docs/scenarios.md`](docs/scenarios.md)
-- 라이브 결과 (Day 1-5 + 후반 사이클): [`docs/migration-result.md`](docs/migration-result.md)
+- 라이브 결과 (Day 1-6): [`docs/migration-result.md`](docs/migration-result.md)
 - 변환 매트릭스 (요소별): [`docs/element-mapping.md`](docs/element-mapping.md)
 - 플러그인 동작: [`docs/plugin-validation.md`](docs/plugin-validation.md)
 - 시각 검수 자동화: [`docs/visual-audit.md`](docs/visual-audit.md)

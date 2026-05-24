@@ -7,9 +7,9 @@
 ## 본 저장소 한 줄
 
 자체 호스팅 DokuWiki → Confluence Cloud (`$CONFLUENCE_BASE_URL`) 일회성/
-반복 마이그레이션 도구. 원 작성자 인스턴스의 라이브는 **Day 1-5 + 후반
-사이클 완료** (2026-05-21 시점). 다른 인스턴스 배포는
-[DEPLOY.md](DEPLOY.md).
+반복 마이그레이션 도구. 원 작성자 인스턴스의 라이브는 **Day 1-6 완료**
+(2026-05-23 시점, 메인 1,675 + history 86.8% + Confluence 측 실측 2,818
+페이지). 다른 인스턴스 배포는 [DEPLOY.md](DEPLOY.md).
 
 ## 가장 먼저 할 것
 
@@ -43,6 +43,8 @@ python run.py audit-3way --with-source --dokuwiki-data <dwdata>  # 3-측 invaria
 python run.py verify build         # 시각 검수 큐
 python run.py compare-publish      # 비교 갤러리 (이전 발행 페이지 자동 exclude)
 python run.py split-oversize --max-chunk 100000   # 본문 한도 초과 페이지 H 단위 분할
+python run.py struct-collapse-unbound       # binding 없는 schema 의 row 자식 페이지 정리 (Day 6)
+python run.py history-append-skipped-footer # SKIPPED rev 페이지에 안내 footer 부착 (Day 6)
 python run.py report-publish       # 결과 보고서 Confluence 페이지 발행
 pytest tests/                  # 회귀 (현재 190 통과)
 ```
